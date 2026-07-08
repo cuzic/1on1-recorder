@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "spike-common",
+    "spike-01-wasapi-dual-capture",
+    "spike-02-app-loopback",
+]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Media_Audio",
+    "Win32_Media_Multimedia",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Foundation",
+    "Win32_System_Performance",
+    # cargo checkで実際に検出した抜け(design.mdの§7で「要確認」としていた点):
+    # このfeatureがないと`_Impl`トレイト自体が生成されず、
+    # #[implement(...)]でCOMオブジェクト(CompletionHandler等)を実装できない。
+    "implement",
+] }
+thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+hound = "3"
+crossbeam-channel = "0.5"
+sysinfo = "0.31"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
