@@ -221,6 +221,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 * 実装中に**実際のバグを2件発見・修正**: (1) `start_binding`が`Stopped`状態からしか開始を許可しておらず、`Waiting`(デバイス復帰・リトライタイマー)からの再開始が常に無視されていた、(2) 連続失敗回数を`Waiting`状態の中だけに持たせていたため、`Starting`へ一度でも遷移すると回数が失われ、`MAX_RETRY_ATTEMPTS`に決して到達しない(実質無限リトライになる)実装になっていた。後者は`CaptureBinding`に`retry_attempt`フィールドを追加し、lifecycle enumを跨いで保持する形に直して解消した
 * 検証手順4(実WASAPIワーカーへの差し替え)は未着手。SPIKE-01/02/09で実装済みの`spike_common::capture_loop`/`device_watch`をFake Worker側の型(`Observation`/`Effect`)へ変換するアダプタ層が必要で、実機での`RecoveryTiming`計測とあわせて、開発がまとまった段階でのWindows実機検証時に行う
 
+**実装状況(2026-07-09)**: `spikes/spike-12-rebinding-fsm`として実装済み。**windowsクレートに一切依存しない純粋なRustクレート**のため、このLinux環境で実装からテスト実行まで完結できた(SPIKE-01/02と違いクロスコンパイルの型検証止まりではなく、実際に`cargo test`が通ることまで確認済み)。
+
 ---
 
 ### SPIKE-03: 共通タイムライン整列・drift 補正(疑似音源)

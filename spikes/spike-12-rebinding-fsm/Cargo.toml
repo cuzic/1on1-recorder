@@ -1,0 +1,14 @@
+[package]
+name = "spike-12-rebinding-fsm"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# 意図的にwindowsクレートへ依存しない。audio-device-state-architecture.md §6が
+# 示すとおり、Decision Engine(reduce関数)はOS APIを一切呼ばない純粋関数であり、
+# WASAPIへの依存はEffect Executor(実WASAPIワーカー、将来spike-01/02側で実装)に
+# 閉じ込める。そのためこのクレートはネイティブ(このLinux環境)でビルド・
+# テストを完結できる。
+[dependencies]
+
+[dev-dependencies]
