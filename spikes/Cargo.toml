@@ -4,6 +4,7 @@ members = [
     "spike-common",
     "spike-01-wasapi-dual-capture",
     "spike-02-app-loopback",
+    "spike-12-rebinding-fsm",
 ]
 
 [workspace.package]
