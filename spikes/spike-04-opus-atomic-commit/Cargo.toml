@@ -1,0 +1,20 @@
+[package]
+name = "spike-04-opus-atomic-commit"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# spike-plan.md SPIKE-04: windowsクレートに依存しない。design.md §11.1/§12.2の
+# 「.partial書き込み→flush→fsync→SHA-256→atomic rename→SQLite登録」を
+# 実Opusエンコード(opus crate、libopus-dev経由)+実Ogg(ogg crate)+
+# 実SQLite(rusqlite, bundled)で検証する。
+[dependencies]
+anyhow = { workspace = true }
+ogg = "0.9"
+opus = "0.3"
+rusqlite = { version = "0.31", features = ["bundled"] }
+sha2 = "0.10"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

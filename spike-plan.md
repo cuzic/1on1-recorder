@@ -281,6 +281,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 **設計の全体像**: 本スパイクが検証する「atomic commit + クラッシュ復旧」は、[audio-device-state-architecture.md](audio-device-state-architecture.md) §7(Effectの完了保証と冪等性)で一般化した Durable Effect Ledger モデルの具体例にあたる。特に §7.4.3(設定・JSON・summaryの保存)・§7.6〜7.8(録音保存プロトコル・append再送・WAV遅延生成)は、本スパイクの検証手順・合否基準をそのまま拡張できる設計になっている。
 
+**実装状況(2026-07-09)**: `spikes/spike-04-opus-atomic-commit`として実装済み・**検証手順1〜4・合否基準を全てこの環境で実行して確認済み**(windowsクレート非依存かつ、`libopus-dev`/`cmake`をユーザーにインストールしてもらったことで実Opusエンコードが可能になったため、SPIKE-01/02と異なりクロスコンパイルの型検証止まりではなく実挙動を検証できた)。`opus`/`ogg` crateで48kHz mono PCMからOgg Opus(OpusHead/OpusTagsを RFC 7845 §5.1/§5.2 に従って手組み)を生成する`opus_ogg::encode_segment_to_ogg_opus`、design.md §12.2の手順(`.partial`書き込み→flush→fsync→SHA-256→atomic rename→SQLite登録)を実装し各段階に`CrashPoint`(AfterPartialWrite/AfterFsync/AfterRename)で打ち切れるテストフックを持つ`segment_writer::commit_segment`、再起動スキャンで孤立`.partial`を破棄しDB未登録の完成`.opus`を再登録する`recovery::scan_and_recover`を実装。`taskkill`相当の強制killではなく、SPIKE-08で確立した「途中で処理を打ち切る」パターンで各クラッシュ地点を模擬。7件のテストが全て通過: 3つのクラッシュ地点それぞれでの復旧、クラッシュなしの正常コミット、4セグメント(2正常+1×2クラッシュパターン)のエンドツーエンド往復、32kbpsでの2時間分容量見積もり(実測: 30秒セグメント=123,378バイト、2時間換算で約28.24MB)、そして**実際に`ffprobe`を実行して**生成ファイルが`codec_name=opus, sample_rate=48000, channels=1`として認識されることを確認(design.mdの「ffprobe/一般プレイヤーで正常に再生できる」という合否基準を実地で満たした)。
+
 ---
 
 ### SPIKE-05: Tauri 2 常駐と録音ライフサイクル分離

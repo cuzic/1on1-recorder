@@ -8,6 +8,7 @@ members = [
     "spike-03-timeline-drift",
     "spike-08-chunked-upload",
     "spike-10-credential-store",
+    "spike-04-opus-atomic-commit",
 ]
 
 [workspace.package]
