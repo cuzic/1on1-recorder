@@ -1,0 +1,19 @@
+[package]
+name = "spike-10-credential-store"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# spike-plan.md SPIKE-10: windowsクレートに依存しない(keyringクレート自体が
+# 3 OSを吸収する)。Linux側のフォールバック(暗号化ファイル)の検証はこの
+# 環境(D-Busセッションはあるが Secret Service 未登録)でこそ実地で行える。
+[dependencies]
+aes-gcm = "0.10"
+anyhow = { workspace = true }
+keyring = "2"
+rand = "0.8"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -455,6 +455,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 * save/load/delete のround-tripを暗号化ファイルストアで実施し、**プロセス再起動を模した(新しいインスタンスで同じディレクトリを開き直す)テストでもマスターキーの永続化・復号が成功することを確認**。フォールバック込みのエンドツーエンドテストも含め全4テストがpass
 * Windows Credential Manager / macOS Keychainでのround-tripはこの環境では検証不可(実機が必要)。ただし`keyring` crateが3 OSを同じAPIで抽象化する設計のため、Linux側で発見した「バックエンド不在時のエラー分類とフォールバック方針」というLinux固有の課題は解決済みで、残るリスクはWindows/macOS側の実機round-tripの確認のみ
 
+**実装状況(2026-07-09)**: `spikes/spike-10-credential-store`として実装済み。**この開発環境(D-Busセッションはあるが`org.freedesktop.secrets`を提供するSecret Serviceデーモンが未登録のLinux)が、まさに検証手順2が求める「Linuxでgnome-keyring不在時」のテストケースそのものだったため、机上の想定ではなく実地で観測できた。**
+
 ---
 
 ## 6. スケジュールと依存関係
