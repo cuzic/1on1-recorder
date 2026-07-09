@@ -11,6 +11,10 @@ members = [
     "spike-04-opus-atomic-commit",
     "spike-11-endpoint-registry",
 ]
+# spike-05-tauri-tray/src-tauriはTauri標準の単独プロジェクト構成(独自のCargo.lock/target)
+# のまま扱う。webkit2gtk-rs等の重いGUI依存を他スパイクの共有ワークスペース解決に
+# 巻き込まないため、あえてメンバーに含めずexcludeする。
+exclude = ["spike-05-tauri-tray/src-tauri"]
 
 [workspace.package]
 edition = "2021"

@@ -314,6 +314,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 **実行検証は本環境ではブロックされている**: このコンテナ内でWebKitGTKのWebView初期化がハングし、ビルド済みバイナリを実行してのソークテスト(RSSサンプリング、SIGUSR1によるhide/show模擬)が行えないことを確認した。原因はvirtio-gpu仮想GPUにMesaドライバがbindされていないこと(`libEGL warning: pci id for fd ...: 1b36:0100, driver (null)`)で、`WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS`/`WEBKIT_DISABLE_COMPOSITING_MODE`/`WEBKIT_DISABLE_DMABUF_RENDERER`/`LIBGL_ALWAYS_SOFTWARE`/`GALLIUM_DRIVER=llvmpipe`/`GDK_GL=disable`等の組み合わせを試したが解消しなかった。**この問題が本スパイクのRustコードに起因しないことは、webkit2gtk本体付属の`MiniBrowser`(Tauri/wryを一切介さない)でも同一環境下で`about:blank`の表示すら同様にハングすることを確認して切り分け済み**(素のGTK3ウィンドウ(`gtk` crateで自作した最小テスト)は同じXvfb環境で問題なく動作したため、GTK自体ではなくWebKitGTKのGPU初期化に問題が限局されている)。ソークテスト用スクリプト(`spikes/spike-05-tauri-tray/soak_test.sh`)は実行可能な状態で用意してあるので、実GPUまたは3Dアクセラレーション付きの環境が手に入り次第そのまま使える。SPIKE-06/07(実機が必要)と同様、本スパイクも「実装は完了しているが実行検証にはこの環境にない何か(実GPU/実ディスプレイ)が要る」という位置づけになった。
 
+**実装状況(2026-07-09)**: `spikes/spike-05-tauri-tray`として実装済み(`pnpm create tauri-app` でTauri 2 + Vue 3 + TSの雛形を生成し、`spikes/Cargo.toml`のワークスペースからは`exclude`して独立プロジェクトのまま扱う。webkit2gtk-rs等の重いGUI依存を他スパイクの共有ワークスペース解決に巻き込まないため)。Rustバックエンド(`src-tauri/src/lib.rs`)は、経過時間のみから決定的に(乱数不使用、再現可能に)疑似レベル値を導出し30fpsで生成し続けるバックグラウンドスレッド、`WindowEvent::CloseRequested`を`prevent_close()`+`window.hide()`でトレイ常駐に倒す処理、トレイメニュー(Show/Quit)、レベルメーターのフロントエンドへのIPC emit、ウィンドウ再表示時に次tickを待たず即座に現在値を再送する`level-meter-snapshot`、そして**Xvfbに実マウス操作がない環境でも「ウィンドウ閉鎖→再表示」を外部スクリプトから駆動できるよう、SIGUSR1受信でウィンドウのhide/showをトグルする仕組み**を実装。`cargo build --release`・フロントエンドの`pnpm build`(vue-tsc型検査込み)ともに警告0で成功。
+
 ---
 
 ## 4. Wave 2: macOS / Linux の方式成立確認とアップロード

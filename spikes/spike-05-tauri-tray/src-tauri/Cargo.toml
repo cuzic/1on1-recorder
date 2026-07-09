@@ -1,0 +1,30 @@
+[package]
+name = "spike-05-tauri-tray"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "spike_05_tauri_tray_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# spike-plan.md SPIKE-05 検証手順3: ウィンドウ閉鎖(SIGUSR1で模擬)を外部の
+# ソークテストスクリプトから駆動するため。Windows実機では使わない(§4参照)。
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
