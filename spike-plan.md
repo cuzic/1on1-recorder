@@ -146,6 +146,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 **タイムボックス**: 3日
 
+**実装状況(2026-07-09)**: `spikes/spike-02-app-loopback`の実装は完了(`todo!()`は0件、`cargo build`/`--release`/`cargo test --no-run`いずれもエラー・警告なし)。`ActivateAudioInterfaceAsync`の呼び出し・PROPVARIANT(VT_BLOB)構築・`IActivateAudioInterfaceCompletionHandler`(`IAgileObject`実装込み)・GetMixFormat/固定フォーマットの2段階リトライまで実装済み。ただし**上記の検証手順・合否基準そのものはまだ何一つ満たされていない**。「Rustから呼べるか」という本スパイクの最大の不確実点は、Windows実機で実際に`Activate`を呼んで完了ハンドラが起動することを確認するまで未検証(cargo checkでの型検証と、実際の動作は別)。実機検証は開発が一定まとまった段階でまとめて行う方針(windows-build-verification.md参照)。
+
 ---
 
 ### SPIKE-11: Audio Endpoint Registry(全デバイスの観測状態追跡)

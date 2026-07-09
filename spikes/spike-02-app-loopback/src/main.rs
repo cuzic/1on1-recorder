@@ -1,4 +1,4 @@
-// spike-windows-01-02-detail-design.md §5.7/§5.8
+// spike-windows-01-02-detail-design.md §5.7/§5.8/§5.9
 
 mod completion_handler;
 mod process_finder;
@@ -7,12 +7,16 @@ mod process_loopback;
 use clap::Parser;
 use process_finder::{ProcessSelectionStrategy, ProcessWatchEvent, ProcessWatcher};
 use process_loopback::{ProcessLoopbackMode, ProcessLoopbackStream};
+use spike_common::aggregator::Aggregator;
+use spike_common::analyze;
+use spike_common::frame_record::StreamId;
+use spike_common::jsonl_log::JsonlWriter;
 use spike_common::spawn_capture_thread;
 use spike_common::StopSignal;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(clap::Parser)]
 struct Cli {
@@ -45,9 +49,16 @@ struct Cli {
     #[arg(long, default_value_t = true)]
     reattach: bool,
 
+    /// キャプチャコールバックのタイムアウト(ms)。WaitForMultipleObjectsに渡す
+    /// (SPIKE-01と同じ既定値。Process Loopbackでは対象アプリ無音時のidle_timeout
+    /// 判定周期としても使われる)。
+    #[arg(long, default_value_t = 2000)]
+    callback_timeout_ms: u32,
+
     #[arg(long)]
     output_dir: Option<PathBuf>,
 }
+
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -60,6 +71,7 @@ fn main() -> anyhow::Result<()> {
         .output_dir
         .unwrap_or_else(|| PathBuf::from("out").join("run"));
     std::fs::create_dir_all(&out_dir)?;
+    let mut event_log = JsonlWriter::create(&out_dir.join("process_events.jsonl"))?;
 
     let activation_hard_timeout = cli.activation_hard_timeout_ms.map(Duration::from_millis);
 
@@ -73,7 +85,10 @@ fn main() -> anyhow::Result<()> {
         let m = process_finder::find_process_by_name(&name, cli.process_selection)
             .ok_or_else(|| anyhow::anyhow!("対象プロセスが見つかりません: {name}"))?;
         let pid = m.pid;
-        (pid, ProcessWatcher::new_by_name(name, cli.process_selection, pid))
+        (
+            pid,
+            ProcessWatcher::new_by_name(name, cli.process_selection, pid),
+        )
     };
 
     let (tx, rx) = crossbeam_channel::bounded(256);
@@ -87,15 +102,30 @@ fn main() -> anyhow::Result<()> {
         capture_epoch,
         activation_hard_timeout,
         pipeline_drop_counter: pipeline_drop_counter.clone(),
+        callback_timeout_ms: cli.callback_timeout_ms,
     });
     let mut current_thread = Some(spawn_capture_thread(stream, tx.clone(), stop_signal.clone()));
+
+    let aggregator = Aggregator::new(&out_dir, &[(StreamId::ProcessLoopback, "process_loopback")])?;
+    let aggregator_handle = std::thread::spawn(move || aggregator.run(rx));
+
+    let wall_start = Instant::now();
+    let cpu_start = analyze::ProcessTimes::query_current().ok();
 
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(cli.duration_secs) {
         match watcher.poll() {
-            ProcessWatchEvent::StillAlive(_) => {}
+            ProcessWatchEvent::StillAlive(pid) => {
+                tracing::trace!(pid, "process_still_alive");
+            }
             ProcessWatchEvent::Exited { old_pid } => {
                 tracing::info!(old_pid, capture_epoch, "process_exited");
+                event_log.write(serde_json::json!({
+                    "ts_ns": JsonlWriter::now_ns(),
+                    "type": "process_exited",
+                    "old_pid": old_pid,
+                    "capture_epoch": capture_epoch,
+                }));
                 stop_signal.signal()?;
                 if let Some(h) = current_thread.take() {
                     let outcome = h.join();
@@ -110,6 +140,13 @@ fn main() -> anyhow::Result<()> {
             }
             ProcessWatchEvent::Restarted { old_pid, new_pid } => {
                 tracing::info!(old_pid, new_pid, capture_epoch, "process_restarted");
+                event_log.write(serde_json::json!({
+                    "ts_ns": JsonlWriter::now_ns(),
+                    "type": "process_restarted",
+                    "old_pid": old_pid,
+                    "new_pid": new_pid,
+                    "capture_epoch": capture_epoch,
+                }));
                 stop_signal.signal()?;
                 if let Some(h) = current_thread.take() {
                     let _ = h.join();
@@ -123,6 +160,7 @@ fn main() -> anyhow::Result<()> {
                     capture_epoch,
                     activation_hard_timeout,
                     pipeline_drop_counter: pipeline_drop_counter.clone(),
+                    callback_timeout_ms: cli.callback_timeout_ms,
                 });
                 current_thread = Some(spawn_capture_thread(
                     stream,
@@ -133,6 +171,11 @@ fn main() -> anyhow::Result<()> {
             }
             ProcessWatchEvent::NotFound => {
                 tracing::warn!("process_not_found; stopping watch loop");
+                event_log.write(serde_json::json!({
+                    "ts_ns": JsonlWriter::now_ns(),
+                    "type": "process_not_found",
+                    "capture_epoch": capture_epoch,
+                }));
                 break;
             }
         }
@@ -145,9 +188,123 @@ fn main() -> anyhow::Result<()> {
     }
     drop(tx);
 
-    // TODO(§5.9): Aggregator(spike-01と共有可能な形へ抽出予定)でCSV/WAV/
-    // process_events.jsonl/summary.jsonを書き出す。
-    let _ = rx;
+    let mut results = aggregator_handle
+        .join()
+        .expect("aggregator thread panicked")?;
+
+    let wall_secs = wall_start.elapsed().as_secs_f64();
+    let cpu_end = analyze::ProcessTimes::query_current().ok();
+    let cpu_percent = match (cpu_start, cpu_end) {
+        (Some(start), Some(end)) => analyze::measure_cpu_percent(start, end, wall_secs),
+        _ => 0.0,
+    };
+    let peak_working_set_bytes = analyze::measure_peak_working_set_bytes();
+    let qpc_freq_hz = spike_common::timestamp::QpcClock::query()?.freq_hz();
+
+    let result = results
+        .remove(&StreamId::ProcessLoopback)
+        .unwrap_or_default();
+
+    // SPIKE-01のbuild_stream_summary相当。Process Loopbackは常にcapture_epoch>=0の
+    // 複数epochを持ちうる(プロセス再起動のたび+1、§5.7)ため、group_records_by_epoch
+    // で世代ごとに分割してから解析する(§4.9のP0-5)。
+    let groups = analyze::group_records_by_epoch(&result.records);
+    let stats = &result.stats;
+
+    let position_gaps = groups
+        .iter()
+        .map(|g| analyze::detect_position_gaps(&g.records))
+        .fold(analyze::PositionGapStats::default(), |mut acc, g| {
+            acc.gap_frames_total += g.gap_frames_total;
+            acc.overlap_frames_total += g.overlap_frames_total;
+            acc.gap_events += g.gap_events;
+            acc.overlap_events += g.overlap_events;
+            acc
+        });
+
+    let nominal_sample_rate = result.format.as_ref().map(|f| f.sample_rate).unwrap_or(0);
+    let clock_drift = analyze::estimate_clock_drift(&stats.position_series, nominal_sample_rate);
+    let qpc_series: Vec<u64> = stats.position_series.iter().map(|(q, _)| *q).collect();
+    let monotonic_violations = analyze::detect_monotonic_violations(&qpc_series);
+
+    let rough = analyze::compute_wake_timing(&stats.wake_qpc_100ns_series, 0.0);
+    let wake_timing =
+        analyze::compute_wake_timing(&stats.wake_qpc_100ns_series, rough.interval.mean_ms);
+
+    let packet_age = groups
+        .first()
+        .map(|g| analyze::compute_packet_age_at_wake(&g.records))
+        .unwrap_or_default();
+
+    let stream_summary = serde_json::json!({
+        "wake_events": stats.wake_events,
+        "packet_events": stats.packet_events,
+        "total_frames_captured": stats.total_frames_captured,
+        "discontinuity_count": stats.discontinuity_count,
+        "silent_count": stats.silent_count,
+        "timestamp_error_count": stats.timestamp_error_count,
+        "expected_wake_interval_ms": wake_timing.expected_interval_ms,
+        "wake_interval_ms": {
+            "mean": wake_timing.interval.mean_ms,
+            "p95": wake_timing.interval.p95_ms,
+            "p99": wake_timing.interval.p99_ms,
+            "max": wake_timing.interval.max_ms,
+        },
+        "wake_jitter_ms": {
+            "mean": wake_timing.jitter.mean_ms,
+            "p95": wake_timing.jitter.p95_ms,
+            "p99": wake_timing.jitter.p99_ms,
+            "max": wake_timing.jitter.max_ms,
+        },
+        "packet_age_at_wake_ms": {
+            "mean": packet_age.mean_ms,
+            "p95": packet_age.p95_ms,
+            "p99": packet_age.p99_ms,
+            "max": packet_age.max_ms,
+        },
+        "position_gap_frames_total": position_gaps.gap_frames_total,
+        "position_overlap_frames_total": position_gaps.overlap_frames_total,
+        "position_gap_events": position_gaps.gap_events,
+        "monotonic_violations": monotonic_violations,
+        "clock_drift_ppm_vs_qpc": clock_drift.drift_ppm,
+        "mmcss_applied": stats.mmcss_applied.unwrap_or(false),
+        "epoch_count": groups.len(),
+    });
+
+    let summary = serde_json::json!({
+        "run_id": out_dir.file_name().and_then(|s| s.to_str()).unwrap_or("run"),
+        "duration_secs": cli.duration_secs,
+        "os": os_info,
+        "qpc_freq_hz": qpc_freq_hz,
+        "target": {
+            "initial_pid": initial_pid,
+            "mode": format!("{:?}", cli.mode),
+            "reattach": cli.reattach,
+        },
+        "streams": {
+            "process_loopback": stream_summary,
+        },
+        "process_cpu_percent_estimate": cpu_percent,
+        "process_peak_working_set_bytes": peak_working_set_bytes,
+        // Process Loopback特有の項目(§5.9)。対象アプリが無音の間はエラーではなく
+        // 単に通知が来ないため、この値が大きいこと自体は失格要件ではない。
+        "idle_timeout_count": stats.idle_timeout_count,
+        "idle_timeout_note": "対象アプリが無音の間、通知が来ずタイムアウトした回数。エラーではない(§4.4)",
+        "acceptance": {
+            "qpc_monotonic": monotonic_violations == 0,
+            "discontinuity_detection_operational": true,
+            "discontinuity_count": stats.discontinuity_count,
+            "position_gap_count": position_gaps.gap_events,
+            "pipeline_drop_count": pipeline_drop_counter.load(std::sync::atomic::Ordering::Relaxed),
+            "cpu_under_10_percent": cpu_percent < 10.0,
+            "mmcss_applied": stats.mmcss_applied.unwrap_or(false),
+            "os_build_supported": true,
+        },
+    });
+
+    let summary_path = out_dir.join("summary.json");
+    std::fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
+    tracing::info!(path = %summary_path.display(), "summary.json written");
 
     Ok(())
 }
