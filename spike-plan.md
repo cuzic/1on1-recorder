@@ -180,6 +180,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 **タイムボックス**: 3日
 
+**実装状況(2026-07-09)**: `spikes/spike-11-endpoint-registry`として実装済み(windowsクレート依存のため、SPIKE-01/02/09と同じく`cargo check`/`cargo build --release --target x86_64-pc-windows-gnu`によるクロスコンパイル型検証まで。実機でのUSB抜き差し・Windows設定操作等は windows-build-verification.md の方針どおり実機まとめ検証のタイミングで行う)。`spike-common::device_watch`(SPIKE-09で実装済みの`IMMNotificationClient`/`IAgileObject`実装、RAIIでの登録/解除)をそのまま再利用し、その上に本スパイク固有の層を追加した: 起動時の全endpoint列挙(`Active`/`Disabled`/`NotPresent`/`Unplugged`すべてを対象、`endpoint_query::scan_all_endpoints`)と6通り(flow×role)の既定ルート初期値(`scan_default_routes`)から`EndpointRegistry`を構築し、`DeviceWatchEvent`受信のたびに該当endpointを`IPropertyStore`/`IAudioEndpointVolume`経由で再取得して`AudioEndpointSnapshot`(状態・friendly_name・音量・mute・default_roles)を更新、変更前後を`endpoint_events.jsonl`へ記録する。既定デバイスなし(`Option<EndpointId>` = `None`)も表現できる。`DefaultDeviceChanged`受信時は`default_routes`マップと各endpointの`default_roles`集合の両方を整合させて更新する。summary.jsonには「callbackからこの消費スレッドに届くまでの遅延」(dispatch latency, p99/max)と、callback自体が`try_send`のみで再列挙やCOM解放を一切行わないことをコードレビューで確認した旨を記録する(実機でしか測れない「callback内実行時間」そのものと混同しないよう明記)。`registry_matches_windows_state`は設計どおり自動化せず`null`のまま。
+
 ---
 
 ### SPIKE-12: Capture Rebinding State Machine(再バインド時の epoch 整合性)

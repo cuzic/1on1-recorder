@@ -9,6 +9,7 @@ members = [
     "spike-08-chunked-upload",
     "spike-10-credential-store",
     "spike-04-opus-atomic-commit",
+    "spike-11-endpoint-registry",
 ]
 
 [workspace.package]
@@ -18,6 +19,7 @@ publish = false
 [workspace.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints", # SPIKE-11: IAudioEndpointVolume(音量/mute取得)
     "Win32_Media_Multimedia",
     "Win32_Media_KernelStreaming",
     "Win32_System_Com",

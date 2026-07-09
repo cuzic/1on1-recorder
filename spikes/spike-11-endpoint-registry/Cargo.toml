@@ -1,0 +1,16 @@
+[package]
+name = "spike-11-endpoint-registry"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+spike-common = { path = "../spike-common" }
+windows = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
