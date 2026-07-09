@@ -1,9 +1,9 @@
 # 技術検証スパイク実施計画
 
-* **文書ステータス**: Draft v0.1
+* **文書ステータス**: Draft v0.2(2026-07-09 改定: §1.4 でスパイク継続 / 直接実装への区分を整理)
 * **作成日**: 2026-07-06
 * **対象設計書**: [design.md](design.md) — デスクトップ2トラック会議レコーダー Phase 1 設計書
-* **目的**: Phase 1A 実装着手前に、設計の前提となる技術的仮説を最小コストで検証し、実現不可能な箇所を早期に発見する
+* **目的**: 設計の前提のうち、実現性が本当に不確実なもの(§1.4 の A区分)だけを最小コストで検証し実現不可能な箇所を早期に発見する。実現性を疑う理由がないもの(B区分)は、検証プロセスを経ずに直接実装へ格上げする
 
 ---
 
@@ -33,34 +33,71 @@ design.md の実装フェーズ(§21)は Windows 縦切り(Phase 1A)から始ま
 **Windows キャプチャ系と共通タイムライン系を最優先(Wave 1)** とし、
 macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)の順で行う。
 
+### 1.4 スパイクとして残すもの / 実装へ格上げするものの分類(2026-07-09 改定)
+
+当初は SPIKE-01〜12 すべてを「使い捨てコードで検証し GO/NO-GO を判定してから本実装に入る」対象として扱っていた。しかし、WASAPI でのマイク/Endpoint Loopback 取得のように **Windows Core Audio の標準的な使い方の範囲内で、実現できることがほぼ確実な項目** まで、同じ重さの検証プロセス(使い捨てコード・タイムボックス・GO/NO-GO 判定・実機確認)に乗せる必要はない。以後、次の2区分で扱う。
+
+**A区分: 本当に不確実で、先に単独で潰す価値がある(スパイクとして継続。§1.1/1.2 の原則をそのまま適用)**
+
+| ID | 継続する理由 |
+|---|---|
+| SPIKE-02 | `ActivateAudioInterfaceAsync`(Process Loopback)を Rust の `windows` crate から呼べるかは前例が少なく、呼び出し可否そのものが不確実 |
+| SPIKE-06 | macOS は新規プラットフォームで、ScreenCaptureKit の権限まわり・タイムスタンプ系が未検証 |
+| SPIKE-07 | Linux も新規プラットフォームで、PipeWire の node 構造・ディストリ差異が未検証 |
+| SPIKE-09 | 「Windows から実際にどんな通知・エラーが飛んでくるか」はドキュメントだけでは分からない実地観測が本質 |
+
+**B区分: 実現性そのものは疑っておらず、直接実装へ格上げ(GO/NO-GO 判定なし、使い捨てコード前提も外す)**
+
+| ID | 格上げする理由 |
+|---|---|
+| SPIKE-01 | WASAPI でのマイク/Endpoint Loopback 同時取得は標準的な Core Audio の使い方であり、実現性を疑う理由がない |
+| SPIKE-03 | drift 補正アルゴリズムの正しさは OS API 非依存の疑似音源で検証でき、実装しながらテストを書けば足りる |
+| SPIKE-04 | atomic commit 手順はファイルシステム操作であり、実装しながら故障注入テストを書けば足りる |
+| SPIKE-05 | Tauri 2 の常駐は公式にサポートされている機能であり、実装しながら確認すれば足りる |
+| SPIKE-08 | アップロードの冪等性はモックサーバで実装しながらテストを書けば足りる |
+| SPIKE-10 | `keyring` crate の 3 OS round-trip は実装しながら確認すれば足りる |
+| SPIKE-11 | `IMMNotificationClient` も Windows Core Audio の標準的な使い方であり、実現性を疑う理由がない |
+| SPIKE-12 | Fake Worker での reducer 実装は純粋なロジックであり、実機なしで開発・テストできる |
+
+**運用上の変更点**
+
+* B区分の項目は、「SPIKE-XX」という識別番号はドキュメント上そのまま残すが、`spikes/{spike-id}/` 配下の使い捨てコードとしてではなく、そのままアプリ本体の実装として書き進めてよい。仮説・検証手順・合否基準は、実装時のセルフチェックリスト/テスト設計としてそのまま使う
+* B区分について、**Windows 実機での動作確認(実際にマイク・スピーカーへ向けて実行する検証)は個別に行わず、開発がある程度進んだ段階でまとめて実施する**(現状は [windows-build-verification.md](windows-build-verification.md) の通り、Linux 上のクロスコンパイルでビルドが通ることの確認のみで先へ進める)
+* A区分の項目のみ、引き続き §1.1(使い捨てコード原則)・§1.2(結果レポート)・タイムボックス超過時のエスカレーションを適用する
+* §7(Go/No-Go 判断基準)は A区分のみを対象に整理し直した
+
 ---
 
 ## 2. スパイク一覧(サマリ)
 
-| ID | テーマ | リスク | Wave | タイムボックス |
-|----|------|------|------|----------|
-| SPIKE-01 | WASAPI マイク + Endpoint Loopback 同時取得とタイムスタンプ | 高 | 1 | 3日 |
-| SPIKE-02 | Windows Application Loopback Capture(プロセス指定) | 高 | 1 | 3日 |
-| SPIKE-11 | Audio Endpoint Registry(全デバイスの観測状態追跡) | 高 | 1 | 3日 |
-| SPIKE-12 | Capture Rebinding State Machine(再バインド時のepoch整合性) | 高 | 1 | 4日 |
-| SPIKE-03 | 共通タイムライン整列・drift 補正アルゴリズム(疑似音源) | 高 | 1 | 4日 |
-| SPIKE-04 | Opus 30秒セグメントの atomic commit とクラッシュ復旧 | 中 | 1 | 2日 |
-| SPIKE-05 | Tauri 2 常駐(トレイ・ウィンドウ閉鎖時の録音継続) | 中 | 1 | 2日 |
-| SPIKE-06 | macOS ScreenCaptureKit: system audio + microphone 同時取得 | 高 | 2 | 4日 |
-| SPIKE-07 | Linux PipeWire: playback node 取得と sink monitor フォールバック | 高 | 2 | 4日 |
-| SPIKE-08 | チャンクアップロード + Idempotency-Key による重複防止 | 中 | 2 | 2日 |
-| SPIKE-09 | デバイス切断・スリープ復帰・Bluetooth プロファイル切替の挙動観測 | 中 | 3 | 3日 |
-| SPIKE-10 | OS 資格情報ストアへのトークン保存(3 OS) | 低 | 3 | 1日 |
+| ID | テーマ | リスク | Wave | タイムボックス | 区分 |
+|----|------|------|------|----------|------|
+| SPIKE-01 | WASAPI マイク + Endpoint Loopback 同時取得とタイムスタンプ | 高 | 1 | — | B: 直接実装 |
+| SPIKE-02 | Windows Application Loopback Capture(プロセス指定) | 高 | 1 | 3日 | A: スパイク |
+| SPIKE-11 | Audio Endpoint Registry(全デバイスの観測状態追跡) | 高 | 1 | — | B: 直接実装 |
+| SPIKE-12 | Capture Rebinding State Machine(再バインド時のepoch整合性) | 高 | 1 | — | B: 直接実装 |
+| SPIKE-03 | 共通タイムライン整列・drift 補正アルゴリズム(疑似音源) | 高 | 1 | — | B: 直接実装 |
+| SPIKE-04 | Opus 30秒セグメントの atomic commit とクラッシュ復旧 | 中 | 1 | — | B: 直接実装 |
+| SPIKE-05 | Tauri 2 常駐(トレイ・ウィンドウ閉鎖時の録音継続) | 中 | 1 | — | B: 直接実装 |
+| SPIKE-06 | macOS ScreenCaptureKit: system audio + microphone 同時取得 | 高 | 2 | 4日 | A: スパイク |
+| SPIKE-07 | Linux PipeWire: playback node 取得と sink monitor フォールバック | 高 | 2 | 4日 | A: スパイク |
+| SPIKE-08 | チャンクアップロード + Idempotency-Key による重複防止 | 中 | 2 | — | B: 直接実装 |
+| SPIKE-09 | デバイス切断・スリープ復帰・Bluetooth プロファイル切替の挙動観測 | 中 | 3 | 3日 | A: スパイク |
+| SPIKE-10 | OS 資格情報ストアへのトークン保存(3 OS) | 低 | 3 | — | B: 直接実装 |
 
-合計目安: 約 7 人週(Wave 間は一部並行可能)
+合計目安: A区分(スパイクとして残るもの)のみで約 1.5〜2 人週。B区分はタイムボックスを設けず、通常の実装スケジュールの中で進める。
 
 > **番号についての注記**: SPIKE-11/12 は本計画の後追いで追加したため、番号は末尾(11/12)だが **実施順は Wave 1、SPIKE-01/02 の直後** に置く。上表の並び順もその実施順を表しており、ID の昇順ではない。
+>
+> **区分についての注記(2026-07-09)**: 詳細は §1.4 を参照。B区分はスパイクとしての GO/NO-GO 判定・タイムボックスを設けず、直接実装として進める(以下の各節に残るタイムボックス・合否基準はセルフチェック用の参考値)。
 
 ---
 
 ## 3. Wave 1: Windows 縦切りの成立検証(Phase 1A の前提)
 
 ### SPIKE-01: WASAPI マイク + Endpoint Loopback 同時取得とタイムスタンプ
+
+> **B区分(直接実装へ格上げ、2026-07-09)**: WASAPI でのマイク/Endpoint Loopback 同時取得は標準的な Core Audio の使い方であり、実現性そのものは疑っていない。GO/NO-GO 判定・タイムボックスは設けず、以下はそのままアプリ本体の実装として進める。以下の仮説・検証手順・合否基準は実装時のセルフチェック/テスト設計として使う。Windows 実機での動作確認は個別に行わず、開発がある程度進んだ段階でまとめて実施する(§1.4)。
 
 **検証する仮説(design.md §5.1, §9.2)**
 
@@ -113,6 +150,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 ### SPIKE-11: Audio Endpoint Registry(全デバイスの観測状態追跡)
 
+> **B区分(直接実装へ格上げ、2026-07-09)**: `IMMNotificationClient` も Windows Core Audio の標準的な使い方であり、実現性そのものは疑っていない。GO/NO-GO 判定・タイムボックスは設けず、直接実装として進める(§1.4)。
+
 **実装詳細**: 本節の仮説・検証手順をコーディング着手可能な粒度まで詳細化したものが [spike-windows-11-detail-design.md](spike-windows-11-detail-design.md) にある(`IMMNotificationClient`の`#[implement]`実装、登録/解除、初期スナップショット構築、`EndpointOsEvent`型定義、消費スレッドでの`AudioEvent`変換)。
 
 **検証する仮説(design.md §16.5, §10 セッション状態モデルの前提)**
@@ -143,6 +182,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 ### SPIKE-12: Capture Rebinding State Machine(再バインド時の epoch 整合性)
 
+> **B区分(直接実装へ格上げ、2026-07-09)**: Fake Worker での reducer 実装は純粋なロジックであり、実機なしで開発・テストできる。GO/NO-GO 判定・タイムボックスは設けず、直接実装として進める(§1.4)。ただし検証手順4(実 WASAPI ワーカーへの差し替え)のみは、実機でのまとめ検証(§1.4)のタイミングで行う。
+
 **検証する仮説(design.md §16.5 のデバイス binding mode、SPIKE-01/02 の `capture_epoch` の一般化)**
 
 * `Idle → Resolving → Activating → Capturing → Interrupted → Rebinding / WaitingForDevice → Capturing` という共通の FSM で、マイク capture・Endpoint Loopback・Process Loopback の 3 種類のキャプチャソースを扱える
@@ -170,11 +211,19 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 **設計の全体像**: SPIKE-11/12 が検証する三層モデル(endpoint観測状態・選択ポリシー・録音bindingのFSM)、および Observation → Admission → Decision → Effect Execution への発展形は、[audio-device-state-architecture.md](audio-device-state-architecture.md) に設計書として整理してある。Fake Worker 実装(検証手順1〜3)はこの設計書の型定義・reducer をそのまま出発点にできる。
 
-**備考**: SPIKE-09(デバイス変更・スリープ・Bluetooth の挙動観測)とは役割が異なる。SPIKE-09 は「Windows から実際にどんな通知・エラーが飛んでくるか」の実地観測であり、SPIKE-11/12 は「観測したイベントを状態機械としてどう安全に処理するか」の検証にあたる。SPIKE-12 の FSM とハーネスは SPIKE-09 の実機シナリオでそのまま利用できるため、SPIKE-09 の実施前に完了しておくのが望ましい。
+**備考**: SPIKE-09(デバイス変更・スリープ・Bluetooth の挙動観測)とは役割が異なる。SPIKE-09 は「Windows から実際にどんな通知・エラーが飛んでくるか」の実地観測であり、SPIKE-11/12 は「観測したイベントを状態機械としてどう安全に処理するか」の検証にあたる。SPIKE-12 の FSM とハーネスは SPIKE-09 の実機シナリオでそのまま利用できるため、SPIKE-09 の実施前に完了しておくのが望ましい(実際にはSPIKE-09を先に実装したため、今回SPIKE-12は後追いで整合させる形になった)。
+
+* `CaptureBindingState`(`Stopped`/`Resolving`/`Starting`/`Running`/`Stopping`/`Waiting`/`Failed`)と`decide(state, input) -> Vec<Effect>`をaudio-device-state-architecture.md §6.4の型定義どおりに実装。`decide`は時刻取得・乱数・I/O・スレッド生成を一切行わない純粋関数
+* 検証手順2の4シナリオ(a〜d)をすべて`tests/scenarios.rs`にイベント列テストとして実装し、**全7テストがpass**(4シナリオ + stale event拒否 + 無限リトライ防止 + shutdown後Start抑止)
+* 検証手順3の不変条件(stale operation_id/epochの棄却、Stopping中に新規Startを発行しない、Pinnedが別endpointへフォールバックしない)もテストで確認済み
+* 実装中に**実際のバグを2件発見・修正**: (1) `start_binding`が`Stopped`状態からしか開始を許可しておらず、`Waiting`(デバイス復帰・リトライタイマー)からの再開始が常に無視されていた、(2) 連続失敗回数を`Waiting`状態の中だけに持たせていたため、`Starting`へ一度でも遷移すると回数が失われ、`MAX_RETRY_ATTEMPTS`に決して到達しない(実質無限リトライになる)実装になっていた。後者は`CaptureBinding`に`retry_attempt`フィールドを追加し、lifecycle enumを跨いで保持する形に直して解消した
+* 検証手順4(実WASAPIワーカーへの差し替え)は未着手。SPIKE-01/02/09で実装済みの`spike_common::capture_loop`/`device_watch`をFake Worker側の型(`Observation`/`Effect`)へ変換するアダプタ層が必要で、実機での`RecoveryTiming`計測とあわせて、開発がまとまった段階でのWindows実機検証時に行う
 
 ---
 
 ### SPIKE-03: 共通タイムライン整列・drift 補正(疑似音源)
+
+> **B区分(直接実装へ格上げ、2026-07-09)**: OS API 非依存の疑似音源で検証できるロジックであり、実装しながらテストを書けば足りる。GO/NO-GO 判定・タイムボックスは設けない(§1.4)。
 
 **検証する仮説(design.md §11, §19.2)**
 
@@ -203,6 +252,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 ### SPIKE-04: Opus セグメントの atomic commit とクラッシュ復旧
 
+> **B区分(直接実装へ格上げ、2026-07-09)**: atomic commit 手順はファイルシステム操作であり、実装しながら故障注入テストを書けば足りる。GO/NO-GO 判定・タイムボックスは設けない(§1.4)。
+
 **検証する仮説(design.md §11.1, §12.2)**
 
 * Rust から Opus(Ogg コンテナ、48kHz mono)で 30 秒セグメントをエンコードできる(`opus` / `ogg` crate、または audiopus)
@@ -230,6 +281,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 ### SPIKE-05: Tauri 2 常駐と録音ライフサイクル分離
 
+> **B区分(直接実装へ格上げ、2026-07-09)**: Tauri 2 の常駐は公式にサポートされている機能であり、実装しながら確認すれば足りる。GO/NO-GO 判定・タイムボックスは設けない(§1.4)。
+
 **検証する仮説(design.md §6, §14)**
 
 * Tauri 2 でウィンドウを閉じてもトレイ常駐でバックエンド(録音スレッド)が継続する
@@ -250,6 +303,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 * レベルメーター更新でフレーム落ち・IPC 詰まりが起きない
 
 **タイムボックス**: 2日
+
+**実行検証は本環境ではブロックされている**: このコンテナ内でWebKitGTKのWebView初期化がハングし、ビルド済みバイナリを実行してのソークテスト(RSSサンプリング、SIGUSR1によるhide/show模擬)が行えないことを確認した。原因はvirtio-gpu仮想GPUにMesaドライバがbindされていないこと(`libEGL warning: pci id for fd ...: 1b36:0100, driver (null)`)で、`WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS`/`WEBKIT_DISABLE_COMPOSITING_MODE`/`WEBKIT_DISABLE_DMABUF_RENDERER`/`LIBGL_ALWAYS_SOFTWARE`/`GALLIUM_DRIVER=llvmpipe`/`GDK_GL=disable`等の組み合わせを試したが解消しなかった。**この問題が本スパイクのRustコードに起因しないことは、webkit2gtk本体付属の`MiniBrowser`(Tauri/wryを一切介さない)でも同一環境下で`about:blank`の表示すら同様にハングすることを確認して切り分け済み**(素のGTK3ウィンドウ(`gtk` crateで自作した最小テスト)は同じXvfb環境で問題なく動作したため、GTK自体ではなくWebKitGTKのGPU初期化に問題が限局されている)。ソークテスト用スクリプト(`spikes/spike-05-tauri-tray/soak_test.sh`)は実行可能な状態で用意してあるので、実GPUまたは3Dアクセラレーション付きの環境が手に入り次第そのまま使える。SPIKE-06/07(実機が必要)と同様、本スパイクも「実装は完了しているが実行検証にはこの環境にない何か(実GPU/実ディスプレイ)が要る」という位置づけになった。
 
 ---
 
@@ -312,6 +367,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 ### SPIKE-08: チャンクアップロードと Idempotency-Key
 
+> **B区分(直接実装へ格上げ、2026-07-09)**: アップロードの冪等性はモックサーバで実装しながらテストを書けば足りる。GO/NO-GO 判定・タイムボックスは設けない(§1.4)。
+
 **検証する仮説(design.md §13)**
 
 * `UploadAdapter` trait の契約(create → segment PUT → finalize)で、順序不定・重複送信・途中再開を安全に扱える
@@ -330,6 +387,13 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 * 再起動後の再開で二重送信が発生しても API 上は冪等に処理される
 
 **タイムボックス**: 2日
+
+* `UploadAdapter`契約(create→segment PUT→finalize)をaxumモックサーバ+reqwestクライアント+rusqlite(bundled、実際のSQLite)で実装
+* モックサーバは`Idempotency-Key`到達時点でキャッシュ済み応答があれば本体ロジックへ到達させず即座に返す(design.md §13.3「APIが受領済みの場合は成功扱い」)。故障注入は「本体処理前に弾く」「本体処理(書き込み)は成功させたうえで応答だけ握りつぶす(受領済みなのに応答喪失)」「タイムアウトを誘発する疑似スリープ」の3種を用意し、後者2つが冪等性の本質的なテストになる
+* クライアントはdesign.md §13.3の再送規則(timeout/5xx/429は再送、401はトークン更新後1回だけ再送、4xx恒久エラーは即停止)どおりに分類し、exponential backoff + jitterで再送する
+* 検証手順3: 100セグメントを8並列・故障率合計30%(pre 10% + post 10% + timeout 10%)で完走させ、**サーバ側の実書き込み回数がちょうど100件、かつ全セグメントで書き込み回数が1回であること(重複登録0件)を確認**
+* 検証手順4: 100セグメントをSQLiteスプールへ積み、39個目まで正常アップロード、40個目(index=39)は「サーバへの送信は成功したがローカルDBへuploaded=1を書く前にプロセスが死んだ」状態を再現してそこで打ち切り、新しい`SpoolDb`ハンドルで再接続(プロセス再起動相当)して残り61件(39個目の再送を含む)を再開。**39個目はクライアント視点で2回送信されるが、サーバ側の実書き込みは1回のみであることを確認**(Idempotency-Keyが`{session_id}:{track}:{sequence}`から決定的に導出されるため、再送でも同じキーになることが前提)
+* 合否基準の両方(重複登録0件・欠落0件でfinalize到達/再起動後の再開が冪等)を`cargo test`で自動化し、いずれもpass
 
 ---
 
@@ -356,9 +420,13 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 **タイムボックス**: 3日
 
+ただし、これは「観測・復帰の仕組みを実装した」だけであり、**検証手順2・合否基準そのものは実機でのUSBマイク抜き差し・既定デバイス切替・スリープ・BT切替を実際に行うまで未検証**。実機検証は開発が一定まとまった段階でまとめて行う方針(windows-build-verification.md参照)。silence挿入自体はSPIKE-03の責務のため、今回の実装はイベント記録とストリーム再アタッチのみに留めている。
+
 ---
 
 ### SPIKE-10: OS 資格情報ストアへのトークン保存
+
+> **B区分(直接実装へ格上げ、2026-07-09)**: `keyring` crate の 3 OS round-trip は実装しながら確認すれば足りる。GO/NO-GO 判定・タイムボックスは設けない(§1.4)。
 
 **検証する仮説(design.md §12.4)**
 
@@ -373,6 +441,11 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 **合否基準**: 3 OS の標準デスクトップ環境で round-trip 成功。Linux 例外系の方針が決まる
 
 **タイムボックス**: 1日
+
+* `keyring` crate(v2)でOS資格情報ストアへの保存を試みたところ、実際に次のエラーを観測した: `Platform secure storage failure: zbus error: org.freedesktop.DBus.Error.ServiceUnknown: The name org.freedesktop.secrets was not provided by any .service files`。これは「Secret Serviceデーモンが起動していない」ことを示す典型的なエラーであり、検証手順2の「エラーを観測」がそのまま実測できた
+* 上記のエラー文字列を判定条件として、暗号化ファイル(AES-256-GCM、マスターキーはファイル権限0600で保護)へフォールバックする`FallbackCredentialStore`を実装。フォールバックは「バックエンドが存在しない」ことを示すエラーだけに絞り、認証拒否やロック中などその他のエラーでは低強度の保護へ意図せず落ちないようにした
+* save/load/delete のround-tripを暗号化ファイルストアで実施し、**プロセス再起動を模した(新しいインスタンスで同じディレクトリを開き直す)テストでもマスターキーの永続化・復号が成功することを確認**。フォールバック込みのエンドツーエンドテストも含め全4テストがpass
+* Windows Credential Manager / macOS Keychainでのround-tripはこの環境では検証不可(実機が必要)。ただし`keyring` crateが3 OSを同じAPIで抽象化する設計のため、Linux側で発見した「バックエンド不在時のエラー分類とフォールバック方針」というLinux固有の課題は解決済みで、残るリスクはWindows/macOS側の実機round-tripの確認のみ
 
 ---
 
@@ -395,25 +468,34 @@ flowchart LR
     S10[SPIKE-10 資格情報]
 ```
 
-* SPIKE-01 と SPIKE-03 は独立しており、**2 名いれば初日から並行可能**(1 名なら 01 → 03 の順)
-* SPIKE-11 は Windows Core Audio のデバイス列挙 API のみに依存するため、SPIKE-01 と並行着手できる。SPIKE-12 は Fake Worker で FSM 自体を先に作れるため SPIKE-01/02 の完了を待たずに設計・実装を始められるが、実 WASAPI ワーカーへの差し替え検証(検証手順4)は SPIKE-01/02 完了後に行う
-* SPIKE-06 / 07 は Wave 1 と独立のため、環境(macOS 15 実機、Ubuntu 24.04 実機)さえあれば前倒し可能
-* **Phase 1A 着手の Go/No-Go 判断は SPIKE-01〜05, 11, 12 完了時点** で行う(目安: 開始から 3〜3.5 週)
-* SPIKE-11/12 を通してから SPIKE-03(共通タイムライン)へ進むことで、後から録音基盤(epoch 境界の扱い)を作り直すリスクを下げる
+* **B区分(SPIKE-01/03/04/05/08/10/11/12)にはゲートがない**。上の依存関係は「どちらを先に実装すると手戻りが少ないか」という実装順の目安であり、GO/NO-GO 判断のための待ち合わせ点ではない
+* SPIKE-01 と SPIKE-03 は独立しており、**2 名いれば初日から並行して実装可能**(1 名なら 01 → 03 の順)
+* SPIKE-11 は Windows Core Audio のデバイス列挙 API のみに依存するため、SPIKE-01 と並行着手できる。SPIKE-12 は Fake Worker で FSM 自体を先に作れるため SPIKE-01/02 の完了を待たずに設計・実装を始められるが、実 WASAPI ワーカーへの差し替え(検証手順4)は実機でのまとめ検証(§1.4)のタイミングで行う
+* **A区分(SPIKE-02/06/07/09)のみ、引き続き GO/NO-GO 判断の対象**。SPIKE-06 / 07 は Wave 1 と独立のため、環境(macOS 15 実機、Ubuntu 24.04 実機)さえあれば前倒し可能
+* **Phase 1A の実装着手そのものにゲートはない**。design.md のレビューが完了し次第、B区分の実装(SPIKE-01/03/04/05/11/12 相当)に着手する。並行して SPIKE-02(Application Loopback)の可否を検証し、結果に応じて §5.1 / §20.2 の対応範囲を確定する
+* SPIKE-11/12 を先に実装してから SPIKE-03(共通タイムライン)へ進むことで、後から録音基盤(epoch 境界の扱い)を作り直すリスクを下げる、という順序自体は変わらない
 * macOS(Phase 1C)/ Linux(Phase 1D)の計画確定は SPIKE-06 / 07 の結果を待つ
 
 ---
 
-## 7. Go/No-Go 判断基準(全体)
+## 7. Go/No-Go 判断基準(A区分のみ)
+
+**2026-07-09 改定**: §1.4 の区分に伴い、この表は A区分(SPIKE-02/06/07/09)のみを対象にする。B区分(SPIKE-01/03/04/05/08/10/11/12)は GO/NO-GO 判断を設けず、実装と受け入れ条件(design.md §20)のテストで確認する。Phase 1A の実装着手自体にゲートはない(§6)。
 
 | 判断ポイント | GO 条件 | NO-GO 時のアクション |
 |---|---|---|
-| Phase 1A 着手 | SPIKE-01, 03, 04, 05, 11, 12 がすべて GO | 技術スタック(§6)の再検討。特に SPIKE-05 NO-GO なら Tauri 以外のシェルを評価 |
 | Application Loopback 採用 | SPIKE-02 が GO または CONDITIONAL-GO | Endpoint Loopback のみで Phase 1B を再定義し、§5.1 / §20.2 を修正 |
-| デバイス自動再バインド(§16.5 Follow system default 含む) | SPIKE-11, 12 が GO | Phase 1 は §16.5 の既定どおり `Fixed selected device` のみを提供し、`Follow system default` / `Ask before switching` は実験的設定または Phase 2 へ繰延べ。Pinned デバイスの切断検出・待機・復帰(§16.1)のみは最低限の縮退スコープとして維持する |
 | macOS を Phase 1C で実施 | SPIKE-06 が GO | macOS 対応時期の再計画、または CoreAudio tap 等の代替方式スパイクを追加 |
 | Linux を Phase 1D で実施 | SPIKE-07 が GO または CONDITIONAL-GO | 対応ディストリの絞り込み、または monitor 専用へ §5.3 を縮退 |
-| 品質ゴール(同期 100ms) | SPIKE-03 の実測 + SPIKE-01/06/07 のタイムスタンプ精度で達成見込み | §3.2 の目標値見直し、または drift 補正方式の追加スパイク |
+| デバイス変更時の障害復旧方針 | SPIKE-09 で、すべての障害イベントが「検出可能」に分類できる | 検出不能なサイレント無音が残る箇所を design.md §16 に既知の制約として明記し、リリース前に再検証 |
+
+**B区分の妥当性は次のテストで確認する(GO/NO-GO 判断ではなく実装の受け入れ条件として)**
+
+| 確認事項 | 確認方法 |
+|---|---|
+| 品質ゴール(同期 100ms、design.md §3.2) | SPIKE-03 相当の疑似音源シミュレーション(2時間相当)を自動テスト化し、CI で継続的に確認する |
+| デバイス自動再バインド(design.md §16.5) | SPIKE-12 相当のイベント列テスト・property test がすべて通過することを確認する。Phase 1 では `Fixed selected device` を既定とし、`Follow system default` は §16.5 のとおり実験的設定に留める方針自体は変えない |
+| Tauri 常駐(SPIKE-05 相当) | 実装後、1 時間の常駐でメモリリークがないことを開発中に確認する |
 
 ---
 
@@ -428,6 +510,8 @@ flowchart LR
 * [ ] 検証結果を置くリポジトリ `spikes/` ディレクトリと RESULT.md テンプレート
 
 SPIKE-11/12 は上記の USB マイク・Bluetooth ヘッドセット・Windows 11 実機のみで検証可能であり、追加の準備物は不要。
+
+**B区分(SPIKE-01/03/04/05/08/10/11/12)は、上記の実機がなくてもLinux上のクロスコンパイル(`x86_64-pc-windows-gnu` ターゲット)でビルド確認しながら実装を進められる**([windows-build-verification.md](windows-build-verification.md) 参照)。実際にマイク・スピーカーへ向けて実行する動作確認は、A区分スパイク(SPIKE-02/09)の実施タイミング、または開発がまとまった段階でのバルク検証時にあわせて行う。
 
 ---
 
