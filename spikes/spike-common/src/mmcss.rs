@@ -12,14 +12,24 @@ struct MmcssGuard(windows::Win32::Foundation::HANDLE);
 
 impl Drop for MmcssGuard {
     fn drop(&mut self) {
-        // TODO(§3.9): AvRevertMmThreadCharacteristics(self.0)
+        let _ = unsafe { windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(self.0) };
     }
 }
 
 pub fn with_pro_audio_priority<F: FnOnce() -> R, R>(f: F) -> (bool, R) {
-    // TODO(§3.9): AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index)
-    // 成功時: let _guard = MmcssGuard(handle); (true, f())
-    // 失敗時: tracing::warn!(...); (false, f())
-    tracing::warn!("mmcss::with_pro_audio_priority is not yet implemented; running without MMCSS");
-    (false, f())
+    let mut task_index: u32 = 0;
+    // w!マクロには依存せず、HSTRINGをPCWSTRとして渡す(Param<PCWSTR>実装済み)。
+    let task_name = windows::core::HSTRING::from("Pro Audio");
+    match unsafe {
+        windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW(&task_name, &mut task_index)
+    } {
+        Ok(handle) => {
+            let _guard = MmcssGuard(handle);
+            (true, f())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "MMCSS registration failed; running without Pro Audio priority");
+            (false, f())
+        }
+    }
 }

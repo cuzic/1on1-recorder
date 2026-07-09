@@ -274,6 +274,30 @@ pub struct ProcessTimes {
     pub user_time_100ns: u64,
 }
 
+fn filetime_to_100ns(ft: windows::Win32::Foundation::FILETIME) -> u64 {
+    ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+}
+
+impl ProcessTimes {
+    /// 現在プロセスのカーネル時間/ユーザー時間を取得する。
+    pub fn query_current() -> windows::core::Result<Self> {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe {
+            GetProcessTimes(GetCurrentProcess(), &mut creation, &mut exit, &mut kernel, &mut user)?;
+        }
+        Ok(Self {
+            kernel_time_100ns: filetime_to_100ns(kernel),
+            user_time_100ns: filetime_to_100ns(user),
+        })
+    }
+}
+
 pub fn measure_cpu_percent(start: ProcessTimes, end: ProcessTimes, wall_secs: f64) -> f64 {
     if wall_secs <= 0.0 {
         return 0.0;
@@ -285,6 +309,19 @@ pub fn measure_cpu_percent(start: ProcessTimes, end: ProcessTimes, wall_secs: f6
 }
 
 pub fn measure_peak_working_set_bytes() -> u64 {
-    // TODO(§4.9): GetProcessMemoryInfo().PeakWorkingSetSize (Win32専用)
-    0
+    use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb).0 != 0
+    };
+    if ok {
+        counters.PeakWorkingSetSize as u64
+    } else {
+        0
+    }
 }

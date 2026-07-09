@@ -6,15 +6,19 @@ pub struct ComApartment;
 
 impl ComApartment {
     pub fn new_mta() -> windows::core::Result<Self> {
-        // TODO(§3.6): windows::Win32::System::Com::CoInitializeEx(
-        //     None, windows::Win32::System::Com::COINIT_MULTITHREADED,
-        // )
-        todo!("CoInitializeEx(None, COINIT_MULTITHREADED)")
+        unsafe {
+            windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_MULTITHREADED,
+            )
+        }
+        .ok()?;
+        Ok(Self)
     }
 }
 
 impl Drop for ComApartment {
     fn drop(&mut self) {
-        // TODO(§3.6): windows::Win32::System::Com::CoUninitialize()
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
     }
 }

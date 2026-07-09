@@ -6,6 +6,10 @@ publish.workspace = true
 
 [dependencies]
 windows = { workspace = true }
+# #[windows::core::implement(...)]が生成するコードはwindows_core::...という
+# 直接のクレートパスを参照するため、windows経由の再エクスポート(windows::core)
+# だけでは解決できない(spike-02-app-loopback/Cargo.tomlで実際に検出済み)。
+windows-core = "0.58"
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 csv = { workspace = true }

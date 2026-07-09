@@ -11,6 +11,10 @@ pub struct MicCaptureStream {
     pub device_id_or_default: String, // CLIの--mic-deviceそのまま
     pub role: DeviceRole,
     pub pipeline_drop_counter: Arc<AtomicU64>,
+    pub callback_timeout_ms: u32,
+    /// spike-plan.md SPIKE-09: デバイス消失検出後の再アタッチのたびに
+    /// 呼び出し側(main.rs)がインクリメントする。
+    pub capture_epoch: u64,
 }
 
 impl CaptureStream for MicCaptureStream {
@@ -31,12 +35,12 @@ impl CaptureStream for MicCaptureStream {
                 },
                 extra_stream_flags: 0,
                 stream_id: StreamId::Mic,
-                callback_timeout_ms: 2000,
+                callback_timeout_ms: self.callback_timeout_ms,
                 pipeline_drop_counter: self.pipeline_drop_counter,
             },
             tx,
             stop,
-            /* capture_epoch */ 0,
+            self.capture_epoch,
         )
     }
 }

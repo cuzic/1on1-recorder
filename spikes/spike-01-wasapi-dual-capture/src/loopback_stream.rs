@@ -13,6 +13,10 @@ pub struct EndpointLoopbackStream {
     pub device_id_or_default: String,
     pub role: DeviceRole,
     pub pipeline_drop_counter: Arc<AtomicU64>,
+    pub callback_timeout_ms: u32,
+    /// spike-plan.md SPIKE-09: デバイス消失検出後の再アタッチのたびに
+    /// 呼び出し側(main.rs)がインクリメントする。
+    pub capture_epoch: u64,
 }
 
 impl CaptureStream for EndpointLoopbackStream {
@@ -33,12 +37,12 @@ impl CaptureStream for EndpointLoopbackStream {
                 },
                 extra_stream_flags: AUDCLNT_STREAMFLAGS_LOOPBACK,
                 stream_id: StreamId::EndpointLoopback,
-                callback_timeout_ms: 2000,
+                callback_timeout_ms: self.callback_timeout_ms,
                 pipeline_drop_counter: self.pipeline_drop_counter,
             },
             tx,
             stop,
-            /* capture_epoch */ 0,
+            self.capture_epoch,
         )
     }
 }

@@ -422,6 +422,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 ただし、これは「観測・復帰の仕組みを実装した」だけであり、**検証手順2・合否基準そのものは実機でのUSBマイク抜き差し・既定デバイス切替・スリープ・BT切替を実際に行うまで未検証**。実機検証は開発が一定まとまった段階でまとめて行う方針(windows-build-verification.md参照)。silence挿入自体はSPIKE-03の責務のため、今回の実装はイベント記録とストリーム再アタッチのみに留めている。
 
+**実装状況(2026-07-09)**: 検証手順1(SPIKE-01のハーネスへイベントログを追加)は実装済み。`spike-common::device_watch`(`IMMNotificationClient`実装、`IAgileObject`込み)でデバイス追加/削除/状態変化/既定デバイス変更/プロパティ変更を`device_events.jsonl`へ記録し、`spike-common::capture_loop`で`IAudioSessionEvents::OnSessionDisconnected`の観測と`AUDCLNT_E_DEVICE_INVALIDATED`検出→`CaptureExit::DeviceLost`への変換を実装。検証手順3(検出→再初期化の最小実装)も、SPIKE-01の`main.rs`に`StreamSupervisor`として実装済み(デバイス消失検出後、同じ`device_id_or_default`で再解決・再初期化を試みる。上限は`--max-recovery-attempts`、既定10)。
+
 ---
 
 ### SPIKE-10: OS 資格情報ストアへのトークン保存

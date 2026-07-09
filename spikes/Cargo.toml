@@ -22,6 +22,12 @@ windows = { version = "0.58", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Foundation",
     "Win32_System_Performance",
+    # SPIKE-01実装で追加(spike-plan.md §1.4のB区分格上げに伴う実装時に判明):
+    "Win32_Security",                    # CreateEventWがWin32_Security feature gate配下にある
+    "Win32_UI_Shell_PropertiesSystem",   # IMMDevice::OpenPropertyStore/IPropertyStore
+    "Win32_Devices_FunctionDiscovery",   # PKEY_Device_FriendlyName
+    "Win32_System_ProcessStatus",        # K32GetProcessMemoryInfo(summary.jsonのpeak working set用)
+    "Win32_System_SystemInformation",    # OSVERSIONINFOEXW(RtlGetVersionの引数型)
     # cargo checkで実際に検出した抜け(design.mdの§7で「要確認」としていた点):
     # このfeatureがないと`_Impl`トレイト自体が生成されず、
     # #[implement(...)]でCOMオブジェクト(CompletionHandler等)を実装できない。

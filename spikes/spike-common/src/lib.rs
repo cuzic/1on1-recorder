@@ -1,21 +1,35 @@
 // spike-windows-01-02-detail-design.md §3
 
+pub mod aggregator;
 pub mod analyze;
+pub mod capture_loop;
 pub mod com_guard;
 pub mod csv_log;
+pub mod device_watch;
 pub mod error;
 pub mod frame_record;
+pub mod jsonl_log;
 pub mod mmcss;
 pub mod os_check;
 pub mod timestamp;
 pub mod wav_writer;
 
+pub use capture_loop::run_capture_loop;
+
 pub use error::SpikeError;
 pub use frame_record::{CapturedFrameRecord, StreamId};
 
-use windows::Win32::Media::Audio::WAVEFORMATEX;
+use windows::Win32::Media::Audio::{WAVEFORMATEX, WAVEFORMATEXTENSIBLE};
+use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
+use windows::Win32::Media::Multimedia::WAVE_FORMAT_IEEE_FLOAT;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::Foundation::HANDLE;
+
+/// KSDATAFORMAT_SUBTYPE_IEEE_FLOAT。windowsクレートの生成コードには
+/// (KSDATAFORMAT_SUBTYPE_PCMと異なり)このGUIDが含まれていないため、
+/// ks.h/mmreg.hで定義された固定値をそのまま定数化する。
+const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: windows::core::GUID =
+    windows::core::GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 
 pub enum CaptureEvent {
     Frame {
@@ -26,6 +40,11 @@ pub enum CaptureEvent {
         stream: StreamId,
         format: AudioFormatInfo,
         qpc_freq_hz: u64,
+        /// 実際に解決されたIMMDevice::GetId()。summary.json(§4.8)のdevicesブロックへ
+        /// 記録し、"default"解決時にどのデバイスが実際に使われたかを後から検証できる
+        /// ようにする(§4.3)。
+        device_id: String,
+        device_friendly_name: String,
     },
     StreamError {
         stream: StreamId,
@@ -38,6 +57,22 @@ pub enum CaptureEvent {
         stream: StreamId,
         exit: CaptureExit,
         mmcss_applied: bool,
+    },
+    /// Process Loopbackで対象アプリが無音の間、通知が来ずタイムアウトを
+    /// 繰り返した回数(§4.4/§5.9)。エラーではない。capture_loop::run_capture_loop
+    /// がループを抜ける直前に一度だけ送る。
+    IdleTimeoutObserved {
+        stream: StreamId,
+        idle_timeout_count: u64,
+    },
+    /// SPIKE-09: `IAudioSessionEvents::OnSessionDisconnected`を観測した。
+    /// `reason_raw`は`AudioSessionDisconnectReason`の生値(DeviceRemoval=0,
+    /// ServerShutdown=1, FormatChanged=2, SessionLogoff=3,
+    /// SessionDisconnected=4, ExclusiveModeOverride=5)。COM型を直接
+    /// スレッド間で持ち回さないため整数のまま送る。
+    SessionDisconnected {
+        stream: StreamId,
+        reason_raw: i32,
     },
 }
 
@@ -72,7 +107,61 @@ impl AudioFormatInfo {
     /// WAVE_FORMAT_EXTENSIBLEかどうかでWAVEFORMATEXTENSIBLEとして
     /// 再解釈するかを分岐する。
     pub fn from_waveformatex(wfx: &WAVEFORMATEX) -> Self {
-        todo!("§3.8: WAVEFORMATEX/WAVEFORMATEXTENSIBLEからAudioFormatInfoを構築する")
+        let block_align = wfx.nBlockAlign;
+        let bytes_per_sample = if wfx.nChannels > 0 {
+            block_align / wfx.nChannels
+        } else {
+            wfx.wBitsPerSample / 8
+        };
+
+        // WAVE_FORMAT_EXTENSIBLEの場合のみ、cbSizeがWAVEFORMATEXTENSIBLE分の
+        // 追加フィールドを含んでいることを確認したうえで再解釈する。cbSizeが
+        // 不足している(壊れたフォーマット記述)場合は非EXTENSIBLE扱いにフォール
+        // バックし、パニックを避ける。
+        let extensible_extra_size =
+            std::mem::size_of::<WAVEFORMATEXTENSIBLE>() - std::mem::size_of::<WAVEFORMATEX>();
+        if wfx.wFormatTag as u32 == WAVE_FORMAT_EXTENSIBLE
+            && wfx.cbSize as usize >= extensible_extra_size
+        {
+            // WAVEFORMATEXは`WAVEFORMATEXTENSIBLE`の先頭フィールド(Format)と
+            // レイアウトが一致するため、cbSizeで安全性を確認したうえで
+            // 同じメモリを`WAVEFORMATEXTENSIBLE`として再解釈してよい。ただし
+            // 元のWAVEFORMATEXが4byteアライメントを保証しないため、参照を
+            // 取らずread_unalignedでスタックへコピーしてから読む
+            // (`&*ptr`でGUIDフィールドへの参照を作るとE0793で弾かれる)。
+            let ext = unsafe {
+                std::ptr::read_unaligned(wfx as *const WAVEFORMATEX as *const WAVEFORMATEXTENSIBLE)
+            };
+            let valid_bits_per_sample = unsafe { ext.Samples.wValidBitsPerSample };
+            // WAVEFORMATEXTENSIBLEはpacked structのため、フィールドへの参照は
+            // (コピーであっても)作れない。値をローカル変数へコピーしてから比較する。
+            let sub_format = ext.SubFormat;
+            Self {
+                sample_rate: wfx.nSamplesPerSec,
+                channels: wfx.nChannels,
+                bits_per_sample: wfx.wBitsPerSample,
+                is_float: sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+                format_tag: wfx.wFormatTag,
+                sub_format: Some(sub_format),
+                block_align,
+                valid_bits_per_sample,
+                channel_mask: ext.dwChannelMask,
+                bytes_per_sample,
+            }
+        } else {
+            Self {
+                sample_rate: wfx.nSamplesPerSec,
+                channels: wfx.nChannels,
+                bits_per_sample: wfx.wBitsPerSample,
+                is_float: wfx.wFormatTag as u32 == WAVE_FORMAT_IEEE_FLOAT,
+                format_tag: wfx.wFormatTag,
+                sub_format: None,
+                block_align,
+                valid_bits_per_sample: wfx.wBitsPerSample,
+                channel_mask: 0,
+                bytes_per_sample,
+            }
+        }
     }
 }
 
@@ -115,12 +204,14 @@ unsafe impl Sync for StopSignal {}
 
 impl StopSignal {
     pub fn new() -> windows::core::Result<Self> {
-        todo!("§3.8: CreateEventW(None, manual_reset=true, initial=false, None)")
+        // manual_reset=true, initial_state=false, 無名イベント。
+        let event = unsafe { windows::Win32::System::Threading::CreateEventW(None, true, false, None)? };
+        Ok(Self { event })
     }
 
     /// SetEvent。以後handle()を待っているすべてのスレッドが即座に解除される。
     pub fn signal(&self) -> windows::core::Result<()> {
-        todo!("§3.8: SetEvent(self.event)")
+        unsafe { windows::Win32::System::Threading::SetEvent(self.event) }
     }
 
     pub fn handle(&self) -> HANDLE {
@@ -130,7 +221,7 @@ impl StopSignal {
 
 impl Drop for StopSignal {
     fn drop(&mut self) {
-        // TODO(§3.8): windows::Win32::Foundation::CloseHandle(self.event)
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.event) };
     }
 }
 
