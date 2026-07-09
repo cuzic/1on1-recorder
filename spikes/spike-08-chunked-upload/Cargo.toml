@@ -1,0 +1,25 @@
+[package]
+name = "spike-08-chunked-upload"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# spike-plan.md SPIKE-08: windowsクレートに依存しない。design.md §13の
+# UploadAdapter契約をモックサーバ(axum)+実HTTPクライアント(reqwest)+
+# 実SQLite(rusqlite, bundled)で検証する。
+[dependencies]
+anyhow = { workspace = true }
+axum = "0.7"
+hex = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
