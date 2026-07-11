@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/audio-timeline",
+    "crates/capture-api",
 ]
 
 [workspace.package]
