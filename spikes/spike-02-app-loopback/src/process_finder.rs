@@ -76,6 +76,36 @@ pub fn find_process_by_name(
     }
 }
 
+/// --target-process/--target-pidのどちらも未指定でも起動できるよう、
+/// よくある会議・ブラウザアプリの実行ファイル名を既定候補として
+/// 現在起動中のプロセスから探す(「起動してEnterを押すだけ」の運用のため)。
+/// 見つかった実行ファイル名(重複なし、検出順)を返す。
+const DEFAULT_CANDIDATE_EXE_NAMES: &[&str] = &[
+    "Zoom.exe",
+    "ms-teams.exe",
+    "Teams.exe",
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+];
+
+pub fn find_running_candidate_exe_names() -> Vec<String> {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    let mut found = Vec::new();
+    for &candidate in DEFAULT_CANDIDATE_EXE_NAMES {
+        let running = sys
+            .processes()
+            .values()
+            .any(|p| p.name().eq_ignore_ascii_case(candidate));
+        if running {
+            found.push(candidate.to_string());
+        }
+    }
+    found
+}
+
 /// --target-pidが明示された場合はこちらを使い、名前解決を経由しない。
 pub fn resolve_process_by_pid(pid: u32) -> Option<ProcessMatch> {
     let mut sys = System::new_all();

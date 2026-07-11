@@ -28,7 +28,7 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 #[derive(Parser, Debug)]
 struct Cli {
     /// イベント受信を続ける秒数(実機での抜き差し・設定変更操作を行う時間)。
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 90)]
     run_seconds: u64,
 
     #[arg(long, default_value = "out")]
@@ -42,6 +42,20 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+
+    spike_common::report::print_banner(
+        "SPIKE-11",
+        "Audio Endpoint Registry(全デバイスの観測状態追跡)",
+        &[
+            &format!("これから{}秒間、オーディオデバイスの変化を監視します。", cli.run_seconds),
+            "この間に、できる範囲で次のような操作を試してください:",
+            "  - USBマイクやヘッドセットの抜き差し",
+            "  - Windowsの「サウンド設定」でマイク/スピーカーを無効化→再度有効化",
+            "  - 既定のマイク・既定のスピーカーを変更",
+            "  - Bluetoothヘッドセットの接続・切断",
+            "何もしなくても起動時の初期スキャンとレジストリの整合性は検証できます。",
+        ],
+    );
 
     let run_id = cli.run_id.clone().unwrap_or_else(|| {
         std::time::SystemTime::now()
@@ -63,7 +77,8 @@ fn main() -> anyhow::Result<()> {
     let now0 = qpc.now_100ns();
     let initial_snapshots = endpoint_query::scan_all_endpoints(&enumerator, now0)?;
     let initial_routes = endpoint_query::scan_default_routes(&enumerator);
-    tracing::info!(count = initial_snapshots.len(), "initial endpoint scan complete");
+    let initial_count = initial_snapshots.len();
+    tracing::info!(count = initial_count, "initial endpoint scan complete");
 
     let mut registry = EndpointRegistry::new(initial_snapshots, initial_routes);
 
@@ -73,11 +88,18 @@ fn main() -> anyhow::Result<()> {
     let mut applied_events: u64 = 0;
     let mut apply_errors: u64 = 0;
 
+    println!("初期スキャンで{initial_count}件のendpointを検出しました。監視を開始します...");
+
     let deadline = Instant::now() + Duration::from_secs(cli.run_seconds);
+    let mut last_countdown_print = Instant::now();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
+        }
+        if last_countdown_print.elapsed() >= Duration::from_secs(10) {
+            println!("...残り約{}秒(ここまでの検出イベント数: {applied_events})", remaining.as_secs());
+            last_countdown_print = Instant::now();
         }
         let timeout = remaining.min(Duration::from_millis(500));
         let event = match rx.recv_timeout(timeout) {
@@ -118,7 +140,19 @@ fn main() -> anyhow::Result<()> {
     let summary = build_summary(&dispatch_latency_us, applied_events, apply_errors, &final_snapshots);
     std::fs::write(out_dir.join("summary.json"), serde_json::to_string_pretty(&summary)?)?;
 
-    tracing::info!(out_dir = %out_dir.display(), "spike-11 run complete");
+    println!(
+        "検出した最終endpoint数: {}件(詳細は{}に保存)",
+        final_snapshots.len(),
+        out_dir.display()
+    );
+    let acceptance = summary.get("acceptance").cloned().unwrap_or(serde_json::json!({}));
+    spike_common::report::print_acceptance_report(
+        "SPIKE-11",
+        "Audio Endpoint Registry(全デバイスの観測状態追跡)",
+        &acceptance,
+    );
+    spike_common::report::pause_before_exit();
+
     Ok(())
 }
 

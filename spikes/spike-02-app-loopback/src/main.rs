@@ -64,32 +64,36 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
+    spike_common::report::print_banner(
+        "SPIKE-02",
+        "Application/Process Loopback Capture(プロセス指定)",
+        &[
+            "Zoom/Teams/Chrome等、音声を出しているアプリを対象に取得します。",
+            "--target-process/--target-pidを省略した場合、起動中のZoom/Teams/",
+            "Chrome/Edge/Firefoxを自動検出します(複数見つかった場合は選択を促します)。",
+            &format!("これから最大{}秒間キャプチャします。途中終了はCtrl+C。", cli.duration_secs),
+        ],
+    );
+
     let os_info = spike_common::os_check::query_os_version()?;
     spike_common::os_check::check_process_loopback_support(&os_info)?;
 
     let out_dir = cli
         .output_dir
+        .clone()
         .unwrap_or_else(|| PathBuf::from("out").join("run"));
     std::fs::create_dir_all(&out_dir)?;
     let mut event_log = JsonlWriter::create(&out_dir.join("process_events.jsonl"))?;
 
     let activation_hard_timeout = cli.activation_hard_timeout_ms.map(Duration::from_millis);
 
-    let (initial_pid, mut watcher) = if let Some(pid) = cli.target_pid {
-        (pid, ProcessWatcher::new_by_pid(pid))
-    } else {
-        let name = cli
-            .target_process
-            .clone()
-            .expect("clapのconflicts_withによりtarget_processかtarget_pidのどちらかは必須");
-        let m = process_finder::find_process_by_name(&name, cli.process_selection)
-            .ok_or_else(|| anyhow::anyhow!("対象プロセスが見つかりません: {name}"))?;
-        let pid = m.pid;
-        (
-            pid,
-            ProcessWatcher::new_by_name(name, cli.process_selection, pid),
-        )
+    let Some((initial_pid, mut watcher, target_label)) = resolve_target_process(&cli)? else {
+        // 対象プロセスが見つからない/選べなかった場合は、パニックではなく
+        // 案内を表示してそのまま(Enter待ちで)穏やかに終了する。
+        spike_common::report::pause_before_exit();
+        return Ok(());
     };
+    println!("対象プロセス: {target_label} (PID={initial_pid})");
 
     let (tx, rx) = crossbeam_channel::bounded(256);
     let pipeline_drop_counter = Arc::new(AtomicU64::new(0));
@@ -112,8 +116,15 @@ fn main() -> anyhow::Result<()> {
     let wall_start = Instant::now();
     let cpu_start = analyze::ProcessTimes::query_current().ok();
 
+    println!("キャプチャを開始しました...");
     let start = std::time::Instant::now();
+    let mut last_countdown_print = Instant::now();
     while start.elapsed() < Duration::from_secs(cli.duration_secs) {
+        if last_countdown_print.elapsed() >= Duration::from_secs(30) {
+            let remaining = Duration::from_secs(cli.duration_secs).saturating_sub(start.elapsed());
+            println!("...残り約{}秒", remaining.as_secs());
+            last_countdown_print = Instant::now();
+        }
         match watcher.poll() {
             ProcessWatchEvent::StillAlive(pid) => {
                 tracing::trace!(pid, "process_still_alive");
@@ -304,7 +315,101 @@ fn main() -> anyhow::Result<()> {
 
     let summary_path = out_dir.join("summary.json");
     std::fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
-    tracing::info!(path = %summary_path.display(), "summary.json written");
+    println!("詳細ログの保存先: {}", out_dir.display());
+
+    let acceptance = summary.get("acceptance").cloned().unwrap_or(serde_json::json!({}));
+    spike_common::report::print_acceptance_report(
+        "SPIKE-02",
+        "Application/Process Loopback Capture(プロセス指定)",
+        &acceptance,
+    );
+    spike_common::report::pause_before_exit();
 
     Ok(())
+}
+
+/// `--target-process`/`--target-pid`のどちらも指定されなかった場合に、
+/// 起動中のZoom/Teams/Chrome/Edge/Firefoxを自動検出して対象を選ぶ
+/// (「起動してEnterを押すだけ」の運用のため)。1件も見つからない、または
+/// ユーザーが選択を放棄した場合は`Ok(None)`を返す(呼び出し側はパニックせず
+/// 案内を出して穏やかに終了する)。
+fn resolve_target_process(
+    cli: &Cli,
+) -> anyhow::Result<Option<(u32, ProcessWatcher, String)>> {
+    if let Some(pid) = cli.target_pid {
+        return match process_finder::resolve_process_by_pid(pid) {
+            Some(m) => Ok(Some((pid, ProcessWatcher::new_by_pid(pid), m.exe_name))),
+            None => {
+                println!("指定されたPID {pid} のプロセスが見つかりません。");
+                Ok(None)
+            }
+        };
+    }
+
+    if let Some(name) = &cli.target_process {
+        return match process_finder::find_process_by_name(name, cli.process_selection) {
+            Some(m) => {
+                let pid = m.pid;
+                Ok(Some((
+                    pid,
+                    ProcessWatcher::new_by_name(name.clone(), cli.process_selection, pid),
+                    name.clone(),
+                )))
+            }
+            None => {
+                println!("対象プロセスが見つかりません: {name}");
+                println!("{name}を起動してから再実行するか、--target-processで正しい実行ファイル名を指定してください。");
+                Ok(None)
+            }
+        };
+    }
+
+    // 両方省略: よくある会議・ブラウザアプリを自動検出する。
+    let candidates = process_finder::find_running_candidate_exe_names();
+    let chosen_name = match candidates.len() {
+        0 => {
+            println!("Zoom/Teams/Chrome/Edge/Firefoxのいずれも起動中のプロセスから見つかりませんでした。");
+            println!("対象アプリを起動してから再実行するか、--target-processで実行ファイル名を指定してください。");
+            return Ok(None);
+        }
+        1 => {
+            let name = candidates.into_iter().next().unwrap();
+            println!("{name} を自動検出しました。これを対象にします。");
+            name
+        }
+        _ => {
+            println!("複数の候補が見つかりました。対象にする番号を入力してください:");
+            for (i, name) in candidates.iter().enumerate() {
+                println!("  {}) {name}", i + 1);
+            }
+            print!("番号を入力してEnter: ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let choice: usize = match input.trim().parse::<usize>() {
+                Ok(n) if n >= 1 && n <= candidates.len() => n,
+                _ => {
+                    println!("無効な入力です。--target-processで直接指定して再実行してください。");
+                    return Ok(None);
+                }
+            };
+            candidates.into_iter().nth(choice - 1).unwrap()
+        }
+    };
+
+    match process_finder::find_process_by_name(&chosen_name, cli.process_selection) {
+        Some(m) => {
+            let pid = m.pid;
+            Ok(Some((
+                pid,
+                ProcessWatcher::new_by_name(chosen_name.clone(), cli.process_selection, pid),
+                chosen_name,
+            )))
+        }
+        None => {
+            println!("{chosen_name}の解決に失敗しました。");
+            Ok(None)
+        }
+    }
 }

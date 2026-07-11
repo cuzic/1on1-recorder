@@ -452,6 +452,18 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    spike_common::report::print_banner(
+        "SPIKE-01",
+        "WASAPIマイク+Endpoint Loopback同時取得とタイムスタンプ",
+        &[
+            &format!("これから{}秒間、マイクとスピーカー(既定デバイス)を同時録音します。", cli.duration_secs),
+            "できれば以下を行ってください(なくても録音・解析自体は完走します):",
+            "  - スピーカーから何か音を再生する(音楽・動画など)",
+            "  - マイクに向かって話しかける",
+            "途中で終了したい場合はCtrl+Cを押してください。",
+        ],
+    );
+
     let out_dir = cli
         .output_dir
         .unwrap_or_else(|| PathBuf::from("out").join("run"));
@@ -512,7 +524,15 @@ fn main() -> anyhow::Result<()> {
     // 再初期化をduration_secs内で行うため、spike-02のプロセス監視ループと
     // 同じ構成にする)。
     let run_start = Instant::now();
+    let mut last_countdown_print = Instant::now();
+    println!("録音を開始しました...");
     while run_start.elapsed() < Duration::from_secs(cli.duration_secs) {
+        if last_countdown_print.elapsed() >= Duration::from_secs(30) {
+            let remaining = Duration::from_secs(cli.duration_secs).saturating_sub(run_start.elapsed());
+            println!("...残り約{}秒", remaining.as_secs());
+            last_countdown_print = Instant::now();
+        }
+
         while let Ok(event) = device_rx.try_recv() {
             device_events_log.write(device_watch_event_to_json(&event));
         }
@@ -664,7 +684,15 @@ fn main() -> anyhow::Result<()> {
 
     let summary_path = out_dir.join("summary.json");
     std::fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
-    tracing::info!(path = %summary_path.display(), "summary.json written");
+    println!("詳細ログの保存先: {}", out_dir.display());
+
+    let acceptance = summary.get("acceptance").cloned().unwrap_or(serde_json::json!({}));
+    spike_common::report::print_acceptance_report(
+        "SPIKE-01",
+        "WASAPIマイク+Endpoint Loopback同時取得とタイムスタンプ",
+        &acceptance,
+    );
+    spike_common::report::pause_before_exit();
 
     Ok(())
 }

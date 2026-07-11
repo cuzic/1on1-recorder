@@ -11,6 +11,7 @@ pub mod frame_record;
 pub mod jsonl_log;
 pub mod mmcss;
 pub mod os_check;
+pub mod report;
 pub mod timestamp;
 pub mod wav_writer;
 
