@@ -173,6 +173,19 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Whether a segment is already registered — `segment-store`'s restart-time
+    /// directory scan uses this to tell "rename completed but DB registration didn't"
+    /// (needs registering) apart from "already fully committed" (leave alone).
+    pub fn segment_exists(&self, session_id: SessionId, track: TrackKind, sequence: u64) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM segments WHERE session_id = ?1 AND track = ?2 AND sequence = ?3",
+            params![session_id.to_string(), track.as_manifest_str(), sequence],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Registers one committed segment (already fsynced/hashed by `segment-store`) and
     /// its initial `NotStarted` upload status, in a single transaction — a segment
     /// isn't visible to `upload-client` until both rows exist together.

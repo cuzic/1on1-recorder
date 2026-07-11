@@ -5,6 +5,7 @@ members = [
     "crates/capture-api",
     "crates/capture-windows",
     "crates/recorder-domain",
+    "crates/segment-store",
     "crates/session-store",
 ]
 
