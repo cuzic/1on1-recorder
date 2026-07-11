@@ -24,6 +24,7 @@ tracing = "0.1"
 session-store = { path = "../session-store" }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 upload-client = { path = ".", features = ["mock-server"] }
 
 [features]
