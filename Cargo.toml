@@ -4,6 +4,7 @@ members = [
     "crates/audio-timeline",
     "crates/capture-api",
     "crates/capture-windows",
+    "crates/recorder-domain",
 ]
 
 [workspace.package]

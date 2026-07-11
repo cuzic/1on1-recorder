@@ -1,0 +1,17 @@
+[package]
+name = "recorder-domain"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core domain types for the meeting recorder (design.md §9/§10/§13): sessions, tracks, captured frames, segments, capture/upload state, and the UploadAdapter API boundary. Contains no OS-specific types."
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+ulid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
