@@ -1,0 +1,11 @@
+# SPIKE-04が依存するaudiopus_sys(0.2.2、2021年以降更新なし)が同梱するOpusの
+# CMakeLists.txtは`cmake_minimum_required(VERSION 3.1)`のままで、CMake 4.x系
+# (ポリシー互換性 < 3.5 のサポートを撤廃済み)でビルドすると
+# 「CMake Error: Compatibility with CMake < 3.5 has been removed」で失敗する。
+#
+# vendored CMakeLists.txt自体は書き換えられないため、CMake公式が用意する
+# 移行用フォールバック環境変数で最低ポリシーバージョンを補う。ローカルの
+# CMakeが3.5未満のポリシーを許容する版(例: 3.2x系)であればこの設定は
+# 実質no-opなので、CMakeのバージョンに関わらずここで一律設定しておく。
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
