@@ -1,0 +1,52 @@
+name: Windows MSVC Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "spikes/**"
+      - ".github/workflows/windows-build.yml"
+  pull_request:
+    paths:
+      - "spikes/**"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: spikes
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spikes
+
+      - name: Build (release, x86_64-pc-windows-msvc)
+        run: cargo build --workspace --release --target x86_64-pc-windows-msvc
+
+      - name: Stage executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for exe in \
+            spike-01-wasapi-dual-capture \
+            spike-02-app-loopback \
+            spike-03-timeline-drift \
+            spike-11-endpoint-registry
+          do
+            cp "target/x86_64-pc-windows-msvc/release/${exe}.exe" "dist/${exe}.exe"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spike-windows-msvc-binaries
+          path: spikes/dist/*.exe
+          if-no-files-found: error
