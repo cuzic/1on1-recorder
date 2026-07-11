@@ -1,0 +1,21 @@
+[package]
+name = "credential-store"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OS keyring credential storage (Windows Credential Manager / macOS Keychain / Linux Secret Service via the keyring crate), with an encrypted-file fallback for headless Linux. Ported from spike-10-credential-store."
+
+[dependencies]
+aes-gcm = "0.10"
+async-trait = "0.1"
+keyring = "2"
+rand = "0.8"
+recorder-domain = { path = "../recorder-domain" }
+thiserror = { workspace = true }
+tracing = "0.1"
+upload-client = { path = "../upload-client" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }

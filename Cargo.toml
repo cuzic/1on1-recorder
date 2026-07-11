@@ -4,6 +4,7 @@ members = [
     "crates/audio-timeline",
     "crates/capture-api",
     "crates/capture-windows",
+    "crates/credential-store",
     "crates/recorder-domain",
     "crates/segment-store",
     "crates/session-store",
