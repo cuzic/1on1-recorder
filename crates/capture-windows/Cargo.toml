@@ -1,0 +1,31 @@
+[package]
+name = "capture-windows"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WASAPI-backed audio capture (microphone and endpoint loopback) for Windows, resilient to device changes via capture-api's rebinding state machine."
+
+[dependencies]
+capture-api = { path = "../capture-api" }
+crossbeam-channel = "0.5"
+thiserror = { workspace = true }
+tracing = "0.1"
+windows = { version = "0.58", features = [
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_System_Performance",
+    "Win32_Foundation",
+    "Win32_Security",                  # CreateEventW is gated behind this feature
+    "Win32_UI_Shell_PropertiesSystem", # IMMDevice::OpenPropertyStore/IPropertyStore
+    "Win32_Devices_FunctionDiscovery", # PKEY_Device_FriendlyName
+    "implement",
+] }
+# `#[implement(...)]`-generated code references `windows_core::...` directly, which
+# isn't resolvable through the `windows::core` re-export alone.
+windows-core = "0.58"
