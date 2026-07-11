@@ -215,6 +215,7 @@ pub fn run_capture_loop(
     format_info: AudioFormatInfo,
     device_id: String,
     device_friendly_name: String,
+    nominal_frame_interval_100ns: i64,
     pipeline_drop_counter: Arc<AtomicU64>,
     callback_timeout_ms: u32,
     tx: &crossbeam_channel::Sender<CaptureEvent>,
@@ -270,6 +271,7 @@ pub fn run_capture_loop(
         qpc_freq_hz: qpc_clock.freq_hz(),
         device_id,
         device_friendly_name,
+        nominal_frame_interval_ns: (nominal_frame_interval_100ns.max(0) as u64) * 100,
     })
     .ok();
 

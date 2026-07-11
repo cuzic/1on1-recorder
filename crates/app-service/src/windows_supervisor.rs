@@ -48,6 +48,25 @@ struct JoinResult {
     outcome: CaptureThreadOutcome,
 }
 
+/// What this supervisor forwards to an optional frame sink (see
+/// `WindowsSupervisor::set_frame_sink`) — everything a consumer (task #10's
+/// `windows_frame_collector`) needs to convert captured audio into
+/// `recorder_domain::CapturedFrame`, without that consumer needing its own access
+/// to `capture-windows`'s raw event channel.
+///
+/// This is a *forwarding* design, not a second receiver on the same channel:
+/// `capture_windows::CaptureEvent`s only ever go to one consumer
+/// (`run_until_shutdown`'s own `Select` loop) which re-sends the ones a frame sink
+/// cares about here. Cloning `capture_rx` itself for an external consumer would
+/// make it and `run_until_shutdown` competing consumers on the same MPMC channel —
+/// each `Frame` event would race to land on whichever thread called `recv()` first,
+/// silently dropping frames whenever the supervisor's own (frame-discarding) loop
+/// won that race.
+pub enum FrameSinkEvent {
+    StreamStarted { binding: BindingKind, sample_rate: u32, channels: u16, nominal_frame_interval_ns: u64 },
+    Frame { record: capture_windows::CapturedFrameRecord, samples: Vec<f32> },
+}
+
 pub struct WindowsSupervisor {
     state: DecisionState,
     workers: HashMap<BindingKind, WorkerHandle>,
@@ -62,6 +81,7 @@ pub struct WindowsSupervisor {
     /// Joiner threads spawned but not yet reported back — `run_until_shutdown` waits
     /// for this to reach 0 before returning.
     pending_joins: usize,
+    frame_tx: Option<Sender<FrameSinkEvent>>,
 }
 
 impl WindowsSupervisor {
@@ -93,16 +113,18 @@ impl WindowsSupervisor {
             pipeline_drop_counter: Arc::new(AtomicU64::new(0)),
             callback_timeout_ms,
             pending_joins: 0,
+            frame_tx: None,
         }
     }
 
-    /// Every event from every managed capture worker, `Frame` included. A clone of
-    /// this is cheap (it's a `crossbeam_channel::Receiver`) — app-service stage 2
-    /// (task #10) consumes it to feed `timeline_adapter`/`segmenter`; this
-    /// supervisor itself only reacts to the lifecycle variants (see
-    /// `handle_capture_event`).
-    pub fn capture_events(&self) -> Receiver<CaptureEvent> {
-        self.capture_rx.clone()
+    /// Registers where `StreamStarted`/`Frame` events get forwarded (see
+    /// [`FrameSinkEvent`] for why this is a forwarding sink rather than a second
+    /// receiver on the same channel). Task #10's `windows_frame_collector` is the
+    /// intended consumer, on its own thread — dropping the receiving half (or never
+    /// calling this) just means frames are discarded, which is fine if the caller
+    /// only cares about capture lifecycle management.
+    pub fn set_frame_sink(&mut self, tx: Sender<FrameSinkEvent>) {
+        self.frame_tx = Some(tx);
     }
 
     /// Queries the OS's current Console-role default capture/render endpoints and
@@ -238,8 +260,20 @@ impl WindowsSupervisor {
 
     fn handle_capture_event(&mut self, event: CaptureEvent) -> Result<(), CaptureError> {
         match event {
-            CaptureEvent::Frame { .. } => {} // consumed via `capture_events()` by the caller (task #10)
-            CaptureEvent::StreamStarted { stream, .. } => {
+            CaptureEvent::Frame { record, samples } => {
+                if let Some(tx) = &self.frame_tx {
+                    let _ = tx.send(FrameSinkEvent::Frame { record, samples });
+                }
+            }
+            CaptureEvent::StreamStarted { stream, ref format, nominal_frame_interval_ns, .. } => {
+                if let Some(tx) = &self.frame_tx {
+                    let _ = tx.send(FrameSinkEvent::StreamStarted {
+                        binding: stream,
+                        sample_rate: format.sample_rate,
+                        channels: format.channels,
+                        nominal_frame_interval_ns,
+                    });
+                }
                 // `self.workers` holds at most one handle per binding — the one
                 // `decide()` is currently `Starting`/`Running` for — so its
                 // operation_id/epoch/target are exactly what this observation needs.

@@ -22,13 +22,21 @@ Ported from this project's `spikes/spike-01-wasapi-dual-capture` and
 - `device_select`: endpoint enumeration and resolution (`"default"` or a specific
   `IMMDevice::GetId()`).
 
+`CaptureEvent::StreamStarted::nominal_frame_interval_ns` is `IAudioClient::
+GetDevicePeriod`'s shared-mode default period (queried once per stream, converted
+from 100ns units to nanoseconds) — the engine's fixed, actual callback interval,
+which is what `audio-timeline`'s `AudioPacket::nominal_duration_ns` needs. It's
+deliberately *not* derived from any one frame's `frame_count`: that would reflect
+whatever drift the device's own clock already has, making drift undetectable by
+definition once fed into `TimelineAligner`.
+
 ## What's not here yet
 
 Process loopback (capturing a specific application's audio only, e.g. just Zoom's
 output) is not ported yet. Phase 1A only needs microphone + endpoint loopback capture;
 process loopback is Phase 1B work.
 
-Nothing here yet turns a `device_watch::DeviceWatchEvent` or a capture thread's exit
-into a `capture_api::rebinding::Observation`/`Effect` — that adapter layer, and
-whatever `CaptureAdapter`-style trait it ends up needing, is deliberately left for
-once there's a second backend (or at least a supervisor loop) to inform its shape.
+The adapter layer that turns a `device_watch::DeviceWatchEvent` or a capture
+thread's exit into a `capture_api::rebinding::Observation`/`Effect` now lives in
+`app-service`'s `windows_supervisor` module (task #1), not here — this crate stays
+the low-level backend only, per that module's own README.

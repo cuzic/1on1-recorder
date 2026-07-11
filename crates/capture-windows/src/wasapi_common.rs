@@ -76,6 +76,13 @@ pub fn init_and_capture(
 
     let capture_client: IAudioCaptureClient = unsafe { audio_client.GetService()? };
 
+    // The engine's actual repeating callback interval (100ns units, shared-mode
+    // default) — see `CaptureEvent::StreamStarted::nominal_frame_interval_ns`'s doc
+    // comment for why this, and not any one frame's `frame_count`, is what "nominal"
+    // means for alignment purposes.
+    let mut nominal_frame_interval_100ns: i64 = 0;
+    unsafe { audio_client.GetDevicePeriod(Some(&mut nominal_frame_interval_100ns), None)? };
+
     crate::run_capture_loop(
         audio_client,
         capture_client,
@@ -85,6 +92,7 @@ pub fn init_and_capture(
         format_info,
         device_id,
         device_friendly_name,
+        nominal_frame_interval_100ns,
         params.pipeline_drop_counter,
         params.callback_timeout_ms,
         tx,

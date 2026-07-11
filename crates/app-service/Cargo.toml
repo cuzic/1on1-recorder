@@ -16,6 +16,7 @@ recorder-domain = { path = "../recorder-domain" }
 segment-store = { path = "../segment-store" }
 session-store = { path = "../session-store" }
 thiserror = { workspace = true }
+tokio = { version = "1", features = ["rt"], optional = true }
 tracing = { version = "0.1", optional = true }
 upload-client = { path = "../upload-client" }
 windows = { version = "0.58", features = ["Win32_Media_Audio", "Win32_System_Com"], optional = true }
@@ -26,8 +27,9 @@ tokio = { version = "1", features = ["full"] }
 upload-client = { path = "../upload-client", features = ["mock-server"] }
 
 [features]
-# Task #1: the Windows supervisor connecting capture-api's FSM to real
-# capture-windows capture threads. Only meaningful on Windows (capture-windows
-# itself is Windows-only) — this crate's default (no-features) build stays
-# OS-independent for stage 1's pseudo-source pipeline.
-windows-supervisor = ["dep:capture-api", "dep:capture-windows", "dep:crossbeam-channel", "dep:tracing", "dep:windows"]
+# Task #1/#10: the Windows supervisor connecting capture-api's FSM to real
+# capture-windows capture threads, and the conversion layer/session wiring that
+# feeds its frames into stage 1's pipeline. Only meaningful on Windows
+# (capture-windows itself is Windows-only) — this crate's default (no-features)
+# build stays OS-independent for stage 1's pseudo-source pipeline.
+windows-supervisor = ["dep:capture-api", "dep:capture-windows", "dep:crossbeam-channel", "dep:tokio", "dep:tracing", "dep:windows"]

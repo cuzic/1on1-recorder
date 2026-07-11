@@ -22,11 +22,11 @@ rather than as one large "wire everything to real Windows capture" task:
   - `pipeline.rs`: wires all of the above together with `segment-store` (encode +
     atomic commit), `session-store` (the ledger), and `upload-client` (HTTP upload),
     end to end. See `tests/e2e.rs`.
-- **Stage 2 (task #10, not yet built)**: feeds `windows_supervisor`'s captured
-  frames into this stage's `timeline_adapter`/`segmenter`/`pipeline` — converting
-  `capture-windows`'s QPC-based timestamps into the `host_time_ns`/
-  `nominal_duration_ns` `timeline_adapter` expects is the remaining piece that
-  actually makes the pipeline Windows-only.
+- **Stage 2 (task #10, this crate's current state)**: `windows_frame_collector`
+  converts `windows_supervisor`'s captured frames into
+  `recorder_domain::CapturedFrame`, and `windows_session::run_windows_capture_session`
+  feeds them through the *exact same* stage 1 `run_pipeline` — no second,
+  Windows-specific pipeline was built.
 - **Stage 3 (task #11, not yet built)**: a standing upload worker and richer
   recording-state management (pause/resume, disk-space handling, `CaptureState`
   transitions beyond what this stage exercises).
@@ -72,6 +72,48 @@ exercised on real Windows hardware yet. That's part of task #9's real-machine
   caller is responsible for that ordering; this module doesn't enforce it.
 - Process loopback (`BindingKind::ProcessLoopback`) is not wired up — Phase 1A only
   manages Microphone and EndpointLoopback, matching `capture-windows`'s own scope.
+
+## `windows_frame_collector` / `windows_session` (task #10)
+
+Also behind `windows-supervisor`. `windows_supervisor` forwards `StreamStarted`/
+`Frame` events to an optional sink (`WindowsSupervisor::set_frame_sink`) rather than
+exposing its raw event channel for a second consumer to clone — cloning
+`crossbeam_channel::Receiver<CaptureEvent>` would make the supervisor's own event
+loop and an external consumer *competing* readers on the same channel, silently
+dropping whichever `Frame` events the supervisor's own (frame-discarding) loop won
+the race for. See `FrameSinkEvent`'s doc comment in `windows_supervisor.rs`.
+
+`windows_frame_collector::collect_frames` drains that sink on its own thread,
+converting each frame:
+
+- `host_time_ns` is `capture_qpc_100ns * 100` — already a normalized, monotonic,
+  machine-wide clock (`capture_windows::timestamp::QpcClock`), just converted from
+  100ns units to nanoseconds.
+- `source_time_ns` is derived from `device_position_frames` (the device's own
+  cumulative sample counter) at the stream's sample rate — a second, independent
+  "how much time has the device itself counted" value, for diagnostics only (not
+  used for alignment).
+- `nominal_frame_interval_ns` (`audio_timeline::AudioPacket`'s per-packet expected
+  duration) comes from `IAudioClient::GetDevicePeriod`'s shared-mode default period
+  — a fixed, engine-configured value queried once at stream start
+  (`CaptureEvent::StreamStarted`), **not** derived from any one frame's
+  `frame_count`. Using the device's own reported sample count as "nominal" would
+  make clock drift undetectable by definition, since `TimelineAligner` works by
+  comparing the nominal (drift-free) expectation against what the device actually
+  delivered.
+
+`windows_session::run_windows_capture_session` ties it together: run
+`WindowsSupervisor` + the collector until `shutdown_rx` fires, then call stage 1's
+`run_pipeline` with whatever was collected. Blocking calls
+(`WindowsSupervisor::run_until_shutdown`, the collector thread's `join()`) run
+inside `tokio::task::spawn_blocking`, since `DeviceWatch::start`/
+`run_until_shutdown` must share one dedicated OS thread (see `DeviceWatch`'s own
+requirement that its creating thread stay alive).
+
+Buffers the entire session's audio in memory before running the pipeline —
+correctly scoped for proving real capture flows end to end, not for how a
+long-running recording should work. Incremental segmenting as capture progresses
+is stage 3's job (task #11).
 
 ## Known scope limits (stage 1)
 

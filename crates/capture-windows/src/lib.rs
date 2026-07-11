@@ -51,6 +51,15 @@ pub enum CaptureEvent {
         /// "default" can still be verified after the fact.
         device_id: String,
         device_friendly_name: String,
+        /// `IAudioClient::GetDevicePeriod`'s shared-mode default period, in
+        /// nanoseconds — the engine's actual repeating callback interval, fixed for
+        /// the life of this stream. This is `audio_timeline::AudioPacket`'s
+        /// `nominal_duration_ns` for every frame this stream delivers: it must come
+        /// from the engine's own configured periodicity, not from any one frame's
+        /// `frame_count` (which already reflects whatever drift the device's clock
+        /// has — using it as "nominal" would make drift undetectable by
+        /// definition). See `app-service`'s `windows_supervisor`/`timeline_adapter`.
+        nominal_frame_interval_ns: u64,
     },
     StreamError {
         stream: BindingKind,

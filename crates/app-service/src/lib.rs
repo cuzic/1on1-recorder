@@ -14,6 +14,10 @@ mod timeline_adapter;
 pub mod pseudo_source;
 
 #[cfg(feature = "windows-supervisor")]
+pub mod windows_frame_collector;
+#[cfg(feature = "windows-supervisor")]
+pub mod windows_session;
+#[cfg(feature = "windows-supervisor")]
 pub mod windows_supervisor;
 
 pub use error::AppServiceError;
