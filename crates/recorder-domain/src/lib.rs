@@ -9,10 +9,11 @@ mod track;
 mod upload;
 
 pub use frame::CapturedFrame;
-pub use segment::{AudioCodec, AudioSegment};
+pub use segment::{AudioCodec, AudioSegment, ParseAudioCodecError};
 pub use session::{
-    AudioManifest, CaptureManifest, ConsentManifest, RemoteSourceKind, SessionId, SessionManifest,
+    AudioManifest, CaptureManifest, ConsentManifest, ParseRemoteSourceKindError, RemoteSourceKind,
+    SessionId, SessionManifest,
 };
 pub use state::{CaptureState, UploadState};
-pub use track::TrackKind;
+pub use track::{ParseTrackKindError, TrackKind};
 pub use upload::{RemoteSession, SessionSummary, UploadAdapter, UploadError, UploadReceipt};

@@ -50,6 +50,39 @@ pub enum RemoteSourceKind {
     ApplicationProcess,
 }
 
+impl RemoteSourceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RemoteSourceKind::EndpointLoopback => "endpoint_loopback",
+            RemoteSourceKind::ApplicationProcess => "application_process",
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteSourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The error returned when parsing a `RemoteSourceKind` from a string other than a
+/// known kind — e.g. a corrupted DB row.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("invalid remote source kind: {0:?}")]
+pub struct ParseRemoteSourceKindError(pub String);
+
+impl std::str::FromStr for RemoteSourceKind {
+    type Err = ParseRemoteSourceKindError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "endpoint_loopback" => Ok(RemoteSourceKind::EndpointLoopback),
+            "application_process" => Ok(RemoteSourceKind::ApplicationProcess),
+            other => Err(ParseRemoteSourceKindError(other.to_string())),
+        }
+    }
+}
+
 /// design.md §9.4, the `capture` object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureManifest {

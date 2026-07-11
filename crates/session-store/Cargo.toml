@@ -1,0 +1,17 @@
+[package]
+name = "session-store"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite-backed ledger of sessions, tracks, segments, upload status, and events for the meeting recorder. The single source of truth segment-store and upload-client register into, so their on-disk/remote state never diverges."
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+recorder-domain = { path = "../recorder-domain" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

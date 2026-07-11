@@ -29,3 +29,21 @@ impl std::fmt::Display for TrackKind {
         f.write_str(self.as_manifest_str())
     }
 }
+
+/// The error returned when parsing a `TrackKind` from a string other than `"self"` or
+/// `"remote"` — e.g. a corrupted DB row or a malformed `Idempotency-Key`.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("invalid track kind: {0:?}")]
+pub struct ParseTrackKindError(pub String);
+
+impl std::str::FromStr for TrackKind {
+    type Err = ParseTrackKindError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "self" => Ok(TrackKind::SelfMic),
+            "remote" => Ok(TrackKind::RemoteAudio),
+            other => Err(ParseTrackKindError(other.to_string())),
+        }
+    }
+}
