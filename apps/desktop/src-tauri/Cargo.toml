@@ -1,0 +1,51 @@
+[package]
+name = "desktop"
+version = "0.1.0"
+description = "1on1 Recorder desktop app"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+recorder-domain = { path = "../../../crates/recorder-domain" }
+session-store = { path = "../../../crates/session-store" }
+credential-store = { path = "../../../crates/credential-store" }
+upload-client = { path = "../../../crates/upload-client" }
+
+# spike-plan.md SPIKE-05 検証手順3: ウィンドウ閉鎖(SIGUSR1で模擬)を外部の
+# ソークテストスクリプトから駆動するため。Windows実機では使わない。
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
+# Only on Windows does app-service's windows-supervisor feature (real WASAPI
+# capture via capture-windows) actually build — see crates/app-service/README.md.
+# On every other OS (this is where local desktop-shell development/testing
+# happens) recording falls back to app-service::pseudo_source, per this crate's
+# own README. Declared once per branch (not once unconditionally plus an extra
+# feature-only entry) so there's exactly one `app-service` dependency edge per
+# platform, with no ambiguity about how Cargo merges the two.
+[target.'cfg(windows)'.dependencies]
+app-service = { path = "../../../crates/app-service", features = ["windows-supervisor"] }
+crossbeam-channel = "0.5"
+
+[target.'cfg(not(windows))'.dependencies]
+app-service = { path = "../../../crates/app-service" }
