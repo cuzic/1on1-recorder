@@ -13,6 +13,9 @@ mod timeline_adapter;
 
 pub mod pseudo_source;
 
+#[cfg(feature = "windows-supervisor")]
+pub mod windows_supervisor;
+
 pub use error::AppServiceError;
 pub use normalize::normalize_to_mono;
 pub use pipeline::run_pipeline;

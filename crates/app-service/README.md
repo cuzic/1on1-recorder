@@ -22,14 +22,56 @@ rather than as one large "wire everything to real Windows capture" task:
   - `pipeline.rs`: wires all of the above together with `segment-store` (encode +
     atomic commit), `session-store` (the ledger), and `upload-client` (HTTP upload),
     end to end. See `tests/e2e.rs`.
-- **Stage 2 (task #10, not yet built)**: a Windows supervisor that runs
-  `capture-api`'s FSM against real `capture-windows` output and converts its
-  QPC-based timestamps into the `host_time_ns`/`nominal_duration_ns` this stage's
-  `timeline_adapter` expects — this is the piece that makes the pipeline
-  Windows-only. Depends on task #1 (the supervisor loop) as well.
+- **Stage 2 (task #10, not yet built)**: feeds `windows_supervisor`'s captured
+  frames into this stage's `timeline_adapter`/`segmenter`/`pipeline` — converting
+  `capture-windows`'s QPC-based timestamps into the `host_time_ns`/
+  `nominal_duration_ns` `timeline_adapter` expects is the remaining piece that
+  actually makes the pipeline Windows-only.
 - **Stage 3 (task #11, not yet built)**: a standing upload worker and richer
   recording-state management (pause/resume, disk-space handling, `CaptureState`
   transitions beyond what this stage exercises).
+
+## `windows_supervisor` (task #1)
+
+Behind the `windows-supervisor` Cargo feature (off by default, so this crate's
+default build stays OS-independent for stage 1's pipeline). Executes
+`capture_api::rebinding::decide()`'s effects against real `capture-windows` capture
+threads: `Effect::StartCapture` spawns a `MicCaptureStream`/`EndpointLoopbackStream`
+via `spawn_capture_thread`; `Effect::StopCapture` signals the worker's `StopSignal`
+and joins it on a dedicated thread, feeding the join result back through `decide()`
+as `Observation::WorkerStopped`; `Effect::ScheduleRetry` sleeps on a thread before
+firing `DecisionInput::RetryTimerFired`. `CaptureEvent`/`DeviceWatchEvent`s are
+normalized into `Observation`s (Ctrl+C — or any other shutdown trigger the caller
+wires up — becomes `DecisionInput::ShutdownRequested`, not a generic
+`Observation`, per Codex's review).
+
+This module can only be **type-checked** from this Linux dev environment (Windows
+cross-compilation, the same way `capture-windows` itself has always been verified
+here — see this project's earlier commits):
+
+```
+cargo check -p app-service --features windows-supervisor --target x86_64-pc-windows-gnu
+cargo clippy -p app-service --features windows-supervisor --target x86_64-pc-windows-gnu --all-targets
+```
+
+Its actual runtime behavior — does the FSM really rebind correctly against a real
+WASAPI device change, does shutdown really drain every worker — has **not** been
+exercised on real Windows hardware yet. That's part of task #9's real-machine
+30-minute Zoom test, once stage 2 (task #10) wires this into the full pipeline.
+
+### Known limitations
+
+- `decide()`'s `ShutdownRequested` handling only stops bindings currently
+  `Running` (see `capture-api`'s rebinding module) — a binding still
+  `Starting`/`Waiting` when shutdown arrives gets no `StopCapture` effect, and
+  `run_until_shutdown`'s join-draining loop won't wait for it (it isn't tracked).
+  In practice this only matters if shutdown races with a fresh start/rebind
+  attempt.
+- `DeviceWatch::start()` and `run_until_shutdown` must run on the *same* thread
+  (per `DeviceWatch`'s own requirement that its creating thread stay alive) — the
+  caller is responsible for that ordering; this module doesn't enforce it.
+- Process loopback (`BindingKind::ProcessLoopback`) is not wired up — Phase 1A only
+  manages Microphone and EndpointLoopback, matching `capture-windows`'s own scope.
 
 ## Known scope limits (stage 1)
 

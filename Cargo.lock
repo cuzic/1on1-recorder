@@ -72,14 +72,19 @@ name = "app-service"
 version = "0.1.0"
 dependencies = [
  "audio-timeline",
+ "capture-api",
+ "capture-windows",
  "chrono",
+ "crossbeam-channel",
  "recorder-domain",
  "segment-store",
  "session-store",
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
  "upload-client",
+ "windows",
 ]
 
 [[package]]
