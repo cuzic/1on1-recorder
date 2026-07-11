@@ -5,6 +5,7 @@
 //! to feed this crate's OS-independent pipeline.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use capture_api::rebinding::BindingKind;
 use capture_windows::CapturedFrameRecord;
@@ -12,6 +13,28 @@ use crossbeam_channel::Receiver;
 use recorder_domain::{CapturedFrame, TrackKind};
 
 use crate::windows_supervisor::FrameSinkEvent;
+
+/// The most recent per-track level, for a UI meter — updated on every `Frame`
+/// event `collect_frames` sees, independent of (and much cheaper than) the
+/// batch collection it's already doing. `rms`/`peak` are in the same `[0.0, 1.0]`-ish
+/// range as the raw `f32` samples themselves (no dB conversion).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LevelSnapshot {
+    pub self_rms: f32,
+    pub self_peak: f32,
+    pub remote_rms: f32,
+    pub remote_peak: f32,
+}
+
+fn rms_and_peak(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    let rms = (sum_sq / samples.len() as f32).sqrt();
+    let peak = samples.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
+    (rms, peak)
+}
 
 /// Phase 1A's fixed capture-windows setup: Microphone is always the `Self` track,
 /// EndpointLoopback is always `Remote`. Process loopback isn't part of Phase 1A
@@ -62,7 +85,11 @@ pub struct CollectedFrames {
 
 /// Drains `rx` until it disconnects (i.e. the `WindowsSupervisor` that owns the
 /// sending half was dropped, normally after `run_until_shutdown` returns),
-/// converting and sorting every frame into its track.
+/// converting and sorting every frame into its track. `level_sink`, if given, is
+/// updated with each track's latest RMS/peak as frames arrive — cheap enough to
+/// compute per-frame that it doesn't need its own consumer (which would recreate
+/// the competing-consumer race `FrameSinkEvent` itself exists to avoid; see
+/// `windows_supervisor`'s doc comment).
 ///
 /// Buffers an entire session's samples in memory — acceptable for proving real
 /// `capture-windows` audio flows through the exact pipeline stage 1 validated with
@@ -70,7 +97,7 @@ pub struct CollectedFrames {
 /// production. Segmenting incrementally as capture progresses (bounding memory,
 /// uploading while still recording) is stage 3's job (task #11), not this
 /// function's.
-pub fn collect_frames(rx: &Receiver<FrameSinkEvent>) -> CollectedFrames {
+pub fn collect_frames(rx: &Receiver<FrameSinkEvent>, level_sink: Option<&Mutex<LevelSnapshot>>) -> CollectedFrames {
     let mut self_frames = Vec::new();
     let mut remote_frames = Vec::new();
     let mut formats: HashMap<BindingKind, (u32, u16)> = HashMap::new();
@@ -90,6 +117,16 @@ pub fn collect_frames(rx: &Receiver<FrameSinkEvent>) -> CollectedFrames {
                 // guess here is better than a panic).
                 let (sample_rate, channels) = formats.get(&record.stream).copied().unwrap_or((48_000, 1));
                 let frame = to_captured_frame(track, &record, samples, sample_rate, channels);
+
+                if let Some(sink) = level_sink {
+                    let (rms, peak) = rms_and_peak(&frame.samples);
+                    let mut snapshot = sink.lock().unwrap();
+                    match track {
+                        TrackKind::SelfMic => (snapshot.self_rms, snapshot.self_peak) = (rms, peak),
+                        TrackKind::RemoteAudio => (snapshot.remote_rms, snapshot.remote_peak) = (rms, peak),
+                    }
+                }
+
                 match track {
                     TrackKind::SelfMic => self_frames.push(frame),
                     TrackKind::RemoteAudio => remote_frames.push(frame),
@@ -129,5 +166,22 @@ mod tests {
         let record = CapturedFrameRecord::from_raw(BindingKind::Microphone, 1, 0, 0, 48_000, 0, 960, 0, 0, None);
         let frame = to_captured_frame(TrackKind::SelfMic, &record, vec![0.0; 960], 48_000, 1);
         assert_eq!(frame.source_time_ns, Some(1_000_000_000));
+    }
+
+    #[test]
+    fn rms_and_peak_of_silence_is_zero() {
+        assert_eq!(rms_and_peak(&[0.0; 100]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn rms_and_peak_of_a_constant_amplitude_signal() {
+        let (rms, peak) = rms_and_peak(&[0.5, -0.5, 0.5, -0.5]);
+        assert!((rms - 0.5).abs() < 1e-6);
+        assert!((peak - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rms_and_peak_of_empty_samples_is_zero() {
+        assert_eq!(rms_and_peak(&[]), (0.0, 0.0));
     }
 }

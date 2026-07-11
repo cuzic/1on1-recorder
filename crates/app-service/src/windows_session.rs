@@ -6,6 +6,7 @@
 //! `pseudo_source`.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use capture_windows::device_watch::DeviceWatch;
 use recorder_domain::{SessionManifest, SessionSummary, UploadAdapter};
@@ -13,7 +14,7 @@ use session_store::SessionStore;
 
 use crate::error::AppServiceError;
 use crate::pipeline::run_pipeline;
-use crate::windows_frame_collector::{collect_frames, CollectedFrames};
+use crate::windows_frame_collector::{collect_frames, CollectedFrames, LevelSnapshot};
 use crate::windows_supervisor::WindowsSupervisor;
 
 /// Runs one real Windows capture session end to end and blocks the calling thread
@@ -37,8 +38,9 @@ pub async fn run_windows_capture_session(
     bitrate_bps: i32,
     store: &SessionStore,
     adapter: &dyn UploadAdapter,
+    level_sink: Option<Arc<Mutex<LevelSnapshot>>>,
 ) -> Result<SessionSummary, AppServiceError> {
-    let collected = tokio::task::spawn_blocking(move || run_capture_blocking(callback_timeout_ms, shutdown_rx))
+    let collected = tokio::task::spawn_blocking(move || run_capture_blocking(callback_timeout_ms, shutdown_rx, level_sink))
         .await
         .expect("capture supervisor thread panicked")
         .map_err(|e| AppServiceError::Capture(e.to_string()))?;
@@ -71,7 +73,7 @@ fn latest_frame_end_ns(collected: &CollectedFrames, self_interval: u64, remote_i
 /// Everything that has to happen on one dedicated OS thread: `DeviceWatch::start`
 /// requires its creating thread to stay alive for as long as it's alive, and that
 /// same thread is what `WindowsSupervisor::run_until_shutdown` blocks.
-fn run_capture_blocking(callback_timeout_ms: u32, shutdown_rx: crossbeam_channel::Receiver<()>) -> Result<CollectedFrames, capture_windows::CaptureError> {
+fn run_capture_blocking(callback_timeout_ms: u32, shutdown_rx: crossbeam_channel::Receiver<()>, level_sink: Option<Arc<Mutex<LevelSnapshot>>>) -> Result<CollectedFrames, capture_windows::CaptureError> {
     let mut supervisor = WindowsSupervisor::new(callback_timeout_ms);
     let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
     supervisor.set_frame_sink(frame_tx);
@@ -82,7 +84,7 @@ fn run_capture_blocking(callback_timeout_ms: u32, shutdown_rx: crossbeam_channel
     supervisor.seed_default_routes()?;
     supervisor.start_all()?;
 
-    let collector = std::thread::spawn(move || collect_frames(&frame_rx));
+    let collector = std::thread::spawn(move || collect_frames(&frame_rx, level_sink.as_deref()));
 
     supervisor.run_until_shutdown(&watch_rx, &shutdown_rx)?;
     drop(supervisor); // drops frame_tx, letting `collector` finish once drained

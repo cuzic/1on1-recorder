@@ -24,6 +24,11 @@ pub mod windows_session;
 #[cfg(feature = "windows-supervisor")]
 pub mod windows_supervisor;
 
+#[cfg(feature = "windows-supervisor")]
+pub use windows_frame_collector::LevelSnapshot;
+#[cfg(feature = "windows-supervisor")]
+pub use windows_session::run_windows_capture_session;
+
 pub use error::AppServiceError;
 pub use normalize::normalize_to_mono;
 pub use pipeline::run_pipeline;
