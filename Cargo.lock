@@ -68,6 +68,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-service"
+version = "0.1.0"
+dependencies = [
+ "audio-timeline",
+ "chrono",
+ "recorder-domain",
+ "segment-store",
+ "session-store",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "upload-client",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

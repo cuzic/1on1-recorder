@@ -320,6 +320,48 @@ impl SessionStore {
         Ok(segments)
     }
 
+    /// Every committed segment for one track, in sequence order, regardless of upload
+    /// status — for verifying/inspecting what's on disk (e.g. a future desktop UI's
+    /// "recorded so far" view), unlike `pending_uploads` which only returns segments
+    /// still needing an upload attempt.
+    pub fn segments_for_track(&self, session_id: SessionId, track: TrackKind) -> Result<Vec<AudioSegment>, StoreError> {
+        let session_id_str = session_id.to_string();
+        let track_str = track.as_manifest_str();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT track, sequence, timeline_start_ms, duration_ms, codec,
+                    sample_rate, channels, sha256, local_path, byte_len
+             FROM segments
+             WHERE session_id = ?1 AND track = ?2
+             ORDER BY sequence",
+        )?;
+        let rows = stmt.query_map(params![session_id_str, track_str], |row| {
+            let track_str: String = row.get(0)?;
+            let codec_str: String = row.get(4)?;
+            let local_path: String = row.get(8)?;
+            Ok((track_str, codec_str, local_path, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?, row.get::<_, u32>(3)?, row.get::<_, u32>(5)?, row.get::<_, u16>(6)?, row.get::<_, String>(7)?, row.get::<_, u64>(9)?))
+        })?;
+
+        let mut segments = Vec::new();
+        for row in rows {
+            let (track_str, codec_str, local_path, sequence, timeline_start_ms, duration_ms, sample_rate, channels, sha256, byte_len) = row?;
+            segments.push(AudioSegment {
+                session_id,
+                track: track_str.parse::<TrackKind>()?,
+                sequence,
+                timeline_start_ms,
+                duration_ms,
+                codec: codec_str.parse::<AudioCodec>()?,
+                sample_rate,
+                channels,
+                sha256,
+                local_path: PathBuf::from(local_path),
+                byte_len,
+            });
+        }
+        Ok(segments)
+    }
+
     /// For `SessionSummary::segment_counts_by_track`, sent to `finalize_session`.
     pub fn segment_counts_by_track(&self, session_id: SessionId) -> Result<BTreeMap<TrackKind, u64>, StoreError> {
         let session_id_str = session_id.to_string();

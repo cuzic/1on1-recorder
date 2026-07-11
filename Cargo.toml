@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/app-service",
     "crates/audio-timeline",
     "crates/capture-api",
     "crates/capture-windows",
