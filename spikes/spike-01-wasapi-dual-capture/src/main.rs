@@ -463,6 +463,7 @@ fn main() -> anyhow::Result<()> {
             "途中で終了したい場合はCtrl+Cを押してください。",
         ],
     );
+    let stop_requested = spike_common::report::install_ctrlc_stop_flag();
 
     let out_dir = cli
         .output_dir
@@ -526,7 +527,9 @@ fn main() -> anyhow::Result<()> {
     let run_start = Instant::now();
     let mut last_countdown_print = Instant::now();
     println!("録音を開始しました...");
-    while run_start.elapsed() < Duration::from_secs(cli.duration_secs) {
+    while run_start.elapsed() < Duration::from_secs(cli.duration_secs)
+        && !stop_requested.load(std::sync::atomic::Ordering::SeqCst)
+    {
         if last_countdown_print.elapsed() >= Duration::from_secs(30) {
             let remaining = Duration::from_secs(cli.duration_secs).saturating_sub(run_start.elapsed());
             println!("...残り約{}秒", remaining.as_secs());
@@ -551,6 +554,9 @@ fn main() -> anyhow::Result<()> {
         )?;
 
         std::thread::sleep(Duration::from_secs(1));
+    }
+    if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        println!("Ctrl+Cを検出しました。ここまでのデータで集計・レポート表示を行います...");
     }
 
     mic_sup.stop_and_join()?;

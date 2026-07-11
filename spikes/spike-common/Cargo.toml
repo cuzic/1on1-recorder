@@ -12,6 +12,7 @@ windows = { workspace = true }
 windows-core = "0.58"
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+ctrlc = { workspace = true }
 csv = { workspace = true }
 hound = { workspace = true }
 crossbeam-channel = { workspace = true }

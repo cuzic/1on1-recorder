@@ -2,6 +2,28 @@
 // コピペすればログと合否が分かる」という運用を、SPIKE-01/02/03/11の
 // バイナリ間で共通のフォーマットで提供するためのヘルパー。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Ctrl+C(Windowsでは Ctrl+Break も)を捕捉し、フラグを立てるだけにする。
+/// 録音ループ側は`duration_secs`経過だけでなくこのフラグも見て早期終了し、
+/// 通常終了と同じ経路(集計→summary.json書き込み→結果レポート表示→Enter待ち)を
+/// 必ず通るようにする。「Ctrl+Cで終了できます」と案内しておきながら、実際には
+/// 何も出力されずに終わってしまう問題を避けるため。
+///
+/// ハンドラ登録に失敗した場合(二重登録など)でも録音自体は継続できるよう、
+/// 呼び出し側にpanicさせずフラグだけ返す(常にfalseから始まる)。
+pub fn install_ctrlc_stop_flag() -> Arc<AtomicBool> {
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let flag = stop_requested.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        flag.store(true, Ordering::SeqCst);
+    }) {
+        eprintln!("警告: Ctrl+Cハンドラの登録に失敗しました({e})。Ctrl+Cで終了すると結果レポートが表示されない可能性があります。");
+    }
+    stop_requested
+}
+
 /// 実行開始時に、これから何秒間・何をすればよいかを画面へ大きく表示する。
 pub fn print_banner(spike_id: &str, title: &str, instructions: &[&str]) {
     println!();

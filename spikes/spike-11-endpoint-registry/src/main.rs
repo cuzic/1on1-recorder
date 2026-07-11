@@ -54,8 +54,10 @@ fn main() -> anyhow::Result<()> {
             "  - 既定のマイク・既定のスピーカーを変更",
             "  - Bluetoothヘッドセットの接続・切断",
             "何もしなくても起動時の初期スキャンとレジストリの整合性は検証できます。",
+            "途中で終了したい場合はCtrl+Cを押してください。",
         ],
     );
+    let stop_requested = spike_common::report::install_ctrlc_stop_flag();
 
     let run_id = cli.run_id.clone().unwrap_or_else(|| {
         std::time::SystemTime::now()
@@ -87,6 +89,7 @@ fn main() -> anyhow::Result<()> {
     let mut dispatch_latency_us: Vec<f64> = Vec::new();
     let mut applied_events: u64 = 0;
     let mut apply_errors: u64 = 0;
+    let mut refresh_timeout_count: u64 = 0;
 
     println!("初期スキャンで{initial_count}件のendpointを検出しました。監視を開始します...");
 
@@ -94,7 +97,7 @@ fn main() -> anyhow::Result<()> {
     let mut last_countdown_print = Instant::now();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if remaining.is_zero() || stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
         if last_countdown_print.elapsed() >= Duration::from_secs(10) {
@@ -119,6 +122,9 @@ fn main() -> anyhow::Result<()> {
                 applied_events += 1;
                 for change in changes {
                     seq += 1;
+                    if matches!(change, RegistryChange::RefreshTimedOut { .. }) {
+                        refresh_timeout_count += 1;
+                    }
                     log_change(&mut event_log, seq, &event, &change);
                 }
             }
@@ -127,6 +133,9 @@ fn main() -> anyhow::Result<()> {
                 tracing::warn!(error = %e, ?event, "failed to apply device watch event");
             }
         }
+    }
+    if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        println!("Ctrl+Cを検出しました。ここまでのデータで集計・レポート表示を行います...");
     }
 
     drop(_watch);
@@ -137,7 +146,13 @@ fn main() -> anyhow::Result<()> {
         serde_json::to_string_pretty(&final_snapshots)?,
     )?;
 
-    let summary = build_summary(&dispatch_latency_us, applied_events, apply_errors, &final_snapshots);
+    let summary = build_summary(
+        &dispatch_latency_us,
+        applied_events,
+        apply_errors,
+        refresh_timeout_count,
+        &final_snapshots,
+    );
     std::fs::write(out_dir.join("summary.json"), serde_json::to_string_pretty(&summary)?)?;
 
     println!(
@@ -214,6 +229,12 @@ fn log_change(
             "old_endpoint_id": old,
             "new_endpoint_id": new,
         }),
+        RegistryChange::RefreshTimedOut { id } => serde_json::json!({
+            "seq": seq,
+            "event": event_name,
+            "kind": "RefreshTimedOut",
+            "endpoint_id": id,
+        }),
     };
     log.write(value);
 }
@@ -233,6 +254,7 @@ fn build_summary(
     dispatch_latency_us: &[f64],
     applied_events: u64,
     apply_errors: u64,
+    refresh_timeout_count: u64,
     final_snapshots: &[AudioEndpointSnapshot],
 ) -> serde_json::Value {
     let mut sorted = dispatch_latency_us.to_vec();
@@ -269,6 +291,16 @@ fn build_summary(
             "no_leaked_registration": true,
             "applied_events": applied_events,
             "apply_errors": apply_errors,
+            // 実機検証(2026-07-11、Bluetoothヘッドセット接続時)で、切断済み
+            // ("NotPresent")のendpointからのPropertyValueChanged連発により
+            // 1件ずつの同期的な再照会が積み重なりdispatch_latencyが数十秒まで
+            // 悪化する事例が見つかったため、ENDPOINT_REFRESH_TIMEOUT
+            // (registry.rs)でタイムアウトさせるようにした。0件ならタイムアウトは
+            // 発生しなかったという意味で、必ずしも0であるべき基準ではない
+            // (荒れたendpointがあれば発生しうる。その場合でも他のendpointの
+            // 処理を巻き込んで遅延させないことが目的)。
+            "endpoint_refresh_timeout_count": refresh_timeout_count,
+            "no_endpoint_refresh_timeouts": refresh_timeout_count == 0,
         }
     })
 }

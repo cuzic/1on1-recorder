@@ -74,6 +74,7 @@ fn main() -> anyhow::Result<()> {
             &format!("これから最大{}秒間キャプチャします。途中終了はCtrl+C。", cli.duration_secs),
         ],
     );
+    let stop_requested = spike_common::report::install_ctrlc_stop_flag();
 
     let os_info = spike_common::os_check::query_os_version()?;
     spike_common::os_check::check_process_loopback_support(&os_info)?;
@@ -119,7 +120,9 @@ fn main() -> anyhow::Result<()> {
     println!("キャプチャを開始しました...");
     let start = std::time::Instant::now();
     let mut last_countdown_print = Instant::now();
-    while start.elapsed() < Duration::from_secs(cli.duration_secs) {
+    while start.elapsed() < Duration::from_secs(cli.duration_secs)
+        && !stop_requested.load(std::sync::atomic::Ordering::SeqCst)
+    {
         if last_countdown_print.elapsed() >= Duration::from_secs(30) {
             let remaining = Duration::from_secs(cli.duration_secs).saturating_sub(start.elapsed());
             println!("...残り約{}秒", remaining.as_secs());
@@ -191,6 +194,9 @@ fn main() -> anyhow::Result<()> {
             }
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+    if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        println!("Ctrl+Cを検出しました。ここまでのデータで集計・レポート表示を行います...");
     }
 
     stop_signal.signal()?;

@@ -46,6 +46,7 @@ windows = { version = "0.58", features = [
 ] }
 thiserror = "1"
 anyhow = "1"
+ctrlc = "3"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 hound = "3"
