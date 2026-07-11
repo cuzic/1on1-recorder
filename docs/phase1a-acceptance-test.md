@@ -43,11 +43,17 @@ receives; watching that output during the test is useful.
 `apps/desktop` reads its token from `credential-store` (Windows Credential
 Manager), not an in-app login screen (not part of Phase 1A's UI scope — see
 `apps/desktop/README.md`). The mock server accepts any bearer token, so any
-placeholder value works. Provisioning it directly via `credential-store`'s own
-test surface, or via a short one-off Rust snippet calling
-`credential_store::FallbackCredentialStore::save("1on1-recorder", "api-token",
-"<any-value>")`, is the only way to set it right now — there is no CLI for this
-yet (a known gap; `tools/recorderctl`, design.md §8, doesn't exist yet either).
+placeholder value works:
+
+```
+cargo run -p credential-store --example set_token -- <any-value>
+```
+
+This writes straight to the OS keyring under the same service/account
+(`"1on1-recorder"` / `"api-token"`) `apps/desktop/src-tauri/src/config.rs` reads
+from. There is still no in-app way to do this (a known gap; `tools/recorderctl`,
+design.md §8, doesn't exist yet either) — this example is the only way to set it
+right now.
 
 ## 3. Build and run the desktop app
 
