@@ -29,7 +29,14 @@ jobs:
           workspaces: spikes
 
       - name: Build (release, x86_64-pc-windows-msvc)
+        # audiopus_sys(SPIKE-04のOpusをvendored+cmakeでビルドする依存)が同梱する
+        # opusのCMakeLists.txtはcmake_minimum_requiredが古く、windows-latest
+        # ランナーのCMake(4.x系)ではポリシー互換性のエラーで失敗する。
+        # CMake側が提供する移行用の環境変数で最低ポリシーバージョンを
+        # 明示することで、vendored CMakeLists.txt自体を書き換えずに回避する。
         run: cargo build --workspace --release --target x86_64-pc-windows-msvc
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
       - name: Stage executables
         shell: bash
