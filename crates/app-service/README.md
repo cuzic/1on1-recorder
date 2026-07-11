@@ -156,6 +156,35 @@ just not a query that reassembles them into a `SessionManifest`). Such a session
 is left `Failed` rather than silently dropped, but a human would currently need
 to intervene to finish it.
 
+## `tests/failure_injection.rs` (task #13)
+
+Three scenarios, each exercising `session_lifecycle`/`upload_worker` the way a
+real deployment would hit them:
+
+- **Disk write failure during recording**: the session directory is made
+  read-only (`chmod 0o555`) before `run_pipeline` runs, so `segment-store`'s
+  `commit_segment` fails with a permission error (the same failure mode as
+  running out of disk space — the OS refuses the write) instead of needing a
+  real size-limited filesystem to reproduce that. `run_pipeline` errors out and
+  the session is left at `CaptureState::Recording`; once the directory is
+  writable again, `recover_incomplete_sessions` (the same startup path a real
+  restart would run) drives it to `Finalized`.
+- **Network outage from the very start of a session**: `begin_session`'s
+  `UploadAdapter::create_session` call is pointed at an address nothing is
+  listening on. The session exists locally (`CaptureState::Preparing`) but never
+  gets a `remote_session_id` — and `recover_incomplete_sessions`, once the
+  network is back, correctly does *not* try to resume it (the documented known
+  gap two sections up), rather than silently discarding or mishandling it.
+- **Network outage through the end of a session, then a restart**: one segment
+  uploads successfully before the network drops; the next commits locally but
+  every upload attempt against the (deliberately unreachable) endpoint fails.
+  `end_session`'s finalize call fails too (the API's own segment-count check
+  correctly refuses to finalize an incomplete session) and the session is left
+  short of `Finalized`. A later `recover_incomplete_sessions` call (network
+  restored) resumes and finishes it — and the mock server's Idempotency-Key
+  dedup means the segment that failed once and succeeded later was still only
+  ever *written* once server-side.
+
 ## Known scope limits (stage 1)
 
 - The pseudo source generates a steady, zero-drift, zero-jitter frame stream.
@@ -164,7 +193,5 @@ to intervene to finish it.
   wiring, not re-prove alignment math.
 - `run_pipeline` processes both tracks fully before returning; it isn't structured
   for a long-running session that segments incrementally as capture progresses.
-  That structure belongs to stage 3's upload worker / recording-state management.
-- No disk-space, network-outage, or crash-mid-session testing here — that's task
-  #13 (failure-injection integration tests), which depends on this stage's pipeline
-  existing first.
+  That structure belongs to a future incremental-segmenting redesign, not
+  something this stage or task #13 covers.
