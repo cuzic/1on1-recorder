@@ -120,6 +120,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 
 **タイムボックス**: 3日
 
+**実機検証(2026-07-11)**: ユーザーが実際にWindows実機(Bluetoothヘッドセット接続状態)で`spike-01-wasapi-dual-capture.exe`を実行。既定の600秒(10分)を待たずCtrl+Cで約162秒時点で終了したため、その時点では**summary.json・合否レポートが一切生成されないバグが見つかった**(Ctrl+Cが集計・レポート表示コードを一切経由せずプロセスを即終了させていたため)。`spike_common::report::install_ctrlc_stop_flag`でCtrl+Cを捕捉し、録音ループが早期終了した場合も通常終了と同じ経路(集計→summary.json→結果レポート→Enter待ち)を通るよう修正済み(未再検証)。なお、生成された生CSVを手動集計した限りでは、mic/loopbackとも約162秒間でdiscontinuity 1件・timestamp_error 0件・silent 0件、フレームレートも48,013Hz程度(公称48kHzとほぼ一致)で、データの質自体は良好だった。10分間フルでの正式な合否判定は、Ctrl+C修正版での再実行が必要。
+
 ---
 
 ### SPIKE-02: Application Loopback Capture(プロセス指定)
@@ -147,6 +149,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 **タイムボックス**: 3日
 
 **実装状況(2026-07-09)**: `spikes/spike-02-app-loopback`の実装は完了(`todo!()`は0件、`cargo build`/`--release`/`cargo test --no-run`いずれもエラー・警告なし)。`ActivateAudioInterfaceAsync`の呼び出し・PROPVARIANT(VT_BLOB)構築・`IActivateAudioInterfaceCompletionHandler`(`IAgileObject`実装込み)・GetMixFormat/固定フォーマットの2段階リトライまで実装済み。ただし**上記の検証手順・合否基準そのものはまだ何一つ満たされていない**。「Rustから呼べるか」という本スパイクの最大の不確実点は、Windows実機で実際に`Activate`を呼んで完了ハンドラが起動することを確認するまで未検証(cargo checkでの型検証と、実際の動作は別)。実機検証は開発が一定まとまった段階でまとめて行う方針(windows-build-verification.md参照)。
+
+**実機検証(2026-07-11)**: ユーザーが実際にWindows実機で実行し、**`ActivateAudioInterfaceAsync`をRustから呼び出せること自体は確認できた**(クラッシュせず、完了ハンドラが起動してキャプチャが成立した)。ただし音声データを含む行はわずか667行(約6.7秒分)のみで、対象アプリがほとんどの時間無音だった可能性が高い(無音区間はコールバックが来ないため記録されない仕様で、これ自体はバグではない)。process_events.jsonlは空(プロセスの異常終了・再起動は起きなかった)。SPIKE-01と同様、Ctrl+Cで早期終了したためsummary.json・合否レポートは生成されず(→SPIKE-01の項目参照、修正済み・未再検証)。「Zoom/Teams音声のみが分離取得でき他アプリ音声が混入しない」という本来の合否基準は、対象アプリで実際に会議・動画を継続再生しながらの再テストが必要。
 
 ---
 
@@ -181,6 +185,8 @@ macOS / Linux は方式の成立確認レベル(Wave 2)、周辺技術(Wave 3)�
 **タイムボックス**: 3日
 
 **実装状況(2026-07-09)**: `spikes/spike-11-endpoint-registry`として実装済み(windowsクレート依存のため、SPIKE-01/02/09と同じく`cargo check`/`cargo build --release --target x86_64-pc-windows-gnu`によるクロスコンパイル型検証まで。実機でのUSB抜き差し・Windows設定操作等は windows-build-verification.md の方針どおり実機まとめ検証のタイミングで行う)。`spike-common::device_watch`(SPIKE-09で実装済みの`IMMNotificationClient`/`IAgileObject`実装、RAIIでの登録/解除)をそのまま再利用し、その上に本スパイク固有の層を追加した: 起動時の全endpoint列挙(`Active`/`Disabled`/`NotPresent`/`Unplugged`すべてを対象、`endpoint_query::scan_all_endpoints`)と6通り(flow×role)の既定ルート初期値(`scan_default_routes`)から`EndpointRegistry`を構築し、`DeviceWatchEvent`受信のたびに該当endpointを`IPropertyStore`/`IAudioEndpointVolume`経由で再取得して`AudioEndpointSnapshot`(状態・friendly_name・音量・mute・default_roles)を更新、変更前後を`endpoint_events.jsonl`へ記録する。既定デバイスなし(`Option<EndpointId>` = `None`)も表現できる。`DefaultDeviceChanged`受信時は`default_routes`マップと各endpointの`default_roles`集合の両方を整合させて更新する。summary.jsonには「callbackからこの消費スレッドに届くまでの遅延」(dispatch latency, p99/max)と、callback自体が`try_send`のみで再列挙やCOM解放を一切行わないことをコードレビューで確認した旨を記録する(実機でしか測れない「callback内実行時間」そのものと混同しないよう明記)。`registry_matches_windows_state`は設計どおり自動化せず`null`のまま。
+
+**実機検証(2026-07-11)**: ユーザーが実際にWindows実機(Bluetoothヘッドセット接続状態)で実行し完走(90秒間、summary.json生成まで到達)。`apply_errors=0`・`no_duplicate_registration=true`・`no_leaked_registration=true`など自動判定項目は全てPASS。**一方で重大な実地発見があった**: `flow=Capture`かつ`state=NotPresent`(切断済み)のBluetoothヘッドセットのマイク側endpointから約61秒間に145件の`PropertyValueChanged`が連続発生し、1件ずつ同期的にCOM再照会する設計だったため後続イベントの処理がどんどん遅延し、`dispatch_latency_us`が平均31.5秒・最大57.4秒まで悪化した。callback自体(`try_send`のみ)はブロックしていないが、**消費側スレッドでの再照会にタイムアウトがなく、荒れたendpointが他のendpointの処理を巻き込んで遅延させる**という設計上の弱点が実機でのみ見つかった典型例。`registry.rs`に`ENDPOINT_REFRESH_TIMEOUT`(1.5秒)を導入し、COM再照会を別スレッド(MTA参加込み)+`recv_timeout`で打ち切れるようにし、タイムアウト発生を`RegistryChange::RefreshTimedOut`として`endpoint_events.jsonl`に記録・`summary.json`の`endpoint_refresh_timeout_count`/`no_endpoint_refresh_timeouts`として可視化するよう修正(クロスコンパイル型検証済み、実機での再検証は未実施)。
 
 ---
 
