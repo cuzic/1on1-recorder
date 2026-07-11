@@ -106,6 +106,25 @@ impl SessionStore {
         Ok(())
     }
 
+    /// The API's own session identifier, once `set_remote_session_id` has recorded
+    /// it — `None` if `UploadAdapter::create_session` never got a response before a
+    /// crash (see `app-service`'s startup recovery, which needs this to know
+    /// whether it can resume uploading a recovered session or must first retry
+    /// `create_session` itself).
+    pub fn remote_session_id(&self, session_id: SessionId) -> Result<Option<String>, StoreError> {
+        let session_id_str = session_id.to_string();
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT remote_session_id FROM sessions WHERE session_id = ?1",
+            params![session_id_str],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StoreError::SessionNotFound(session_id_str),
+            other => StoreError::Sqlite(other),
+        })
+    }
+
     pub fn capture_state(&self, session_id: SessionId) -> Result<CaptureState, StoreError> {
         let session_id_str = session_id.to_string();
         let conn = self.conn.lock().unwrap();
@@ -141,6 +160,24 @@ impl SessionStore {
             other => StoreError::Sqlite(other),
         })
         .and_then(|(tag, retryable, reason)| state_codec::decode_upload_state(&tag, retryable, reason))
+    }
+
+    /// How many times a segment has entered `UploadState::Uploading` — see
+    /// `update_upload_state`'s doc comment for exactly what counts as an attempt.
+    /// `upload-client`'s backoff pacing is expected to read this.
+    pub fn upload_attempt_count(&self, session_id: SessionId, track: TrackKind, sequence: u64) -> Result<u32, StoreError> {
+        let session_id_str = session_id.to_string();
+        let track_str = track.as_manifest_str();
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT attempt_count FROM upload_status WHERE session_id = ?1 AND track = ?2 AND sequence = ?3",
+            params![session_id_str, track_str, sequence],
+            |row| row.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StoreError::SegmentNotFound { session_id: session_id_str, track: track_str.to_string(), sequence },
+            other => StoreError::Sqlite(other),
+        })
     }
 
     pub fn update_capture_state(&self, session_id: SessionId, state: &CaptureState) -> Result<(), StoreError> {
@@ -228,9 +265,15 @@ impl SessionStore {
         Ok(())
     }
 
-    /// An attempt happened (`Uploading`/`Failed`) bumps `attempt_count` and
-    /// `last_attempt_at`; a pure status change (`Pending`, `Completed`, ...) does not —
-    /// `upload-client`'s backoff logic reads these two columns.
+    /// Starting a new attempt (transitioning to `Uploading`) bumps `attempt_count`
+    /// and `last_attempt_at`; every other transition — including that same
+    /// attempt's own `Completed`/`Failed` outcome — does not. Counting only the
+    /// start of an attempt (not its outcome too) means a caller can always go
+    /// `Uploading -> {Completed, Failed}` for one real upload call without
+    /// double-counting it; a caller that skips `Uploading` and jumps straight to
+    /// `Failed` won't have that attempt counted at all, so callers that want an
+    /// accurate count should always transition through `Uploading` first (see
+    /// `upload_worker::upload_pending_once`).
     pub fn update_upload_state(
         &self,
         session_id: SessionId,
@@ -243,7 +286,7 @@ impl SessionStore {
         let (retryable, reason) = state_codec::upload_state_detail(state);
         let session_id_str = session_id.to_string();
         let track_str = track.as_manifest_str();
-        let is_attempt = matches!(state, UploadState::Uploading | UploadState::Failed { .. });
+        let is_attempt = matches!(state, UploadState::Uploading);
 
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute(

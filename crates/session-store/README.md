@@ -20,8 +20,17 @@ for the reasoning behind building this before `segment-store`/`upload-client`.
 - `segments` — one row per committed `AudioSegment` (already fsynced/hashed on disk by
   `segment-store`; this table stores metadata and a path, not the audio bytes).
 - `upload_status` — one row per segment's `UploadState`, plus `attempt_count` /
-  `last_attempt_at` for `upload-client`'s backoff logic.
+  `last_attempt_at` for `upload-client`'s backoff logic. `attempt_count` increments
+  only on a transition *into* `Uploading` — its own later `Completed`/`Failed`
+  outcome doesn't add a further increment, so `update_upload_state`'s caller can
+  always go `Uploading -> {Completed, Failed}` for one real upload call without
+  double-counting it (see `upload_attempt_count` and that method's doc comment).
 - `events` — an append-only log of state transitions, for diagnostics.
+
+`remote_session_id` (once set) and `segments_for_track` (every committed segment
+for one track, regardless of upload status) are what `app-service`'s startup
+crash-recovery (task #11) uses to decide whether a recovered session can resume
+uploading without first needing to retry `UploadAdapter::create_session`.
 
 `CaptureState`/`UploadState` are stored as a plain `_tag` column (plus the `Failed`
 variant's `recoverable`/`retryable` + `reason` in their own columns) rather than a

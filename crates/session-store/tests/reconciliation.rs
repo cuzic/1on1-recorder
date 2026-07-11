@@ -121,16 +121,23 @@ fn pending_uploads_excludes_completed_and_permanently_failed_segments() {
 }
 
 #[test]
-fn update_upload_state_counts_attempts_only_for_uploading_and_failed_transitions() {
+fn update_upload_state_counts_attempts_only_on_entering_uploading() {
     let store = SessionStore::open_in_memory().unwrap();
     let session_id = SessionId::new();
     store.create_session(&sample_manifest(session_id)).unwrap();
     store.register_segment(&sample_segment(session_id, TrackKind::SelfMic, 0)).unwrap();
 
-    // Pending -> Uploading -> Failed(retryable) -> Uploading -> Completed:
-    // three attempts (Uploading, Failed, Uploading), Pending/Completed don't count.
+    // Pending -> Uploading -> Failed(retryable) -> Uploading -> Completed: two
+    // attempts (the two `Uploading` transitions). Neither outcome
+    // (Failed/Completed) adds a further increment on top of the attempt that
+    // produced it, so `Uploading -> {Completed, Failed}` never double-counts one
+    // real upload call.
     store.update_upload_state(session_id, TrackKind::SelfMic, 0, &UploadState::Pending).unwrap();
+    assert_eq!(store.upload_attempt_count(session_id, TrackKind::SelfMic, 0).unwrap(), 0);
+
     store.update_upload_state(session_id, TrackKind::SelfMic, 0, &UploadState::Uploading).unwrap();
+    assert_eq!(store.upload_attempt_count(session_id, TrackKind::SelfMic, 0).unwrap(), 1);
+
     store
         .update_upload_state(
             session_id,
@@ -139,8 +146,13 @@ fn update_upload_state_counts_attempts_only_for_uploading_and_failed_transitions
             &UploadState::Failed { retryable: true, reason: "timeout".to_string() },
         )
         .unwrap();
+    assert_eq!(store.upload_attempt_count(session_id, TrackKind::SelfMic, 0).unwrap(), 1);
+
     store.update_upload_state(session_id, TrackKind::SelfMic, 0, &UploadState::Uploading).unwrap();
+    assert_eq!(store.upload_attempt_count(session_id, TrackKind::SelfMic, 0).unwrap(), 2);
+
     store.update_upload_state(session_id, TrackKind::SelfMic, 0, &UploadState::Completed).unwrap();
+    assert_eq!(store.upload_attempt_count(session_id, TrackKind::SelfMic, 0).unwrap(), 2);
 
     assert_eq!(
         store.upload_state(session_id, TrackKind::SelfMic, 0).unwrap(),
@@ -194,6 +206,18 @@ fn reconcile_on_startup_fails_sessions_left_mid_flight_and_leaves_terminal_ones_
     // A second reconciliation pass must be a no-op: both sessions are now `failed`
     // (a terminal tag), not one of the non-terminal tags being scanned for.
     assert!(store.reconcile_on_startup().unwrap().is_empty());
+}
+
+#[test]
+fn remote_session_id_is_none_until_set_and_then_persists() {
+    let store = SessionStore::open_in_memory().unwrap();
+    let session_id = SessionId::new();
+    store.create_session(&sample_manifest(session_id)).unwrap();
+
+    assert_eq!(store.remote_session_id(session_id).unwrap(), None);
+
+    store.set_remote_session_id(session_id, "remote-abc123").unwrap();
+    assert_eq!(store.remote_session_id(session_id).unwrap(), Some("remote-abc123".to_string()));
 }
 
 #[test]

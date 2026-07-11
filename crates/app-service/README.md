@@ -27,9 +27,9 @@ rather than as one large "wire everything to real Windows capture" task:
   `recorder_domain::CapturedFrame`, and `windows_session::run_windows_capture_session`
   feeds them through the *exact same* stage 1 `run_pipeline` — no second,
   Windows-specific pipeline was built.
-- **Stage 3 (task #11, not yet built)**: a standing upload worker and richer
-  recording-state management (pause/resume, disk-space handling, `CaptureState`
-  transitions beyond what this stage exercises).
+- **Stage 3 (task #11, this crate's current state)**: `upload_worker` and
+  `session_lifecycle` drive design.md §10's `CaptureState`/`UploadState`
+  transitions and force-quit crash recovery — see below.
 
 ## `windows_supervisor` (task #1)
 
@@ -114,6 +114,47 @@ Buffers the entire session's audio in memory before running the pipeline —
 correctly scoped for proving real capture flows end to end, not for how a
 long-running recording should work. Incremental segmenting as capture progresses
 is stage 3's job (task #11).
+
+## `upload_worker` / `session_lifecycle` (task #11)
+
+OS-independent (no `windows-supervisor` feature needed) — used identically by
+stage 1's `pseudo_source` path and stage 2's real Windows path.
+
+- `upload_worker::upload_pending_once` attempts every segment
+  `SessionStore::pending_uploads` currently returns, once each, transitioning
+  `Uploading -> {Completed, Failed}` per segment rather than aborting on the first
+  failure. `run_until_drained` repeats this (with a sleep between passes) until
+  nothing is pending or `max_passes` is exhausted — the backstop against a bug in
+  error classification, not something expected to bind in normal operation.
+- `session_lifecycle::begin_session`/`end_session` drive design.md §10's
+  `CaptureState` diagram: `begin_session` registers the session (locally and with
+  the API) and moves to `Recording`; `end_session` moves through
+  `Stopping -> Finalizing`, drains any still-pending uploads via
+  `run_until_drained`, calls `UploadAdapter::finalize_session`, and moves to
+  `Finalized`. `pipeline::run_pipeline` now calls both instead of duplicating
+  session bootstrapping inline, and `commit_and_upload_track`'s per-segment
+  upload failures no longer abort the pipeline (`?`-propagate) — they're marked
+  `Failed` and picked up by `end_session`'s drain pass instead, per design.md
+  §13.4 ("an upload failure must not block recording").
+- `session_lifecycle::recover_incomplete_sessions` is this task's other half —
+  the wiring the task description asks for by name: at startup, before any new
+  recording starts, it calls `SessionStore::reconcile_on_startup` (finds sessions
+  a previous process instance left mid-flight), then `segment_store::
+  scan_and_recover` for each of Phase 1A's two tracks (picks up any segment whose
+  atomic commit was interrupted between rename and DB registration), then resumes
+  uploading and finalizes each recovered session that already has a
+  `remote_session_id`. See `tests/upload_failure_and_recovery.rs` for both
+  behaviors end to end (including a real `commit_segment(..., CrashPoint::
+  AfterRename)` simulating the crash).
+
+**Known gap**: a session that crashed *before* ever getting a `remote_session_id`
+(i.e. before `UploadAdapter::create_session`'s response was ever stored — a very
+narrow window right at a session's start) isn't resumed automatically;
+reconstructing its `SessionManifest` to retry `create_session` needs a getter
+`session-store` doesn't have yet (its `sessions` table has every needed field,
+just not a query that reassembles them into a `SessionManifest`). Such a session
+is left `Failed` rather than silently dropped, but a human would currently need
+to intervene to finish it.
 
 ## Known scope limits (stage 1)
 

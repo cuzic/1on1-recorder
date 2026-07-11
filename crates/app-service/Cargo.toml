@@ -16,7 +16,10 @@ recorder-domain = { path = "../recorder-domain" }
 segment-store = { path = "../segment-store" }
 session-store = { path = "../session-store" }
 thiserror = { workspace = true }
-tokio = { version = "1", features = ["rt"], optional = true }
+# "time" for the upload worker's retry-pacing sleep (task #11) — needed
+# unconditionally since the upload worker itself is OS-independent, unlike
+# windows-supervisor's own extra tokio features (see that feature below).
+tokio = { version = "1", features = ["time"] }
 tracing = { version = "0.1", optional = true }
 upload-client = { path = "../upload-client" }
 windows = { version = "0.58", features = ["Win32_Media_Audio", "Win32_System_Com"], optional = true }
@@ -31,5 +34,6 @@ upload-client = { path = "../upload-client", features = ["mock-server"] }
 # capture-windows capture threads, and the conversion layer/session wiring that
 # feeds its frames into stage 1's pipeline. Only meaningful on Windows
 # (capture-windows itself is Windows-only) — this crate's default (no-features)
-# build stays OS-independent for stage 1's pseudo-source pipeline.
-windows-supervisor = ["dep:capture-api", "dep:capture-windows", "dep:crossbeam-channel", "dep:tokio", "dep:tracing", "dep:windows"]
+# build stays OS-independent for stage 1's pseudo-source pipeline and stage 3's
+# upload worker/session lifecycle.
+windows-supervisor = ["dep:capture-api", "dep:capture-windows", "dep:crossbeam-channel", "dep:tracing", "dep:windows", "tokio/rt"]
