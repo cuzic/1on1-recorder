@@ -1,0 +1,32 @@
+[package]
+name = "upload-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP implementation of recorder-domain's UploadAdapter (design.md §13): idempotent segment upload with retry/backoff, ported from spike-08-chunked-upload. Auth is injected via a TokenProvider seam, not hardcoded."
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.7", optional = true }
+chrono = "0.4"
+hex = { version = "0.4", optional = true }
+rand = "0.9"
+recorder-domain = { path = "../recorder-domain" }
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["time", "fs"] }
+tracing = "0.1"
+
+[dev-dependencies]
+session-store = { path = "../session-store" }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+upload-client = { path = ".", features = ["mock-server"] }
+
+[features]
+# Only for this crate's own tests and other crates' dev-dependencies — the mock
+# server is not part of the published API surface.
+mock-server = ["dep:axum", "dep:hex", "tokio/net", "tokio/rt-multi-thread", "tokio/macros"]

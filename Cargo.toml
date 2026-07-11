@@ -7,6 +7,7 @@ members = [
     "crates/recorder-domain",
     "crates/segment-store",
     "crates/session-store",
+    "crates/upload-client",
 ]
 
 [workspace.package]
