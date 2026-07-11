@@ -85,19 +85,19 @@ pub struct WindowsSupervisor {
 }
 
 impl WindowsSupervisor {
-    /// Phase 1A's fixed policy: Microphone and EndpointLoopback, both following
-    /// whatever the OS's Console-role default device is (device pinning / process
-    /// loopback are not exposed here — this crate's scope is Phase 1A only).
+    /// Starts with no bindings at all — `pin_devices` (directly, or via
+    /// `resolve_current_defaults` for "whatever's currently in use") must run
+    /// before `start_all`. Bindings are deliberately never constructed as
+    /// `EndpointSelection::FollowDefault`: `decide()`'s existing
+    /// `DefaultEndpointChanged` handling would then rebind automatically on
+    /// every later OS default-device change while `Running`, which is exactly
+    /// what design.md §16.5 says must not happen unconditionally ("OSの既定マイクや
+    /// 既定スピーカーが変わっても、無条件には追随しない") — once a recording
+    /// starts, the device it started with is what it keeps, for the reasons that
+    /// section gives (a silent switch would break Self/Remote's meaning
+    /// mid-session).
     pub fn new(callback_timeout_ms: u32) -> Self {
-        let state = DecisionState::new()
-            .with_binding(CaptureBinding::new(
-                BindingKind::Microphone,
-                BindingSelection::Endpoint(EndpointSelection::FollowDefault { flow: DataFlow::Capture, role: DeviceRole::Console }),
-            ))
-            .with_binding(CaptureBinding::new(
-                BindingKind::EndpointLoopback,
-                BindingSelection::Endpoint(EndpointSelection::FollowDefault { flow: DataFlow::Render, role: DeviceRole::Console }),
-            ));
+        let state = DecisionState::new();
         let (capture_tx, capture_rx) = crossbeam_channel::bounded(256);
         let (join_result_tx, join_result_rx) = crossbeam_channel::unbounded();
         let (retry_tx, retry_rx) = crossbeam_channel::unbounded();
@@ -127,42 +127,41 @@ impl WindowsSupervisor {
         self.frame_tx = Some(tx);
     }
 
-    /// Queries the OS's current Console-role default capture/render endpoints and
-    /// feeds them into `decide()` before any binding starts, so `start_all`'s first
-    /// `resolve_target` call has something to resolve against. Must run before
-    /// `start_all`.
-    pub fn seed_default_routes(&mut self) -> Result<(), CaptureError> {
+    /// Queries whatever the OS's current Console-role default capture/render
+    /// endpoints are, right now — "what's currently in use" for each of
+    /// Microphone and EndpointLoopback. Doesn't touch `self.state`; the caller
+    /// decides what to do with the result (normally `pin_devices`).
+    pub fn resolve_current_defaults(&self) -> Result<(EndpointId, EndpointId), CaptureError> {
         let _com = capture_windows::com_guard::ComApartment::new_mta()?;
         let enumerator: windows::Win32::Media::Audio::IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
 
-        let capture_id = unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eConsole) }
-            .ok()
-            .and_then(|d| capture_windows::device_select::read_device_id(&d).ok());
-        let effects = decide(
-            &mut self.state,
-            DecisionInput::Observation(Observation::DefaultEndpointChanged {
-                flow: DataFlow::Capture,
-                role: DeviceRole::Console,
-                endpoint_id: capture_id.map(EndpointId),
-            }),
-        );
-        self.execute(effects)?;
+        let capture_id = unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)? };
+        let capture_id = capture_windows::device_select::read_device_id(&capture_id)?;
 
-        let render_id = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
-            .ok()
-            .and_then(|d| capture_windows::device_select::read_device_id(&d).ok());
-        let effects = decide(
-            &mut self.state,
-            DecisionInput::Observation(Observation::DefaultEndpointChanged {
-                flow: DataFlow::Render,
-                role: DeviceRole::Console,
-                endpoint_id: render_id.map(EndpointId),
-            }),
-        );
-        self.execute(effects)?;
+        let render_id = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? };
+        let render_id = capture_windows::device_select::read_device_id(&render_id)?;
 
-        Ok(())
+        Ok((EndpointId(capture_id), EndpointId(render_id)))
+    }
+
+    /// Pins Phase 1A's two bindings (Microphone, EndpointLoopback) to specific
+    /// endpoints — `resolve_current_defaults`'s result for "use whatever's
+    /// currently in use", or a caller-chosen `EndpointId` from
+    /// `capture_windows::device_select::enumerate_capture_devices`/
+    /// `enumerate_render_devices` for a manual picker. Must run before
+    /// `start_all`, and only while both bindings are absent/`Stopped` (i.e. before
+    /// the first `start_all`, or after a full `ShutdownRequested` drain) — this
+    /// does not itself stop an already-running binding to switch it.
+    pub fn pin_devices(&mut self, microphone_endpoint_id: EndpointId, render_endpoint_id: EndpointId) {
+        self.state.bindings.insert(
+            BindingKind::Microphone,
+            CaptureBinding::new(BindingKind::Microphone, BindingSelection::Endpoint(EndpointSelection::Pinned { endpoint_id: microphone_endpoint_id })),
+        );
+        self.state.bindings.insert(
+            BindingKind::EndpointLoopback,
+            CaptureBinding::new(BindingKind::EndpointLoopback, BindingSelection::Endpoint(EndpointSelection::Pinned { endpoint_id: render_endpoint_id })),
+        );
     }
 
     pub fn start_all(&mut self) -> Result<(), CaptureError> {

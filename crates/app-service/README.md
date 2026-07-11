@@ -45,6 +45,17 @@ normalized into `Observation`s (Ctrl+C — or any other shutdown trigger the cal
 wires up — becomes `DecisionInput::ShutdownRequested`, not a generic
 `Observation`, per Codex's review).
 
+`WindowsSupervisor::new` starts with **no bindings at all** — `resolve_current_defaults`
+(whatever's currently in use) + `pin_devices` must run before `start_all`.
+Bindings are never constructed as `EndpointSelection::FollowDefault`: `decide()`
+already rebinds automatically on every `Observation::DefaultEndpointChanged` for
+a `FollowDefault` binding, which is exactly what design.md §16.5 says must
+*not* happen unconditionally once a recording has started ("OSの既定マイクや
+既定スピーカーが変わっても、無条件には追随しない"). `pin_devices` also accepts
+a caller-chosen `EndpointId` (from `capture_windows::device_select::
+enumerate_capture_devices`/`enumerate_render_devices`) for a future manual
+device picker — same plumbing, just skip the "resolve current default" step.
+
 This module can only be **type-checked** from this Linux dev environment (Windows
 cross-compilation, the same way `capture-windows` itself has always been verified
 here — see this project's earlier commits):

@@ -81,7 +81,12 @@ fn run_capture_blocking(callback_timeout_ms: u32, shutdown_rx: crossbeam_channel
     let (watch_tx, watch_rx) = crossbeam_channel::unbounded();
     let _device_watch = DeviceWatch::start(watch_tx)?;
 
-    supervisor.seed_default_routes()?;
+    // design.md §16.5: use whatever's currently in use for each of Microphone
+    // and EndpointLoopback, then pin to those exact devices for the rest of the
+    // session — not `FollowDefault`, which would auto-rebind on every later OS
+    // default-device change while running.
+    let (mic_endpoint_id, render_endpoint_id) = supervisor.resolve_current_defaults()?;
+    supervisor.pin_devices(mic_endpoint_id, render_endpoint_id);
     supervisor.start_all()?;
 
     let collector = std::thread::spawn(move || collect_frames(&frame_rx, level_sink.as_deref()));
