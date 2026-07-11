@@ -1381,6 +1381,8 @@ spike-02-app-loopback/
 
 Zoom/Teams/Chromeのようなマルチプロセスアプリでは、実行ファイル名だけでは対象PIDが一意に決まらない。そのため、名前指定に加えて明示的なPID指定・選択戦略を用意する。
 
+**実機観察の手順**: 以下の`ProcessSelectionStrategy`は設計上のヒューリスティックであり、実際のZoom/Teams/Chromeのプロセスツリー形状(トレイ常駐プロセスと会議ウィンドウプロセスの関係、昇格ヘルパー経由の起動有無など)に対して機能するかはコードを書く前に実機で確認できる・すべきである。手順は [spike02-process-tree-recon.md](spike02-process-tree-recon.md) を参照(Rustコード不要、PowerShellの`Get-CimInstance Win32_Process`だけで完結する)。
+
 ```rust
 pub struct ProcessMatch {
     pub pid: u32,
