@@ -1,0 +1,13 @@
+[package]
+name = "audio-timeline"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Align two independently-clocked real-time audio streams onto a shared timeline, absorbing clock drift and packet loss without losing sync."
+readme = "README.md"
+keywords = ["audio", "timeline", "resample", "sync", "drift"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+serde = { workspace = true }
