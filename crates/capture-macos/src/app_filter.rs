@@ -27,6 +27,6 @@ pub fn scoped_to_application(
 ) -> SCContentFilter {
     SCContentFilter::create()
         .with_display(display)
-        .with_including_applications(std::slice::from_ref(application), &[])
+        .with_including_applications(&[application], &[])
         .build()
 }

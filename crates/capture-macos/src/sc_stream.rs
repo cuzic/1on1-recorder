@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use capture_api::rebinding::BindingKind;
-use screencapturekit::cm::CMSampleBuffer;
+use screencapturekit::cm::{CMSampleBuffer, CMSampleBufferExt};
 use screencapturekit::stream::configuration::SCStreamConfiguration;
 use screencapturekit::stream::content_filter::SCContentFilter;
 use screencapturekit::stream::output_trait::SCStreamOutputTrait;
@@ -238,8 +238,8 @@ impl SCStreamOutputTrait for FrameForwarder {
 /// real build (non-interleaved/planar delivery would need a different conversion).
 fn audio_buffer_list_to_f32(buffer_list: &screencapturekit::AudioBufferList) -> Vec<f32> {
     let mut samples = Vec::new();
-    for buffer in &buffer_list.buffers {
-        let chunks = buffer.data.chunks_exact(4);
+    for buffer in buffer_list {
+        let chunks = buffer.data().chunks_exact(4);
         samples.extend(
             chunks.map(|bytes| f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
         );

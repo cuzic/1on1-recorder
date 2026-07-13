@@ -15,15 +15,39 @@
 //! sense to enumerate them through it than to add a second, separate
 //! process-enumeration dependency.
 
+use std::ffi::c_void;
+use std::ptr::NonNull;
+
 use capture_api::rebinding::DeviceRole;
 use objc2_core_audio::{
     kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
     kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain,
     kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, AudioDeviceID,
-    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectPropertyAddress,
+    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+    AudioObjectPropertyAddress,
 };
 
 use crate::error::CaptureError;
+
+/// `objc2-core-audio`'s functions return a raw `OSStatus` (`i32`, `0` = success)
+/// rather than a `Result` — this crate's own `Result<_, CaptureError>` convention
+/// is applied at this one boundary rather than at every call site.
+fn check_status(status: i32, context: &str) -> Result<(), CaptureError> {
+    if status != 0 {
+        return Err(CaptureError::CoreAudio(format!(
+            "{context} failed with OSStatus {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// `kAudioObjectSystemObject` is declared as `c_int` (`i32`) in `objc2-core-audio`,
+/// but every function that takes an object ID expects `AudioObjectID` (`u32`) — a
+/// deliberately narrow, named cast (rather than sprinkling `as AudioObjectID` at
+/// every call site) so the one intentional bit-reinterpretation is documented once.
+fn system_object() -> AudioObjectID {
+    kAudioObjectSystemObject as AudioObjectID
+}
 
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -121,62 +145,74 @@ pub fn enumerate_running_applications() -> Result<Vec<RunningApplicationInfo>, C
         .map(|app| RunningApplicationInfo {
             bundle_identifier: app.bundle_identifier(),
             display_name: app.application_name(),
-            pid: app.process_id(),
+            // ScreenCaptureKit reports pid_t (i32); RunningApplicationInfo.pid is
+            // u32 to match capture_api::rebinding::Observation::ProcessRestarted's
+            // pid fields — a real PID is always non-negative, so this is lossless.
+            pid: app.process_id() as u32,
         })
         .collect())
 }
 
 fn all_device_ids() -> Result<Vec<AudioDeviceID>, CaptureError> {
-    let address = AudioObjectPropertyAddress {
+    let mut address = AudioObjectPropertyAddress {
         mSelector: kAudioHardwarePropertyDevices,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain,
     };
-    let data_size = unsafe {
-        AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &address, 0, std::ptr::null())
+    let mut data_size: u32 = 0;
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            system_object(),
+            NonNull::from(&mut address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut data_size),
+        )
     };
-    let data_size = data_size.map_err(|err| CaptureError::CoreAudio(err.to_string()))?;
+    check_status(status, "AudioObjectGetPropertyDataSize")?;
     let count = data_size as usize / std::mem::size_of::<AudioDeviceID>();
 
     let mut device_ids = vec![AudioDeviceID::default(); count];
     let mut actual_size = data_size;
-    unsafe {
+    let data_ptr = NonNull::new(device_ids.as_mut_ptr() as *mut c_void)
+        .ok_or_else(|| CaptureError::CoreAudio("empty device list buffer".to_string()))?;
+    let status = unsafe {
         AudioObjectGetPropertyData(
-            kAudioObjectSystemObject,
-            &address,
+            system_object(),
+            NonNull::from(&mut address),
             0,
             std::ptr::null(),
-            &mut actual_size,
-            device_ids.as_mut_ptr() as *mut _,
+            NonNull::from(&mut actual_size),
+            data_ptr,
         )
-    }
-    .map_err(|err| CaptureError::CoreAudio(err.to_string()))?;
+    };
+    check_status(status, "AudioObjectGetPropertyData")?;
 
     Ok(device_ids)
 }
 
 fn default_device_uid(selector: u32) -> Result<Option<String>, CaptureError> {
-    let address = AudioObjectPropertyAddress {
+    let mut address = AudioObjectPropertyAddress {
         mSelector: selector,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain,
     };
     let mut device_id = AudioDeviceID::default();
     let mut size = std::mem::size_of::<AudioDeviceID>() as u32;
-    let result = unsafe {
+    let status = unsafe {
         AudioObjectGetPropertyData(
-            kAudioObjectSystemObject,
-            &address,
+            system_object(),
+            NonNull::from(&mut address),
             0,
             std::ptr::null(),
-            &mut size,
-            &mut device_id as *mut _ as *mut _,
+            NonNull::from(&mut size),
+            NonNull::from(&mut device_id).cast(),
         )
     };
-    match result {
-        Ok(()) => Ok(Some(device_uid(device_id)?)),
-        Err(_) => Ok(None),
+    if status != 0 {
+        return Ok(None);
     }
+    Ok(Some(device_uid(device_id)?))
 }
 
 // device_uid/device_name/device_has_input_streams/device_has_output_streams: thin

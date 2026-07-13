@@ -12,14 +12,25 @@
 //!
 //! **Not yet verified against a real build** — see `lib.rs`'s top-level doc comment.
 
+use std::ffi::c_void;
+use std::ptr::NonNull;
+
 use objc2_core_audio::{
     kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
     kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, AudioObjectAddPropertyListenerBlock,
-    AudioObjectPropertyAddress, AudioObjectRemovePropertyListenerBlock,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, AudioObjectAddPropertyListener,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectRemovePropertyListener,
 };
 
 use crate::error::CaptureError;
+
+/// Every property this module watches, in one place so `start`/`drop` register and
+/// unregister exactly the same set.
+const WATCHED_SELECTORS: [u32; 3] = [
+    kAudioHardwarePropertyDevices,
+    kAudioHardwarePropertyDefaultInputDevice,
+    kAudioHardwarePropertyDefaultOutputDevice,
+];
 
 #[derive(Debug, Clone)]
 pub enum DeviceWatchEvent {
@@ -53,20 +64,32 @@ pub enum DeviceWatchEvent {
 }
 
 /// RAII registration of the CoreAudio device-change listeners. Must be kept alive
-/// for as long as device-change events are wanted; dropping it unregisters the
-/// listener block, mirroring `capture-windows::device_watch::DeviceWatch`'s RAII
-/// shape.
+/// for as long as device-change events are wanted; dropping it unregisters every
+/// listener and frees the boxed [`crossbeam_channel::Sender`] passed as CoreAudio's
+/// client-data pointer, mirroring `capture-windows::device_watch::DeviceWatch`'s
+/// RAII shape.
+///
+/// Uses the plain C-callback flavor (`AudioObjectAddPropertyListener`, taking an
+/// `extern "C-unwind" fn` + a `client_data: *mut c_void`) rather than the
+/// Objective-C-block flavor (`AudioObjectAddPropertyListenerBlock`) this module
+/// originally used — the block variant needs a `block2`-wrapped closure, which
+/// turned out not to bind the way a raw `*mut _`-cast Rust closure does (caught by
+/// the first real macOS CI build). The C-callback flavor's function-pointer +
+/// opaque-pointer shape is the classic, straightforward-to-bind-correctly pattern.
 pub struct DeviceWatch {
-    tx: crossbeam_channel::Sender<DeviceWatchEvent>,
+    /// Owns the heap allocation `property_changed` dereferences via its
+    /// `client_data` parameter on every callback. Freed in `Drop`, only after every
+    /// listener referencing it has been unregistered.
+    client_data: NonNull<crossbeam_channel::Sender<DeviceWatchEvent>>,
 }
 
 impl DeviceWatch {
-    /// Registers `AudioObjectPropertyListenerBlock`s for the device list and both
-    /// default-device selectors, forwarding CoreAudio's raw notifications onto `tx`
-    /// as [`DeviceWatchEvent`]s. Deliberately does not resolve device UIDs inside
-    /// the listener block itself (CoreAudio property listener blocks fire on an
-    /// internal dispatch queue with no guarantee about which thread calls
-    /// `AudioObjectGetPropertyData` safely) — the block only signals *that*
+    /// Registers one C-callback listener (`property_changed`) for the device list
+    /// and both default-device selectors, forwarding CoreAudio's raw notifications
+    /// onto `tx` as [`DeviceWatchEvent`]s. Deliberately does not resolve device
+    /// UIDs inside the callback itself (CoreAudio property listeners fire on an
+    /// internal thread/queue with no guarantee about which thread calls
+    /// `AudioObjectGetPropertyData` safely) — the callback only signals *that*
     /// something changed; resolving current state happens via
     /// `device_select::enumerate_capture_devices`/`enumerate_render_devices` calls
     /// made by the consumer in response, the same "notification is a trigger to
@@ -74,80 +97,137 @@ impl DeviceWatch {
     /// `capture-windows::device_watch::DeviceWatchEvent` already documents for its
     /// own `PropertyValueChanged`/`DeviceStateChanged` variants.
     pub fn start(tx: crossbeam_channel::Sender<DeviceWatchEvent>) -> Result<Self, CaptureError> {
-        register_listener(kAudioHardwarePropertyDevices, &tx)?;
-        register_listener(kAudioHardwarePropertyDefaultInputDevice, &tx)?;
-        register_listener(kAudioHardwarePropertyDefaultOutputDevice, &tx)?;
-        Ok(Self { tx })
+        let client_data = NonNull::from(Box::leak(Box::new(tx)));
+        for selector in WATCHED_SELECTORS {
+            if let Err(err) = register_listener(selector, client_data) {
+                // Unregister whatever succeeded before this failure, then free the
+                // boxed sender, rather than leaking it on a partial-start failure.
+                for already_registered in WATCHED_SELECTORS.iter().take_while(|s| **s != selector) {
+                    let _ = unregister_listener(*already_registered, client_data);
+                }
+                unsafe { drop(Box::from_raw(client_data.as_ptr())) };
+                return Err(err);
+            }
+        }
+        Ok(Self { client_data })
     }
 }
 
 impl Drop for DeviceWatch {
     fn drop(&mut self) {
-        for selector in [
-            kAudioHardwarePropertyDevices,
-            kAudioHardwarePropertyDefaultInputDevice,
-            kAudioHardwarePropertyDefaultOutputDevice,
-        ] {
-            let address = AudioObjectPropertyAddress {
-                mSelector: selector,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            };
+        for selector in WATCHED_SELECTORS {
             // Best-effort unregistration on drop; a failure here just leaks the
-            // listener block rather than being something a Drop impl can surface.
-            unsafe {
-                let _ = AudioObjectRemovePropertyListenerBlock(
-                    kAudioObjectSystemObject,
-                    &address,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-            }
+            // listener registration rather than being something a Drop impl can
+            // surface.
+            let _ = unregister_listener(selector, self.client_data);
         }
+        // SAFETY: `client_data` was created via `Box::leak` in `start` and every
+        // listener referencing it has just been unregistered above, so nothing can
+        // call `property_changed` with this pointer again after this point.
+        unsafe { drop(Box::from_raw(self.client_data.as_ptr())) };
     }
 }
 
 fn register_listener(
     selector: u32,
-    tx: &crossbeam_channel::Sender<DeviceWatchEvent>,
+    client_data: NonNull<crossbeam_channel::Sender<DeviceWatchEvent>>,
 ) -> Result<(), CaptureError> {
-    let address = AudioObjectPropertyAddress {
+    let mut address = AudioObjectPropertyAddress {
         mSelector: selector,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain,
     };
-    let tx = tx.clone();
-    // TODO(verify on real build): AudioObjectAddPropertyListenerBlock's exact
-    // signature (queue parameter, block type) needs confirming — this is written
-    // against best-effort documentation research, no macOS host available to
-    // compile-check it (see lib.rs's top-level doc comment).
-    let result = unsafe {
-        AudioObjectAddPropertyListenerBlock(
-            kAudioObjectSystemObject,
-            &address,
-            std::ptr::null_mut(), // dispatch_queue_t: run on CoreAudio's default queue
-            &mut move |_number_addresses, _addresses| {
-                let event = match selector {
-                    s if s == kAudioHardwarePropertyDevices => {
-                        // The listener alone can't tell added from removed; the
-                        // consumer re-enumerates and diffs (see doc comment above).
-                        // Reported as `DeviceAdded` with an empty UID as a
-                        // re-enumerate-me trigger — refine once real behavior is
-                        // observed on a Mac.
-                        DeviceWatchEvent::DeviceAdded {
-                            device_uid: String::new(),
-                        }
-                    }
-                    s if s == kAudioHardwarePropertyDefaultInputDevice => {
-                        DeviceWatchEvent::DefaultInputDeviceChanged { device_uid: None }
-                    }
-                    _ => DeviceWatchEvent::DefaultOutputDeviceChanged { device_uid: None },
-                };
-                let _ = tx.send(event);
-            } as *mut _,
+    let status = unsafe {
+        AudioObjectAddPropertyListener(
+            system_object(),
+            NonNull::from(&mut address),
+            Some(property_changed),
+            client_data.as_ptr() as *mut c_void,
         )
     };
-    result.map_err(|err| CaptureError::CoreAudio(err.to_string()))
+    if status != 0 {
+        return Err(CaptureError::CoreAudio(format!(
+            "AudioObjectAddPropertyListener failed with OSStatus {status}"
+        )));
+    }
+    Ok(())
+}
+
+fn unregister_listener(
+    selector: u32,
+    client_data: NonNull<crossbeam_channel::Sender<DeviceWatchEvent>>,
+) -> Result<(), CaptureError> {
+    let mut address = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let status = unsafe {
+        AudioObjectRemovePropertyListener(
+            system_object(),
+            NonNull::from(&mut address),
+            Some(property_changed),
+            client_data.as_ptr() as *mut c_void,
+        )
+    };
+    if status != 0 {
+        return Err(CaptureError::CoreAudio(format!(
+            "AudioObjectRemovePropertyListener failed with OSStatus {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// `kAudioObjectSystemObject` is `c_int` (`i32`) in `objc2-core-audio`, but every
+/// function that takes an object ID expects `AudioObjectID` (`u32`) — see
+/// `device_select::system_object`'s identical rationale (duplicated here rather
+/// than shared, since the two modules are otherwise independent and this is a
+/// one-line cast, not worth a cross-module dependency for).
+fn system_object() -> AudioObjectID {
+    kAudioObjectSystemObject as AudioObjectID
+}
+
+/// The `AudioObjectPropertyListenerProc` callback CoreAudio invokes on every
+/// watched property's change. `client_data` is the `NonNull<Sender<...>>` pointer
+/// `start`/`register_listener` passed in — reconstructed as a borrow (never taking
+/// ownership away from `DeviceWatch`, which frees it exactly once in `Drop`).
+///
+/// Only inspects `in_addresses`' first entry's `mSelector` to decide which
+/// `DeviceWatchEvent` to emit, even though `in_number_addresses` could in principle
+/// be greater than 1 — CoreAudio is documented to always deliver one address per
+/// registered listener callback in practice for this crate's usage (one listener
+/// registered per selector, not one shared listener across multiple selectors at
+/// once), so this is a reasonable simplification rather than a correctness gap for
+/// the selectors this module watches.
+unsafe extern "C-unwind" fn property_changed(
+    _in_object_id: AudioObjectID,
+    _in_number_addresses: u32,
+    in_addresses: NonNull<AudioObjectPropertyAddress>,
+    in_client_data: *mut c_void,
+) -> i32 {
+    let tx = unsafe { &*(in_client_data as *const crossbeam_channel::Sender<DeviceWatchEvent>) };
+    let address = unsafe { in_addresses.as_ref() };
+
+    let event = match address.mSelector {
+        s if s == kAudioHardwarePropertyDevices => {
+            // The listener alone can't tell added from removed; the consumer
+            // re-enumerates and diffs (see `DeviceWatch::start`'s doc comment).
+            // Reported as `DeviceAdded` with an empty UID as a re-enumerate-me
+            // trigger — refine once real behavior is observed on a Mac.
+            DeviceWatchEvent::DeviceAdded {
+                device_uid: String::new(),
+            }
+        }
+        s if s == kAudioHardwarePropertyDefaultInputDevice => {
+            DeviceWatchEvent::DefaultInputDeviceChanged { device_uid: None }
+        }
+        s if s == kAudioHardwarePropertyDefaultOutputDevice => {
+            DeviceWatchEvent::DefaultOutputDeviceChanged { device_uid: None }
+        }
+        _ => return 0,
+    };
+    let _ = tx.send(event);
+    0
 }
 
 /// Watches for meeting-app launch/terminate via `NSWorkspace` notifications.
