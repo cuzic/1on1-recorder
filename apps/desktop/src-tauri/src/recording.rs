@@ -65,14 +65,74 @@ pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
     active.join_handle.await.map_err(|e| format!("capture task panicked: {e}"))?.map_err(|e| e.to_string())
 }
 
-/// No real capture backend exists on this platform (`capture-windows` is
-/// Windows-only) — "recording" here is a stopwatch only. On stop, exactly enough
-/// `pseudo_source` audio for the elapsed real time is generated and run through
-/// the same `run_pipeline` a real session uses, so the rest of the app
-/// (session-store, segment-store, upload-client) is genuinely exercised locally.
-/// This is a development/testing fallback, not a claim that anything was actually
-/// recorded from a real microphone — see this crate's README.
-#[cfg(not(windows))]
+/// The macOS analogue of the `#[cfg(windows)]` `start` above — real
+/// ScreenCaptureKit capture via `app_service::run_macos_capture_session`. **Not
+/// yet run on real macOS hardware, or even compiled at all** — see
+/// `crates/capture-macos`'s crate doc comment and README.
+#[cfg(target_os = "macos")]
+pub fn start(state: &AppState) -> Result<SessionId, String> {
+    let manifest = build_manifest();
+    let session_id = manifest.session_id;
+
+    let level = std::sync::Arc::new(std::sync::Mutex::new(
+        app_service::macos_frame_collector::LevelSnapshot::default(),
+    ));
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::unbounded();
+
+    let store = state.store.clone();
+    let adapter = state.adapter.clone();
+    let session_dir = state.config.sessions_root.join(session_id.to_string());
+    let bitrate_bps = state.config.bitrate_bps;
+    let manifest_for_task = manifest.clone();
+    let level_for_task = level.clone();
+    let sample_rate_hz = manifest.audio.sample_rate;
+
+    // SCStreamConfiguration takes channel count as an explicit request (unlike
+    // WASAPI, which reports the device's own mix format) — mono, matching
+    // Windows Phase 1A's own capture format.
+    const CHANNELS: u16 = 1;
+
+    let join_handle = tauri::async_runtime::spawn(async move {
+        app_service::run_macos_capture_session(
+            &manifest_for_task,
+            shutdown_rx,
+            sample_rate_hz,
+            CHANNELS,
+            &session_dir,
+            bitrate_bps,
+            &store,
+            adapter.as_ref(),
+            Some(level_for_task),
+        )
+        .await
+    });
+
+    *state.current.lock().unwrap() = Some(ActiveRecording {
+        session_id,
+        manifest,
+        started_at: Instant::now(),
+        level,
+        shutdown_tx,
+        join_handle,
+    });
+    Ok(session_id)
+}
+
+#[cfg(target_os = "macos")]
+pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
+    let active = state.current.lock().unwrap().take().ok_or_else(|| "not recording".to_string())?;
+    active.shutdown_tx.send(()).map_err(|e| format!("failed to signal shutdown: {e}"))?;
+    active.join_handle.await.map_err(|e| format!("capture task panicked: {e}"))?.map_err(|e| e.to_string())
+}
+
+/// No real capture backend exists on this platform (neither `capture-windows` nor
+/// `capture-macos` target it) — "recording" here is a stopwatch only. On stop,
+/// exactly enough `pseudo_source` audio for the elapsed real time is generated
+/// and run through the same `run_pipeline` a real session uses, so the rest of
+/// the app (session-store, segment-store, upload-client) is genuinely exercised
+/// locally. This is a development/testing fallback, not a claim that anything was
+/// actually recorded from a real microphone — see this crate's README.
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn start(state: &AppState) -> Result<SessionId, String> {
     let manifest = build_manifest();
     let session_id = manifest.session_id;
@@ -80,7 +140,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
     Ok(session_id)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
     use app_service::pseudo_source::{generate_frames, nominal_frame_interval_ns, PseudoSourceConfig};
 

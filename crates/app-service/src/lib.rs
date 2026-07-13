@@ -24,10 +24,27 @@ pub mod windows_session;
 #[cfg(feature = "windows-supervisor")]
 pub mod windows_supervisor;
 
-#[cfg(feature = "windows-supervisor")]
+// Only re-exported when `macos-supervisor` is off: both this and
+// `macos_frame_collector::LevelSnapshot` are structurally identical but distinct
+// types, so re-exporting both under the same top-level name would collide if a
+// caller ever enabled both features together (e.g. `cargo build --all-features`,
+// which nothing stops even though the two are only ever meaningful on their own
+// respective OS). Callers building with `macos-supervisor` reach the macOS type via
+// `app_service::macos_frame_collector::LevelSnapshot` instead of a root re-export.
+#[cfg(all(feature = "windows-supervisor", not(feature = "macos-supervisor")))]
 pub use windows_frame_collector::LevelSnapshot;
 #[cfg(feature = "windows-supervisor")]
 pub use windows_session::run_windows_capture_session;
+
+#[cfg(feature = "macos-supervisor")]
+pub mod macos_frame_collector;
+#[cfg(feature = "macos-supervisor")]
+pub mod macos_session;
+#[cfg(feature = "macos-supervisor")]
+pub mod macos_supervisor;
+
+#[cfg(feature = "macos-supervisor")]
+pub use macos_session::run_macos_capture_session;
 
 pub use error::AppServiceError;
 pub use normalize::normalize_to_mono;

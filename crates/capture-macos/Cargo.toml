@@ -1,0 +1,21 @@
+[package]
+name = "capture-macos"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ScreenCaptureKit-backed audio capture (microphone and system-audio output) for macOS 15+, resilient to device/app changes via capture-api's rebinding state machine."
+
+[dependencies]
+capture-api = { path = "../capture-api" }
+crossbeam-channel = "0.5"
+thiserror = { workspace = true }
+tracing = "0.1"
+# macos_13_0 gates system-audio capture; macos_15_0 gates the SCStreamOutputType
+# ::Microphone output (added WWDC24) design.md §5.2 requires — exact feature flag
+# names to be confirmed against the crate on first real macOS build (see lib.rs's
+# top-level doc comment: this crate has not yet been compiled on a real macOS host).
+screencapturekit = { version = "8", features = ["macos_15_0"] }
+objc2-core-audio = "0.3"
+objc2-core-audio-types = "0.3"
+objc2-core-foundation = "0.3"

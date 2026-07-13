@@ -20,20 +20,25 @@ pub struct AppState {
 
 pub struct ActiveRecording {
     pub session_id: SessionId,
-    /// Only read back out on the non-Windows dev-mode `stop` path (see
-    /// `recording.rs`) — the real Windows path already moved its own clone into
-    /// the spawned capture task, so this copy goes unread there.
-    #[cfg_attr(windows, allow(dead_code))]
+    /// Only read back out on the dev-mode `stop` path (see `recording.rs`) — the
+    /// real Windows/macOS paths already moved their own clone into the spawned
+    /// capture task, so this copy goes unread there.
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
     pub manifest: SessionManifest,
     pub started_at: Instant,
-    /// Updated live by `app_service::windows_frame_collector` as real capture
-    /// happens — only exists on Windows. Other platforms report
-    /// `level::dev_placeholder_level(elapsed)` instead (see `recording.rs`), since
-    /// there is no real capture to compute a level from.
+    /// Updated live by `app_service::windows_frame_collector`/
+    /// `app_service::macos_frame_collector` as real capture happens — only exists
+    /// on Windows/macOS. Other platforms report `level::dev_placeholder_level(elapsed)`
+    /// instead (see `recording.rs`), since there is no real capture to compute a
+    /// level from. The two platforms' `LevelSnapshot` types are structurally
+    /// identical but distinct (see `app-service`'s `lib.rs` for why macOS's isn't
+    /// re-exported at the crate root the way Windows's is).
     #[cfg(windows)]
     pub level: Arc<Mutex<app_service::LevelSnapshot>>,
-    #[cfg(windows)]
+    #[cfg(target_os = "macos")]
+    pub level: Arc<Mutex<app_service::macos_frame_collector::LevelSnapshot>>,
+    #[cfg(any(windows, target_os = "macos"))]
     pub shutdown_tx: crossbeam_channel::Sender<()>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub join_handle: tauri::async_runtime::JoinHandle<Result<SessionSummary, app_service::AppServiceError>>,
 }

@@ -1,0 +1,13 @@
+# crates/segment-storeが依存するopus(0.3.1)経由のaudiopus_sys(0.2.2、2021年以降
+# 更新なし)が同梱するOpusのCMakeLists.txtは`cmake_minimum_required(VERSION 3.1)`の
+# ままで、CMake 4.x系(ポリシー互換性 < 3.5 のサポートを撤廃済み)でビルドすると
+# 「CMake Error: Compatibility with CMake < 3.5 has been removed」で失敗する。
+# spikes/.cargo/config.tomlと同じ問題がメインワークスペースにも存在するため、
+# 同じ回避策をここにも設定する(spikes/.cargo/config.tomlのコメント参照)。
+#
+# vendored CMakeLists.txt自体は書き換えられないため、CMake公式が用意する
+# 移行用フォールバック環境変数で最低ポリシーバージョンを補う。ローカルの
+# CMakeが3.5未満のポリシーを許容する版であればこの設定は実質no-opなので、
+# CMakeのバージョンに関わらずここで一律設定しておく。
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

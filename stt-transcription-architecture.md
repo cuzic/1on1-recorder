@@ -1,9 +1,11 @@
 # リアルタイム文字起こし抽象化 設計書
 
-* **文書ステータス**: Draft v0.3(Codexレビュー2回反映済み。実装着手可、ただし§7.3の条件付き)
-* **作成日**: 2026-07-13
+* **文書ステータス**: Draft v0.4(PoC対象をGemini LiveからDeepgramへ変更。実装着手可)
+* **作成日**: 2026-07-13(最終更新: 2026-07-13、PoC対象変更)
 * **関連文書**: [design.md](design.md) §13(アップロードAPI境界、`UploadAdapter`と同型の抽象化パターン)・§13.4(将来のリアルタイム文字起こしに関する既定方針)、[docs/logging-policy.md](docs/logging-policy.md)(音声内容・トークンを外部に出す際の既定ルール)
-* **位置づけ**: 本書は「複数のSTT(音声認識)エンジンを差し替え可能にする」抽象化そのものの設計書であり、実装前にCodexレビューを経てから着手する。PoCとしてはGemini Live APIのみを実装するが、抽象化自体は他プロバイダを見据えて設計する。
+* **位置づけ**: 本書は「複数のSTT(音声認識)エンジンを差し替え可能にする」抽象化そのものの設計書であり、実装前にCodexレビューを経てから着手する。**PoC対象はDeepgram(Nova-3)**。抽象化自体は他プロバイダを見据えて設計する。
+
+> **2026-07-13 変更メモ**: §4〜§5の抽象設計(トレイト形状・extra機構)はGemini向けにCodexレビュー2回を経て確定していたが、その後の実機検証(Gemini Live APIへの実接続スパイク)で、Gemini Liveのnative-audioモデルは常に音声応答を自発生成する会話系APIであり、無応答・聞き専用の文字起こしモードが存在しないことが判明した(公式ドキュメントでも明示的に確認)。これはdrain完了判定などの実装詳細以前の、PoCとして採用できないという根本的な問題だったため、PoC対象をGemini Liveから撤回した。加えて、日本語対応状況を調査した結果、当初最安と見えたAssemblyAIの主力ストリーミングモデルは日本語非対応(英語+欧州5言語のみ)で、Deepgram(Nova-3)は日本語をstreaming/batch双方で追加コストなく正式サポートしていることが分かった。このため、実際にサーバー側から常時ストリーミング応答が得られ、日本語対応もクリーンなDeepgramをPoC対象に変更する。§4(トレイト)・§5(extra機構)は設計変更不要(プロバイダ非依存の抽象化はそのまま使える)。§6のみDeepgram向けに書き換える。
 
 ---
 
@@ -61,10 +63,10 @@ design.md §13.4は将来のリアルタイム文字起こしについて次の�
 ```
 crates/
 ├─ stt-api/       # トレイト・共通型のみ。特定プロバイダに一切依存しない。汎用crateとして公開可能な設計にする。
-└─ stt-gemini/    # Gemini Live APIの実装。stt-apiに依存する。
+└─ stt-deepgram/  # Deepgram(Nova-3)ストリーミングAPIの実装。stt-apiに依存する。
 ```
 
-将来 `stt-deepgram` 等を追加しても `stt-api` は変更不要、というのが分離の目的。`stt-api`自体は他のこのプロジェクト固有の型(`SessionId`・`TrackKind`等)に依存させない — 「音声を入れたらテキストが出てくる」という抽象化だけを持ち、「どのセッション/どのtrackの音声か」はこれを呼び出す`app-service`側の責務とする。
+将来 `stt-gemini`(バッチ用途に限定すれば有望)や`stt-assemblyai`等を追加しても `stt-api` は変更不要、というのが分離の目的。`stt-api`自体は他のこのプロジェクト固有の型(`SessionId`・`TrackKind`等)に依存させない — 「音声を入れたらテキストが出てくる」という抽象化だけを持ち、「どのセッション/どのtrackの音声か」はこれを呼び出す`app-service`側の責務とする。
 
 ---
 
@@ -327,25 +329,38 @@ let config = SttSessionConfig::new(16_000)
 
 ---
 
-## 6. Geminiアダプタ(`stt-gemini`)実装方針
+## 6. Deepgramアダプタ(`stt-deepgram`)実装方針
 
-Gemini Live API(WebSocket)の実プロトコルは以下の通り(Codexが2026-07-13にhttps://ai.google.dev/gemini-api/docs/live-api、https://ai.google.dev/gemini-api/docs/live-api/get-started-websocket、https://ai.google.dev/api/live を実際に確認して裏取り済み)。
+Deepgram Streaming API(WebSocket)の実プロトコルは以下の通り(2026-07-13にhttps://developers.deepgram.com/reference/speech-to-text/listen-streaming、https://developers.deepgram.com/docs/close-stream、https://developers.deepgram.com/docs/understanding-end-of-speech-detection、https://developers.deepgram.com/reference/authentication を実際に確認して裏取り済み)。
 
-* 接続: WSSエンドポイント(`BidiGenerateContent`系)
-* セッション開始: setupメッセージでVAD設定(`realtimeInputConfig`内の`automaticActivityDetection`)・`inputAudioTranscription`を指定。**生WebSocket JSONのフィールド名はcamelCase**(`inputAudioTranscription`/`realtimeInputConfig`)である。当初案の`input_audio_transcription`のようなsnake_caseはSDK風の誤記であり、生WSプロトコルとしては誤り — 実装時は公式リファレンスのフィールド名をそのまま使うこと。
-* 音声送信: `realtimeInput.audio`経由で16-bit PCM 16kHz little-endianの連続バイト列
-* 受信: `serverContent.inputTranscription.text`にテキストが逐次追記される
-* 終了: 自動VAD時は`audioStreamEnd`、手動VAD時は`activityEnd`という制御メッセージが存在する
-* エラー: WSクローズコード(1011, 1008等)、インバンドJSONエラーではない
+* 接続: `wss://api.deepgram.com/v1/listen` に対しクエリパラメータで設定を渡す(Gemini Liveのような別途JSON setupメッセージは不要):
+  `model=nova-3`、`language=ja`(日本語固定。将来`SttSessionConfig.language`から渡す)、`encoding=linear16`、`sample_rate=<SttSessionConfig.sample_rate_hz>`、`channels=1`、`interim_results=true|false`(`SttSessionConfig.interim_results`から)、`punctuate=true`、`vad_events=true|false`(`SttSessionConfig.vad_events`から)、`endpointing=<ms>`(発話終端検出の無音長。既定10msは短すぎるため実装時にチューニング)、`utterance_end_ms=1000`以上(`UtteranceEnd`メッセージを有効化する場合)。
+* 認証: HTTPヘッダ`Authorization: Token <DEEPGRAM_API_KEY>`(GeminiのようなURLクエリへの生キー埋め込みではない — 資格情報の扱いは[docs/logging-policy.md](docs/logging-policy.md)の既定方針(ログへ出さない)にも合致しやすい)。
+* 音声送信: JSON setupメッセージなしで、接続直後からバイナリWebSocketフレームとしてPCM16 little-endianの生バイト列をそのまま送るだけ(Gemini Liveのような`{"realtimeInput":{"audio":{"data": base64...}}}`のようなJSONラップ・base64化は不要)。
+* 受信: `type: "Results"`のJSONメッセージ。形状は概ね次の通り:
+  ```json
+  {
+    "type": "Results",
+    "channel": { "alternatives": [{ "transcript": "...", "words": [...] }] },
+    "is_final": true,
+    "speech_final": true,
+    "start": 5.99,
+    "duration": 1.98
+  }
+  ```
+  `is_final`(このメッセージの音声区間についてこれ以上変わらない)と`speech_final`(発話がこの時点で自然に終わったとDeepgramが判断した)の**2種のフラグが独立にある**点がGemini Liveとの大きな違いであり、§2.2の表の通り「順序保証がなく単一テキストが逐次追記される」Geminiより判定が単純。
+* `vad_events=true`時は`{"type":"SpeechStarted", ...}`(発話区間の開始を検知)、`utterance_end_ms`設定時は`{"type":"UtteranceEnd", "channel": [0,1], "last_word_end": 3.1}`(無音が閾値を超えて発話区切りと判定)がそれぞれサーバから送られる — こちらはGemini Liveの`activityStart`/`activityEnd`(クライアント→サーバの制御メッセージ)とは異なり、**サーバ→クライアントの通知イベント**である点に注意(方向性の取り違えはGemini設計時にCodexへ指摘された誤りなので、Deepgramでも実装時に確認すること)。
+* 終了: `{"type": "CloseStream"}`をJSON textフレームで送信すると、サーバは残りの音声を処理してから`{"type": "Metadata", "request_id": ..., "duration": ..., ...}`を送り、その後WebSocketを閉じる。**drain完了の判定はこの`Metadata`メッセージの受信そのもの**であり、Geminiのようなタイムアウト方式による推測が不要(§7.3で条件としていたスパイク検証が、Deepgramでは設計時点で不要になった理由)。
+* エラー: WSクローズコード、または`{"type": "Error", ...}`系のインバンドメッセージ(詳細は実装時にドキュメント再確認)。HTTPレベルの401/429は接続確立前に発生しうるため、`start_session`内のWebSocketハンドシェイク失敗時にステータスコードから`SttError::AuthenticationFailed`/`SttError::RateLimited`へマッピングする。
 
-これを`SttSession`にマッピングする方針(Codexレビューで3点誤りが指摘され、修正済み):
+これを`SttSession`にマッピングする方針:
 
-* `send_audio`: PCM f32 → PCM16への変換をここで行い、`realtimeInput.audio`として送信する(サンプルレート変換は呼び出し側`app-service`の責務とし、`stt-gemini`は`SttSessionConfig.sample_rate_hz`で指定された16kHzのf32を受け取る前提とする)
-* **【要検証・未解決】interim/finalの境界判定**: 当初案は`turnComplete`受信時点のテキストを`FinalTranscript`とする設計だったが、これは誤り。公式APIリファレンスは、`inputTranscription`メッセージは他のメッセージ(`turnComplete`含む)と**独立に送られ、順序保証がない**と明記している。したがって`turnComplete`をfinal境界として使うと、遅延して届くtranscriptの取りこぼしや誤ったfinal化が起き得る。この問題はドキュメント調査だけでは解決できず、**実際にAPIを叩いて`inputTranscription`と`turnComplete`の実際の到着順序・タイミングを観測してから実装方針を決める**必要がある(実装着手時の最初のスパイク的な検証項目とする)。暫定案としては「`inputTranscription`は常に`PartialTranscript`として扱い、`finalize()`呼び出し時点で最後に受信したテキストをその場で`FinalTranscript`として発火する」という保守的な方針が考えられるが、これも実機検証で妥当性を確認すること。
-* 単語タイムスタンプ・話者分離: Gemini Live文字起こしには未提供のため、常に`words: None`
-* **`SpeechStarted`/`SpeechEnded`は今回のGeminiアダプタでは発火しない**: 当初案は`activityStart`/`activityEnd`をサーバからのイベントとして扱っていたが誤り。これらは自動VADを**無効化した場合に、クライアントからサーバへ送る制御メッセージ**であり、サーバがクライアントへ送ってくる通知ではない。現行の`SttSession`インターフェース(`send_audio`のみ)には、クライアント側でactivity境界を明示的に送る手段が無い。手動VADモードをサポートするには`SttSession`に`mark_speech_started`/`mark_speech_ended`のようなメソッドを追加する必要があり、これは今回のPoCスコープ外とする。**Geminiアダプタは常に自動VADモードで動作し、`SttSessionConfig.vad_events`が`true`でも`SpeechStarted`/`SpeechEnded`は一切発火しない**(「対応していない機能は出さない」という設計方針どおりの挙動として明記する)。
-* `finalize()`: 接続を切るだけでは不十分。自動VAD時は`audioStreamEnd`を送信し、それ以降に届く`inputTranscription`をdrainしてからWebSocketをcloseする(手動VAD自体は上記の理由で今回サポートしない)。**【要検証】"drain完了"の判定条件が未定義**: `turnComplete`はfinal境界として使えない(上記のとおり順序保証がない)ため、`audioStreamEnd`送信後に「もう`inputTranscription`が来ない」とどう判断するかを別途決める必要がある。ドキュメント調査だけでは確定できないため、実装着手時の最初のスパイクで実際に`audioStreamEnd`送信後の挙動を観測し、以下のいずれかで確定する: (a) 一定時間(例: 500ms〜1秒)新規`inputTranscription`が届かなければdrain完了とみなすタイムアウト方式、(b) サーバが`GoAway`または明示的なセッション終了通知を送ってくることを確認できればそれをdrain完了のトリガーにする、(c) その他観測結果に応じた方式。
-* エラー: WSクローズコードを`SttError::Transport`にマッピング(コード値からリトライ可否を判定する詳細は実装時に詰める)
+* `send_audio`: PCM f32 → PCM16への変換をここで行い、JSONラップなしでバイナリフレームとしてそのまま送信する(サンプルレート変換は呼び出し側`app-service`の責務とし、`stt-deepgram`は`SttSessionConfig.sample_rate_hz`で指定されたレートのf32を受け取ってそのままDeepgramへの`sample_rate`クエリに渡す — Geminiと違い16kHz固定を要求しない)。
+* interim/finalの境界判定: `is_final: false`の`Results`は`PartialTranscript`、`is_final: true`の`Results`は`FinalTranscript`として発火する。`speech_final: true`は「発話の自然な区切り」を表すのみで、`is_final`と独立してよい(`speech_final`単体を追加のセマンティクスとして`SttExtraResult.provider_specific`に載せるかは実装時に判断)。
+* 単語タイムスタンプ・話者分離: `channel.alternatives[0].words[]`に単語ごとの`start`/`end`/`confidence`があり、`diarization: true`を渡していれば`speaker`も含まれる(Deepgramの`diarize`クエリパラメータに対応)。`Word`型へそのままマッピングできる。
+* `SpeechStarted`/`SpeechEnded`: `vad_events: true`かつ`utterance_end_ms`設定時、`SpeechStarted`メッセージ受信で`SttEvent::SpeechStarted`、`UtteranceEnd`メッセージ受信で`SttEvent::SpeechEnded`を発火する(Geminiと異なり、Deepgramアダプタでは`vad_events: true`が実際に効く)。
+* `finalize()`: `{"type": "CloseStream"}`をテキストフレームで送信し、`{"type": "Metadata", ...}`受信をもって完了とみなしてからWebSocketをcloseする。判定条件が明確なため、Geminiで必要だったタイムアウト方式のフォールバックは不要。
+* エラー: WSクローズコード / インバンドの`Error`メッセージを`SttError`へマッピング(429相当は`RateLimited`、401/403相当は`AuthenticationFailed`、それ以外の接続断は`Transport`)。
 
 ---
 
@@ -366,6 +381,6 @@ Gemini Live API(WebSocket)の実プロトコルは以下の通り(Codexが2026-0
 
 本書の§4改訂で`AudioChunk::start_sample`と`SttEvent`の`audio_start_ms`/`audio_end_ms`を追加したのは、後続で文字起こし結果を録音セグメント(`AudioSegment`の`timeline_start_ms`)や要約と対応づけるために最低限必要な情報を今のうちに用意しておくため。実際に session-store のどのテーブル/スキーマに保存するかは次フェーズで設計する。
 
-### 7.3 実装着手の条件(2回目のCodexレビューの結論)
+### 7.3 実装着手の条件(2026-07-13時点)
 
-2回目のレビュー結論は「条件付き可」。§6の**drain完了判定**(`turnComplete`が使えない前提で、`audioStreamEnd`送信後にもう`inputTranscription`が来ないとどう判断するか)がドキュメント調査だけでは確定できないため、**本実装の前に小さなスパイクでGemini Live APIの実際の挙動を観測し、この判定条件を確定する**ことを実装の最初のステップとする。それ以外の設計(トレイト形状、`extra`機構、crate分割)は実装着手可の状態。
+トレイト形状・`extra`機構・crate分割は、Gemini向けにCodexレビュー2回を経て確定済みでプロバイダ非依存のため変更不要。PoC対象をDeepgramに変更したことで、§6のGemini実装方針で残っていた懸案(interim/finalの境界判定、drain完了判定)はいずれもDeepgramのドキュメント調査だけで解決している(`is_final`/`speech_final`の独立フラグ、`CloseStream`→`Metadata`という明確な完了通知)。そのため、Geminiのときのような「実装着手前の実機スパイクが必須」という条件は外れる — ただし、ドキュメントと実際の挙動が一致するかは通常のリスクとして、実装後の早い段階で一度実際にDeepgramへ接続して疎通確認は行うこと。**実装着手可。**

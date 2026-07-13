@@ -5,11 +5,14 @@ members = [
     "crates/app-service",
     "crates/audio-timeline",
     "crates/capture-api",
+    "crates/capture-macos",
     "crates/capture-windows",
     "crates/credential-store",
     "crates/recorder-domain",
     "crates/segment-store",
     "crates/session-store",
+    "crates/stt-api",
+    "crates/stt-deepgram",
     "crates/upload-client",
 ]
 

@@ -9,10 +9,12 @@ description = "Orchestrates capture -> align -> segment -> upload for the meetin
 [dependencies]
 audio-timeline = { path = "../audio-timeline" }
 capture-api = { path = "../capture-api", optional = true }
+capture-macos = { path = "../capture-macos", optional = true }
 capture-windows = { path = "../capture-windows", optional = true }
 chrono = "0.4"
 crossbeam-channel = { version = "0.5", optional = true }
 recorder-domain = { path = "../recorder-domain" }
+screencapturekit = { version = "8", features = ["macos_15_0"], optional = true }
 segment-store = { path = "../segment-store" }
 session-store = { path = "../session-store" }
 thiserror = { workspace = true }
@@ -37,3 +39,11 @@ upload-client = { path = "../upload-client", features = ["mock-server"] }
 # build stays OS-independent for stage 1's pseudo-source pipeline and stage 3's
 # upload worker/session lifecycle.
 windows-supervisor = ["dep:capture-api", "dep:capture-windows", "dep:crossbeam-channel", "dep:tracing", "dep:windows", "tokio/rt"]
+
+# The macOS analogue of windows-supervisor: connects capture-api's FSM to real
+# capture-macos (ScreenCaptureKit) capture threads via macos_supervisor, plus the
+# conversion layer/session wiring (macos_frame_collector/macos_session) that feeds
+# its frames into stage 1's pipeline. Only meaningful on macOS (capture-macos
+# itself is macOS-only, and — unlike capture-windows — has not yet been compiled or
+# run at all; see capture-macos's crate doc comment).
+macos-supervisor = ["dep:capture-api", "dep:capture-macos", "dep:crossbeam-channel", "dep:screencapturekit", "dep:tracing", "tokio/rt"]

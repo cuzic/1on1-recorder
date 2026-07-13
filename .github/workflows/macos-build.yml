@@ -1,0 +1,113 @@
+name: macOS Build & Test
+
+# Tier 0 (`build`) is a blocking gate: compiles/lints/tests the main workspace with
+# macOS's real capture backend (capture-macos, app-service's macos-supervisor
+# feature) enabled. No TCC grant or real audio hardware is needed for this —
+# see stt-transcription-architecture.md-style caveats throughout crates/capture-macos
+# for what has and hasn't been verified.
+#
+# Tier 1 (`e2e-best-effort`) is explicitly NOT a reliable gate — see its own
+# comments below. Real ScreenCaptureKit capture + TCC automation is genuinely
+# fragile across macOS versions; even the `screencapturekit` crate's own upstream
+# CI doesn't attempt this. Confident end-to-end verification still depends on a
+# manual real-Mac pass (see the project's task list — the macOS analogue of
+# Windows's task #9).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "apps/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - ".github/workflows/macos-build.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "apps/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (capture-macos + app-service macos-supervisor feature)
+        run: |
+          cargo build -p capture-macos --target aarch64-apple-darwin
+          cargo build -p app-service --features macos-supervisor --target aarch64-apple-darwin
+          cargo build -p desktop --target aarch64-apple-darwin
+
+      - name: Clippy
+        run: |
+          cargo clippy -p capture-macos --target aarch64-apple-darwin -- -D warnings
+          cargo clippy -p app-service --features macos-supervisor --target aarch64-apple-darwin -- -D warnings
+
+      - name: Test
+        # No TCC grant or real audio hardware needed here: capture-macos's own
+        # unit tests (e.g. timestamp::cmtime_to_ns) are pure arithmetic, and
+        # app-service's macos_frame_collector tests construct fixture
+        # CapturedFrameRecords directly rather than driving real ScreenCaptureKit.
+        run: |
+          cargo test -p capture-macos --target aarch64-apple-darwin
+          cargo test -p app-service --features macos-supervisor --target aarch64-apple-darwin
+
+  e2e-best-effort:
+    runs-on: macos-latest
+    needs: build
+    # This job is allowed to fail without turning the overall check red — real
+    # ScreenCaptureKit capture requires TCC (Screen & System Audio Recording +
+    # Microphone) permissions that cannot be granted through any documented,
+    # stable API. The TCC.db sqlite3 approach below is a known community
+    # workaround (see actions/runner-images#9529 and similar issues), not an
+    # Apple-supported mechanism — its schema differs across macOS versions and it
+    # has been reported to not reliably take effect depending on which process
+    # actually invokes the capture. Treat a red/skipped result here as "unable to
+    # verify automatically today", not as a real regression signal.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install BlackHole (virtual audio loopback, no kext required)
+        run: brew install blackhole-2ch
+
+      - name: Restart coreaudiod so BlackHole is picked up
+        # BlackHole's own install docs describe a "restart when prompted" step,
+        # which doesn't translate directly to a headless CI runner. Restarting
+        # coreaudiod is the commonly-suggested non-reboot substitute — not yet
+        # confirmed to reliably work in this specific CI environment.
+        run: sudo killall coreaudiod || true
+
+      - name: Pre-seed TCC permissions (best-effort, version-fragile)
+        run: ./scripts/ci/seed-tcc-permissions.sh
+
+      - name: Build smoke-test example
+        run: cargo build -p capture-macos --example smoke_test --target aarch64-apple-darwin
+
+      - name: Run capture smoke test
+        id: smoke_test
+        run: |
+          ./target/aarch64-apple-darwin/debug/examples/smoke_test \
+            --duration-secs 10 \
+            --out /tmp/capture-macos-smoke-test.raw
+
+      - name: Assert audio data was actually captured
+        run: ./scripts/ci/assert-segment-written.sh /tmp/capture-macos-smoke-test.raw
