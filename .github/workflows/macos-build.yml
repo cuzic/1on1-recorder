@@ -51,9 +51,14 @@ jobs:
           cargo build -p desktop --target aarch64-apple-darwin
 
       - name: Clippy
+        # --no-deps scopes linting to capture-macos/app-service themselves, not
+        # every workspace-local path dependency clippy walks into while building
+        # them (e.g. audio-timeline) — this job's -D warnings gate is meant for
+        # this macOS work specifically, not as a first-ever blanket clippy pass
+        # over pre-existing, previously-unlinted code elsewhere in the workspace.
         run: |
-          cargo clippy -p capture-macos --target aarch64-apple-darwin -- -D warnings
-          cargo clippy -p app-service --features macos-supervisor --target aarch64-apple-darwin -- -D warnings
+          cargo clippy -p capture-macos --target aarch64-apple-darwin --no-deps -- -D warnings
+          cargo clippy -p app-service --features macos-supervisor --target aarch64-apple-darwin --no-deps -- -D warnings
 
       - name: Test
         # No TCC grant or real audio hardware needed here: capture-macos's own
