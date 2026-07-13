@@ -65,6 +65,17 @@ jobs:
         # unit tests (e.g. timestamp::cmtime_to_ns) are pure arithmetic, and
         # app-service's macos_frame_collector tests construct fixture
         # CapturedFrameRecords directly rather than driving real ScreenCaptureKit.
+        #
+        # DYLD_LIBRARY_PATH=/usr/lib/swift: the screencapturekit/apple-cf crates'
+        # Swift bridge links against libswift_Concurrency.dylib via an @rpath entry
+        # that doesn't resolve at test-binary run time on the CI image, even though
+        # the OS-shipped Swift runtime (present on macOS 12+) has it at this path —
+        # a known class of issue with Rust binaries linking Swift-compiled code
+        # (see e.g. https://forums.swift.org/t/42111). Pointing the dynamic linker
+        # at the system runtime directly as a fallback resolves it without needing
+        # to vendor/ship the library ourselves.
+        env:
+          DYLD_LIBRARY_PATH: /usr/lib/swift
         run: |
           cargo test -p capture-macos --target aarch64-apple-darwin
           cargo test -p app-service --features macos-supervisor --target aarch64-apple-darwin
@@ -109,6 +120,10 @@ jobs:
 
       - name: Run capture smoke test
         id: smoke_test
+        # See Tier 0's "Test" step for why DYLD_LIBRARY_PATH=/usr/lib/swift is
+        # needed (screencapturekit/apple-cf's Swift bridge).
+        env:
+          DYLD_LIBRARY_PATH: /usr/lib/swift
         run: |
           ./target/aarch64-apple-darwin/debug/examples/smoke_test \
             --duration-secs 10 \
