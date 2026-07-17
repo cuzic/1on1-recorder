@@ -1,0 +1,25 @@
+[package]
+name = "stt-assemblyai"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "stt-api adapter for AssemblyAI's Streaming v3 speech-to-text API (WebSocket)."
+readme = "README.md"
+keywords = ["speech-to-text", "stt", "assemblyai", "streaming"]
+categories = ["multimedia::audio", "asynchronous"]
+
+[dependencies]
+async-trait = "0.1"
+futures-util = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+stt-api = { path = "../stt-api" }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
