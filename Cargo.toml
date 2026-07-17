@@ -12,7 +12,10 @@ members = [
     "crates/segment-store",
     "crates/session-store",
     "crates/stt-api",
+    "crates/stt-assemblyai",
     "crates/stt-deepgram",
+    "crates/stt-google",
+    "crates/stt-openai",
     "crates/summarize",
     "crates/upload-client",
 ]
