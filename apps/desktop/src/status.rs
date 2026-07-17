@@ -20,6 +20,9 @@ pub struct Status {
     pub last_error: Option<String>,
     pub last_session_id: Option<String>,
     pub last_total_duration_ms: Option<u64>,
+    /// #52's STT connection visibility — `crate::transcription_status::describe`
+    /// turns this into the transcript panel's status line.
+    pub transcription_status: crate::transcription_status::TranscriptionStatus,
 }
 
 fn segment_progress(state: &AppState, session_id: SessionId) -> (usize, usize) {
@@ -54,6 +57,15 @@ pub fn current(state: &AppState) -> Status {
     #[cfg(not(windows))]
     let level = crate::level::dev_placeholder_level(elapsed);
 
+    // #52: only Windows wires up live transcription at all (see
+    // `app_state::ActiveRecording`'s doc comment); every other platform reports
+    // `Unavailable` for both tracks rather than the default `NotConfigured`, since
+    // there's no settings-screen fix for "unavailable".
+    #[cfg(windows)]
+    let transcription_status: crate::transcription_status::TranscriptionStatus = active.transcription_status.lock().unwrap().clone().into();
+    #[cfg(not(windows))]
+    let transcription_status = crate::transcription_status::TranscriptionStatus::unavailable();
+
     let (uploaded_segments, pending_segments) = segment_progress(state, active.session_id);
 
     Status {
@@ -69,5 +81,6 @@ pub fn current(state: &AppState) -> Status {
         last_error,
         last_session_id: Some(active.session_id.to_string()),
         last_total_duration_ms: None,
+        transcription_status,
     }
 }

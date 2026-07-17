@@ -6,6 +6,7 @@ mod recording;
 mod settings;
 mod status;
 mod transcript;
+mod transcription_status;
 mod ui;
 
 use std::sync::{Arc, Mutex};

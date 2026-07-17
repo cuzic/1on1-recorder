@@ -14,7 +14,7 @@ use session_store::SessionStore;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::error::AppServiceError;
-use crate::live_transcription::run_live_transcription;
+use crate::live_transcription::{run_live_transcription, TranscriptionStatus};
 use crate::pipeline::run_pipeline;
 use crate::windows_frame_collector::{collect_frames, CollectedFrames, LevelSnapshot};
 use crate::windows_supervisor::WindowsSupervisor;
@@ -39,7 +39,12 @@ use crate::windows_supervisor::WindowsSupervisor;
 /// itself is unaffected either way). Wired up unconditionally (not only under the
 /// `live-transcription` feature) so this function's signature doesn't need its
 /// own `#[cfg]`; without that feature, `live_transcription::run_live_transcription`
-/// is a stub that ignores it.
+/// is a stub that ignores it (and reports `Unavailable` on `transcription_status_sink`
+/// — see that module).
+///
+/// `transcription_status_sink`, if given, is `live_transcription`'s #52 side
+/// channel — kept up to date with each track's Deepgram connection state so the
+/// desktop UI can tell "STT not connected" apart from "nobody has spoken yet".
 #[allow(clippy::too_many_arguments)]
 pub async fn run_windows_capture_session(
     manifest: &SessionManifest,
@@ -51,6 +56,7 @@ pub async fn run_windows_capture_session(
     adapter: &dyn UploadAdapter,
     level_sink: Option<Arc<Mutex<LevelSnapshot>>>,
     credential_store: Option<Arc<dyn credential_store::CredentialStore + Send + Sync>>,
+    transcription_status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
 ) -> Result<SessionSummary, AppServiceError> {
     // Same shape as `level_sink`'s side channel (see `windows_frame_collector`'s doc
     // comment), but for raw PCM instead of RMS/peak. `stt_tx` is moved into
@@ -59,7 +65,7 @@ pub async fn run_windows_capture_session(
     // `audio_rx.recv()` loop end (and finalize both STT sessions) at the right time
     // without a separate shutdown signal.
     let (stt_tx, stt_rx) = tokio::sync::mpsc::unbounded_channel();
-    let live_transcription_fut = run_live_transcription(manifest.session_id, manifest.audio.sample_rate, credential_store, stt_rx, store);
+    let live_transcription_fut = run_live_transcription(manifest.session_id, manifest.audio.sample_rate, credential_store, stt_rx, store, transcription_status_sink);
 
     let capture_fut = tokio::task::spawn_blocking(move || run_capture_blocking(callback_timeout_ms, shutdown_rx, level_sink, stt_tx));
 

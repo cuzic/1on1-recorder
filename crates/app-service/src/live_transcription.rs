@@ -21,12 +21,69 @@
 //! actually compiled/run (see that crate's own doc comment) — out of scope here since
 //! macOS capture itself isn't in scope yet.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use credential_store::CredentialStore;
 use recorder_domain::{SessionId, TrackKind};
 use session_store::SessionStore;
 use tokio::sync::mpsc::UnboundedReceiver;
+
+/// Per-track Deepgram connection status (task #52): the desktop UI can't otherwise
+/// tell "nobody has spoken yet" from "STT is broken" when the transcript panel is
+/// empty. Updated by [`run_live_transcription`] as each track's session state
+/// changes, via the same `Arc<Mutex<_>>` side-channel shape as `LevelSnapshot` (see
+/// `windows_frame_collector`). Two independent fields rather than one aggregate
+/// status, since Self and Remote each open their own Deepgram session (see this
+/// module's doc comment) and can fail independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackTranscriptionStatus {
+    /// No Deepgram API key configured — a connection was never attempted.
+    NotConfigured,
+    /// `start_session` is in flight.
+    Connecting,
+    /// Session open and streaming.
+    Connected,
+    /// `start_session` failed, or the session reported an `SttEvent::Error` after
+    /// connecting. Carries `SttError::to_string()` rather than the typed error
+    /// itself, so this type — and the desktop crate's mirror of it (see
+    /// `apps/desktop/src/transcription_status.rs`) — never needs an `stt-api`
+    /// dependency.
+    Error(String),
+    /// `live-transcription` feature disabled, or the running platform has no live
+    /// transcription wiring at all (e.g. macOS/dev builds — see this module's doc
+    /// comment on scope).
+    Unavailable,
+}
+
+impl Default for TrackTranscriptionStatus {
+    /// Before the first update lands, "unknown yet" reads closer to `NotConfigured`
+    /// than to claiming a connection is already in flight.
+    fn default() -> Self {
+        Self::NotConfigured
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptionStatus {
+    pub self_status: TrackTranscriptionStatus,
+    pub remote_status: TrackTranscriptionStatus,
+}
+
+fn set_status(sink: &Option<Arc<Mutex<TranscriptionStatus>>>, track: TrackKind, status: TrackTranscriptionStatus) {
+    let Some(sink) = sink else { return };
+    let mut guard = sink.lock().unwrap();
+    match track {
+        TrackKind::SelfMic => guard.self_status = status,
+        TrackKind::RemoteAudio => guard.remote_status = status,
+    }
+}
+
+fn set_both_status(sink: &Option<Arc<Mutex<TranscriptionStatus>>>, status: TrackTranscriptionStatus) {
+    let Some(sink) = sink else { return };
+    let mut guard = sink.lock().unwrap();
+    guard.self_status = status.clone();
+    guard.remote_status = status;
+}
 
 #[cfg(feature = "live-transcription")]
 mod deepgram_wiring {
@@ -42,16 +99,20 @@ mod deepgram_wiring {
     /// connect failure) is logged and simply means no live transcription for that
     /// track — same "failure doesn't take down the whole pipeline" spirit as
     /// `upload_worker`'s retry handling; the batch `run_pipeline` recording itself is
-    /// unaffected either way.
+    /// unaffected either way. `status_sink`, if given, is kept up to date with each
+    /// track's connection state for #52's UI visibility — `None` is fine, it's just
+    /// a side channel, mirroring `level_sink`/`stt_sink` elsewhere in this crate.
     pub async fn run_live_transcription(
         session_id: SessionId,
         sample_rate_hz: u32,
         credential_store: Option<Arc<dyn CredentialStore + Send + Sync>>,
         mut audio_rx: UnboundedReceiver<(TrackKind, Vec<f32>, u32)>,
         store: &SessionStore,
+        status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
     ) {
         let Some(credential_store) = credential_store else {
             tracing::debug!("live transcription: no credential store configured, skipping");
+            set_both_status(&status_sink, TrackTranscriptionStatus::NotConfigured);
             drain(&mut audio_rx).await;
             return;
         };
@@ -60,6 +121,7 @@ mod deepgram_wiring {
             Ok(key) => key,
             Err(err) => {
                 tracing::info!(%err, "live transcription: no Deepgram API key configured, skipping");
+                set_both_status(&status_sink, TrackTranscriptionStatus::NotConfigured);
                 drain(&mut audio_rx).await;
                 return;
             }
@@ -77,17 +139,27 @@ mod deepgram_wiring {
         // index alone.
         let config = SttSessionConfig::new(sample_rate_hz).with_interim_results(true).with_vad_events(true).with_diarization(true);
 
+        set_both_status(&status_sink, TrackTranscriptionStatus::Connecting);
+
         let self_sess = match provider.start_session(config.clone()).await {
-            Ok((session, events)) => Some((session, events)),
+            Ok((session, events)) => {
+                set_status(&status_sink, TrackKind::SelfMic, TrackTranscriptionStatus::Connected);
+                Some((session, events))
+            }
             Err(err) => {
                 tracing::warn!(%err, track = "self", "live transcription: failed to start STT session");
+                set_status(&status_sink, TrackKind::SelfMic, TrackTranscriptionStatus::Error(err.to_string()));
                 None
             }
         };
         let remote_sess = match provider.start_session(config).await {
-            Ok((session, events)) => Some((session, events)),
+            Ok((session, events)) => {
+                set_status(&status_sink, TrackKind::RemoteAudio, TrackTranscriptionStatus::Connected);
+                Some((session, events))
+            }
             Err(err) => {
                 tracing::warn!(%err, track = "remote", "live transcription: failed to start STT session");
+                set_status(&status_sink, TrackKind::RemoteAudio, TrackTranscriptionStatus::Error(err.to_string()));
                 None
             }
         };
@@ -103,6 +175,15 @@ mod deepgram_wiring {
         let mut self_samples_sent: u64 = 0;
         let mut remote_samples_sent: u64 = 0;
         let mut audio_open = true;
+
+        // #56: the last still-unconfirmed `PartialTranscript` seen per track, cleared
+        // every time a `FinalTranscript` supersedes it. If a track's event channel
+        // closes (Deepgram disconnected) while one of these is still set, no final
+        // ever arrived for that stretch of speech and it would otherwise vanish
+        // entirely from `transcript::to_turns`' summary input (which only reads
+        // `is_final` rows) — see this function's tail below.
+        let mut self_last_interim: Option<PendingInterim> = None;
+        let mut remote_last_interim: Option<PendingInterim> = None;
 
         while audio_open || self_events.is_some() || remote_events.is_some() {
             tokio::select! {
@@ -138,14 +219,32 @@ mod deepgram_wiring {
                 }
                 maybe = self_events.as_mut().unwrap().recv(), if self_events.is_some() => {
                     match maybe {
-                        Some(event) => persist_event(store, session_id, Some(TrackKind::SelfMic), event),
-                        None => self_events = None,
+                        Some(event) => {
+                            note_event(&mut self_last_interim, &event);
+                            if let SttEvent::Error(err) = &event {
+                                set_status(&status_sink, TrackKind::SelfMic, TrackTranscriptionStatus::Error(err.to_string()));
+                            }
+                            persist_event(store, session_id, Some(TrackKind::SelfMic), event);
+                        }
+                        None => {
+                            self_events = None;
+                            persist_pending_interim(store, session_id, TrackKind::SelfMic, self_last_interim.take());
+                        }
                     }
                 }
                 maybe = remote_events.as_mut().unwrap().recv(), if remote_events.is_some() => {
                     match maybe {
-                        Some(event) => persist_event(store, session_id, Some(TrackKind::RemoteAudio), event),
-                        None => remote_events = None,
+                        Some(event) => {
+                            note_event(&mut remote_last_interim, &event);
+                            if let SttEvent::Error(err) = &event {
+                                set_status(&status_sink, TrackKind::RemoteAudio, TrackTranscriptionStatus::Error(err.to_string()));
+                            }
+                            persist_event(store, session_id, Some(TrackKind::RemoteAudio), event);
+                        }
+                        None => {
+                            remote_events = None;
+                            persist_pending_interim(store, session_id, TrackKind::RemoteAudio, remote_last_interim.take());
+                        }
                     }
                 }
             }
@@ -163,6 +262,54 @@ mod deepgram_wiring {
         match session {
             Some((session, events)) => (Some(session), Some(events)),
             None => (None, None),
+        }
+    }
+
+    /// The bits of a `PartialTranscript` needed to persist it as a fallback final
+    /// (#56) — just what `TranscriptSegment` needs, not the full `SttEvent`.
+    struct PendingInterim {
+        text: String,
+        audio_start_ms: Option<u64>,
+        audio_end_ms: Option<u64>,
+    }
+
+    /// Tracks the most recent not-yet-finalized `PartialTranscript` per track:
+    /// records it on every partial, clears it on every final (a final always
+    /// supersedes the partials leading up to it).
+    fn note_event(last_interim: &mut Option<PendingInterim>, event: &SttEvent) {
+        match event {
+            SttEvent::PartialTranscript { text, audio_start_ms, audio_end_ms, .. } => {
+                *last_interim = Some(PendingInterim { text: text.clone(), audio_start_ms: *audio_start_ms, audio_end_ms: *audio_end_ms });
+            }
+            SttEvent::FinalTranscript { .. } => *last_interim = None,
+            _ => {}
+        }
+    }
+
+    /// #56's fallback: called once a track's event channel has closed, with
+    /// whatever `PendingInterim` was still outstanding (`None` if the last partial
+    /// was already superseded by a final, or there was none). Persists it as
+    /// `is_final: true` so it isn't silently dropped by `transcript::to_turns`.
+    /// Loses word-level diarization (`speaker` stays `None`) since
+    /// `PartialTranscript` never carries `words` — better than losing the
+    /// utterance outright.
+    fn persist_pending_interim(store: &SessionStore, session_id: SessionId, track: TrackKind, pending: Option<PendingInterim>) {
+        let Some(pending) = pending else { return };
+        if pending.text.trim().is_empty() {
+            return;
+        }
+        tracing::info!(?track, "live transcription: finalizing last interim transcript after channel close");
+        let segment = TranscriptSegment {
+            session_id,
+            track: Some(track),
+            speaker: None,
+            text: pending.text,
+            start_ms: pending.audio_start_ms,
+            end_ms: pending.audio_end_ms,
+            is_final: true,
+        };
+        if let Err(err) = store.insert_transcript_segment(&segment) {
+            tracing::warn!(%err, ?track, "live transcription: failed to persist fallback-final transcript");
         }
     }
 
@@ -194,6 +341,84 @@ mod deepgram_wiring {
     async fn drain(audio_rx: &mut UnboundedReceiver<(TrackKind, Vec<f32>, u32)>) {
         while audio_rx.recv().await.is_some() {}
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn set_status_updates_only_the_named_track() {
+            let sink = Arc::new(Mutex::new(TranscriptionStatus::default()));
+            set_status(&Some(sink.clone()), TrackKind::SelfMic, TrackTranscriptionStatus::Connected);
+            let status = sink.lock().unwrap().clone();
+            assert_eq!(status.self_status, TrackTranscriptionStatus::Connected);
+            assert_eq!(status.remote_status, TrackTranscriptionStatus::NotConfigured);
+        }
+
+        #[test]
+        fn set_both_status_updates_both_tracks() {
+            let sink = Arc::new(Mutex::new(TranscriptionStatus::default()));
+            set_both_status(&Some(sink.clone()), TrackTranscriptionStatus::Connecting);
+            let status = sink.lock().unwrap().clone();
+            assert_eq!(status.self_status, TrackTranscriptionStatus::Connecting);
+            assert_eq!(status.remote_status, TrackTranscriptionStatus::Connecting);
+        }
+
+        #[test]
+        fn note_event_tracks_the_latest_partial_and_clears_on_final() {
+            let mut last_interim = None;
+            note_event(&mut last_interim, &SttEvent::PartialTranscript { text: "hel".to_string(), audio_start_ms: Some(0), audio_end_ms: Some(100), extra: Default::default() });
+            assert!(last_interim.is_some());
+            note_event(&mut last_interim, &SttEvent::FinalTranscript { text: "hello".to_string(), words: None, audio_start_ms: Some(0), audio_end_ms: Some(200), extra: Default::default() });
+            assert!(last_interim.is_none());
+        }
+
+        #[test]
+        fn persist_pending_interim_inserts_a_final_segment() {
+            let store = SessionStore::open_in_memory().unwrap();
+            let manifest = test_manifest();
+            store.create_session(&manifest).unwrap();
+
+            let pending = PendingInterim { text: "こんにち".to_string(), audio_start_ms: Some(10), audio_end_ms: Some(500) };
+            persist_pending_interim(&store, manifest.session_id, TrackKind::SelfMic, Some(pending));
+
+            let segments = store.list_transcript_segments(manifest.session_id).unwrap();
+            assert_eq!(segments.len(), 1);
+            assert!(segments[0].is_final);
+            assert_eq!(segments[0].text, "こんにち");
+            assert_eq!(segments[0].track, Some(TrackKind::SelfMic));
+        }
+
+        #[test]
+        fn persist_pending_interim_skips_when_none_or_blank() {
+            let store = SessionStore::open_in_memory().unwrap();
+            let manifest = test_manifest();
+            store.create_session(&manifest).unwrap();
+
+            persist_pending_interim(&store, manifest.session_id, TrackKind::SelfMic, None);
+            persist_pending_interim(&store, manifest.session_id, TrackKind::SelfMic, Some(PendingInterim { text: "   ".to_string(), audio_start_ms: None, audio_end_ms: None }));
+
+            assert!(store.list_transcript_segments(manifest.session_id).unwrap().is_empty());
+        }
+
+        fn test_manifest() -> recorder_domain::SessionManifest {
+            recorder_domain::SessionManifest {
+                schema_version: 1,
+                session_id: SessionId::new(),
+                started_at: chrono::Utc::now(),
+                ended_at: None,
+                platform: "test".to_string(),
+                app_version: "0.0.0".to_string(),
+                capture: recorder_domain::CaptureManifest {
+                    microphone_device_id: "default".to_string(),
+                    remote_source_id: "default".to_string(),
+                    remote_source_kind: recorder_domain::RemoteSourceKind::EndpointLoopback,
+                },
+                audio: recorder_domain::AudioManifest { sample_rate: 48_000, segment_duration_ms: 30_000, tracks: vec![TrackKind::SelfMic, TrackKind::RemoteAudio] },
+                consent: recorder_domain::ConsentManifest { confirmed_by_user: true, confirmed_at: chrono::Utc::now() },
+            }
+        }
+    }
 }
 
 #[cfg(feature = "live-transcription")]
@@ -202,7 +427,9 @@ pub use deepgram_wiring::run_live_transcription;
 /// `live-transcription` feature disabled: no STT provider types are even compiled in,
 /// so this just drains and discards `audio_rx` — keeping
 /// `windows_session::run_windows_capture_session`'s call site identical regardless of
-/// the feature (see this module's doc comment).
+/// the feature (see this module's doc comment). Reports `Unavailable` on
+/// `status_sink` for both tracks immediately, same as the non-Windows desktop path
+/// (see `apps/desktop/src/transcription_status.rs`).
 #[cfg(not(feature = "live-transcription"))]
 pub async fn run_live_transcription(
     _session_id: SessionId,
@@ -210,6 +437,8 @@ pub async fn run_live_transcription(
     _credential_store: Option<Arc<dyn CredentialStore + Send + Sync>>,
     mut audio_rx: UnboundedReceiver<(TrackKind, Vec<f32>, u32)>,
     _store: &SessionStore,
+    status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
 ) {
+    set_both_status(&status_sink, TrackTranscriptionStatus::Unavailable);
     while audio_rx.recv().await.is_some() {}
 }

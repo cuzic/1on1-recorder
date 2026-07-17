@@ -38,6 +38,9 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
     let session_id = manifest.session_id;
 
     let level = std::sync::Arc::new(std::sync::Mutex::new(app_service::LevelSnapshot::default()));
+    // Task #52: same side-channel shape as `level`, for the Deepgram connection
+    // status `run_windows_capture_session` -> `live_transcription` maintains.
+    let transcription_status = std::sync::Arc::new(std::sync::Mutex::new(app_service::TranscriptionStatus::default()));
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::unbounded();
 
     let store = state.store.clone();
@@ -46,6 +49,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
     let bitrate_bps = state.config.bitrate_bps;
     let manifest_for_task = manifest.clone();
     let level_for_task = level.clone();
+    let transcription_status_for_task = transcription_status.clone();
     // `state.credential_store` also backs the settings screen (`settings.rs`) —
     // `run_windows_capture_session`'s `live_transcription` wiring reads the
     // Deepgram key from it, if any was ever saved there. No key configured just
@@ -68,11 +72,12 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
             adapter.as_ref(),
             Some(level_for_task),
             Some(credential_store_for_task),
+            Some(transcription_status_for_task),
         )
         .await
     });
 
-    *state.current.lock().unwrap() = Some(ActiveRecording { session_id, manifest, started_at: Instant::now(), level, shutdown_tx, join_handle });
+    *state.current.lock().unwrap() = Some(ActiveRecording { session_id, manifest, started_at: Instant::now(), level, transcription_status, shutdown_tx, join_handle });
     Ok(session_id)
 }
 

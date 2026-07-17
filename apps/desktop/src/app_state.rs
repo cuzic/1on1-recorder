@@ -42,6 +42,14 @@ pub struct ActiveRecording {
     pub level: Arc<Mutex<app_service::LevelSnapshot>>,
     #[cfg(target_os = "macos")]
     pub level: Arc<Mutex<app_service::macos_frame_collector::LevelSnapshot>>,
+    /// Task #52: `app_service::live_transcription`'s per-track Deepgram connection
+    /// status side channel — only exists on Windows, the only platform that wires
+    /// up live transcription at all (see `app_service::live_transcription`'s doc
+    /// comment on macOS scope). `status::current` reports
+    /// `transcription_status::TranscriptionStatus::unavailable()` on every other
+    /// platform instead.
+    #[cfg(windows)]
+    pub transcription_status: Arc<Mutex<app_service::TranscriptionStatus>>,
     #[cfg(any(windows, target_os = "macos"))]
     pub shutdown_tx: crossbeam_channel::Sender<()>,
     #[cfg(any(windows, target_os = "macos"))]

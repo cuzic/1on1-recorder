@@ -37,6 +37,11 @@ pub mod windows_supervisor;
 pub use windows_frame_collector::LevelSnapshot;
 #[cfg(feature = "windows-supervisor")]
 pub use windows_session::run_windows_capture_session;
+// `live_transcription` (unlike `LevelSnapshot`) has no macOS-side equivalent type
+// to collide with (see that module's doc comment), so this re-export doesn't need
+// the same `not(feature = "macos-supervisor")` guard.
+#[cfg(feature = "windows-supervisor")]
+pub use live_transcription::{TrackTranscriptionStatus, TranscriptionStatus};
 
 #[cfg(feature = "macos-supervisor")]
 pub mod macos_frame_collector;
