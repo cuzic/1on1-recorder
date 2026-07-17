@@ -1,9 +1,11 @@
+#[cfg(windows)]
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
 use recorder_domain::{AudioManifest, CaptureManifest, ConsentManifest, RemoteSourceKind, SessionId, SessionManifest, SessionSummary, TrackKind};
 
-use crate::state::{ActiveRecording, AppState};
+use crate::app_state::{ActiveRecording, AppState};
 
 /// Placeholder until Phase 1A gets real device-selection UI (design.md §14.1's
 /// "マイク選択"/"会議音声ソース選択" — not in task #8's stated scope list for this
@@ -44,14 +46,30 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
     let bitrate_bps = state.config.bitrate_bps;
     let manifest_for_task = manifest.clone();
     let level_for_task = level.clone();
+    // `state.credential_store` also backs the settings screen (`settings.rs`) —
+    // `run_windows_capture_session`'s `live_transcription` wiring reads the
+    // Deepgram key from it, if any was ever saved there. No key configured just
+    // means no live transcription (see that module's doc comment), not a failure.
+    let credential_store_for_task: Arc<dyn credential_store::CredentialStore + Send + Sync> = state.credential_store.clone();
 
     // WASAPI's callback timeout — how long the capture loop waits for a device
     // callback before treating it as a stall (`capture_windows::capture_loop`).
     // Not yet tuned against real hardware; see this crate's README.
     const CALLBACK_TIMEOUT_MS: u32 = 500;
 
-    let join_handle = tauri::async_runtime::spawn(async move {
-        app_service::run_windows_capture_session(&manifest_for_task, shutdown_rx, CALLBACK_TIMEOUT_MS, &session_dir, bitrate_bps, &store, adapter.as_ref(), Some(level_for_task)).await
+    let join_handle = tokio::spawn(async move {
+        app_service::run_windows_capture_session(
+            &manifest_for_task,
+            shutdown_rx,
+            CALLBACK_TIMEOUT_MS,
+            &session_dir,
+            bitrate_bps,
+            &store,
+            adapter.as_ref(),
+            Some(level_for_task),
+            Some(credential_store_for_task),
+        )
+        .await
     });
 
     *state.current.lock().unwrap() = Some(ActiveRecording { session_id, manifest, started_at: Instant::now(), level, shutdown_tx, join_handle });
@@ -92,7 +110,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
     // Windows Phase 1A's own capture format.
     const CHANNELS: u16 = 1;
 
-    let join_handle = tauri::async_runtime::spawn(async move {
+    let join_handle = tokio::spawn(async move {
         app_service::run_macos_capture_session(
             &manifest_for_task,
             shutdown_rx,

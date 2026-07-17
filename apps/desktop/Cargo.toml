@@ -1,0 +1,52 @@
+[package]
+name = "desktop"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "1on1 Recorder desktop app (dioxus-desktop shell)"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dioxus = { version = "0.7", features = ["desktop"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
+dirs = "6"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+recorder-domain = { path = "../../crates/recorder-domain" }
+session-store = { path = "../../crates/session-store" }
+credential-store = { path = "../../crates/credential-store" }
+upload-client = { path = "../../crates/upload-client" }
+stt-deepgram = { path = "../../crates/stt-deepgram" }
+summarize = { path = "../../crates/summarize" }
+# For building the `genai::Client` that `summarize::summarize` (#38) takes — the
+# app owns client construction (model string picked in settings + auth resolver
+# wiring) since `summarize` itself stays provider-agnostic.
+genai = "0.7.0-beta.13"
+
+# On Windows, app-service's windows-supervisor feature (real WASAPI capture via
+# capture-windows) actually builds — see crates/app-service/README.md. On macOS,
+# its macos-supervisor feature (real ScreenCaptureKit capture via capture-macos)
+# does — see crates/capture-macos/README.md; unlike windows-supervisor, this has
+# never been compiled at all (no macOS host in this dev environment). On every
+# other OS (this is where most local desktop-shell development/testing happens)
+# recording falls back to app-service::pseudo_source, per this crate's own README.
+# Declared once per branch (not once unconditionally plus extra feature-only
+# entries) so there's exactly one `app-service` dependency edge per platform, with
+# no ambiguity about how Cargo merges them.
+[target.'cfg(windows)'.dependencies]
+# "live-transcription" wires real-time Deepgram transcription into the Windows
+# capture session (see crates/app-service/src/live_transcription.rs) — real
+# capture only exists on Windows today, so this is only added on this branch.
+app-service = { path = "../../crates/app-service", features = ["windows-supervisor", "live-transcription"] }
+crossbeam-channel = "0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+app-service = { path = "../../crates/app-service", features = ["macos-supervisor"] }
+crossbeam-channel = "0.5"
+
+[target.'cfg(all(not(windows), not(target_os = "macos")))'.dependencies]
+app-service = { path = "../../crates/app-service" }

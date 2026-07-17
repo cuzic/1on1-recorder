@@ -1,13 +1,12 @@
 use recorder_domain::{SessionId, TrackKind};
-use serde::Serialize;
 
-use crate::state::AppState;
+use crate::app_state::AppState;
 
 /// design.md §14.1/§14.2's initial + recording screens, combined into one DTO the
-/// frontend polls (`get_status`) and switches its view on — Rust stays the single
-/// source of truth for capture/upload state (design.md §6.1), the frontend never
-/// tracks its own copy.
-#[derive(Debug, Clone, Default, Serialize)]
+/// UI polls (`status::current`) and switches its view on — Rust stays the single
+/// source of truth for capture/upload state (design.md §6.1); the UI never tracks
+/// its own copy.
+#[derive(Debug, Clone, Default)]
 pub struct Status {
     pub recording: bool,
     pub elapsed_ms: u64,

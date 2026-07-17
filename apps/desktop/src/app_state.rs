@@ -12,6 +12,11 @@ pub struct AppState {
     pub store: Arc<SessionStore>,
     pub adapter: Arc<HttpUploadClient>,
     pub config: Config,
+    /// Backs the settings screen (Deepgram / summary provider API keys and the
+    /// selected-provider/model strings) — same instance `main.rs` already builds
+    /// for the upload bearer token, so there's one credential-store handle per app
+    /// run rather than one per consumer.
+    pub credential_store: Arc<credential_store::FallbackCredentialStore>,
     pub consent_confirmed: Mutex<bool>,
     pub current: Mutex<Option<ActiveRecording>>,
     pub last_error: Mutex<Option<String>>,
@@ -40,5 +45,5 @@ pub struct ActiveRecording {
     #[cfg(any(windows, target_os = "macos"))]
     pub shutdown_tx: crossbeam_channel::Sender<()>,
     #[cfg(any(windows, target_os = "macos"))]
-    pub join_handle: tauri::async_runtime::JoinHandle<Result<SessionSummary, app_service::AppServiceError>>,
+    pub join_handle: tokio::task::JoinHandle<Result<SessionSummary, app_service::AppServiceError>>,
 }

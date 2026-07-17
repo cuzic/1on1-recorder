@@ -3,7 +3,7 @@
 /// tracking), duplicated here as a plain, always-available type so this crate's
 /// status DTO doesn't need to depend on the `windows-supervisor`-gated
 /// `app_service::LevelSnapshot` on non-Windows builds.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct LevelSnapshot {
     pub self_rms: f32,
     pub self_peak: f32,
