@@ -47,13 +47,26 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep dependency artifacts even if a later step (clippy/test) fails, so
+          # the next run isn't back to a fully cold cache over one red run.
+          cache-on-failure: true
 
-      - name: Build (capture-windows + app-service windows-supervisor/live-transcription features)
+      - name: Check (capture-windows + app-service windows-supervisor/live-transcription features + desktop)
+        # `cargo check` (not `build`): this step exists to fail fast on plain
+        # compile errors before the slower clippy/test steps, and skipping
+        # codegen/linking matters most for `desktop` — dioxus-desktop's
+        # wry/tao/WebView2 link step is the single most expensive part of this
+        # job. The two separate app-service invocations are still both worth
+        # keeping despite live-transcription being a superset: they confirm a
+        # plain `windows-supervisor` build stays isolated from stt-deepgram's
+        # websocket/TLS stack (see that feature's own Cargo.toml doc comment),
+        # which a live-transcription-only check wouldn't catch on its own.
         run: |
-          cargo build -p capture-windows --target x86_64-pc-windows-msvc
-          cargo build -p app-service --features windows-supervisor --target x86_64-pc-windows-msvc
-          cargo build -p app-service --features live-transcription --target x86_64-pc-windows-msvc
-          cargo build -p desktop --target x86_64-pc-windows-msvc
+          cargo check -p capture-windows --target x86_64-pc-windows-msvc
+          cargo check -p app-service --features windows-supervisor --target x86_64-pc-windows-msvc
+          cargo check -p app-service --features live-transcription --target x86_64-pc-windows-msvc
+          cargo check -p desktop --target x86_64-pc-windows-msvc
 
       - name: Clippy
         # --no-deps scopes linting to capture-windows/app-service/desktop themselves,
