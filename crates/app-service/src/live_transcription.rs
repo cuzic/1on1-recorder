@@ -2,7 +2,10 @@
 //! 表示したい"): consumes the raw-PCM side channel `windows_frame_collector::collect_frames`
 //! feeds (mirroring how `level_sink` is fed, for the same "cheap side channel, batch
 //! `run_pipeline` stays untouched" reason — see that module's doc comment), streams it
-//! into per-track Deepgram (`stt-deepgram`) sessions, and persists every
+//! into per-track sessions of whichever `stt-*` adapter the user selected (Deepgram,
+//! OpenAI, Google, or AssemblyAI — see [`SttProviderKind`]/`stt_wiring::build_stt_provider`,
+//! task #47/#48), resampling to that provider's required rate first (see
+//! `crate::resample` and `stt_wiring::target_sample_rate_hz`), and persists every
 //! `SttEvent::PartialTranscript`/`FinalTranscript` via
 //! `SessionStore::insert_transcript_segment`.
 //!
@@ -10,10 +13,11 @@
 //! without it, [`run_live_transcription`] below compiles to a stub that just drains
 //! and discards `audio_rx`, so `windows_session::run_windows_capture_session` doesn't
 //! need any `#[cfg]` of its own at the call site, and a plain `--features
-//! windows-supervisor` build never pulls in stt-deepgram's websocket/TLS stack.
+//! windows-supervisor` build never pulls in any `stt-*` adapter's websocket/TLS/gRPC
+//! stack.
 //!
 //! Like the rest of `windows_supervisor`/`windows_session`, never run against a real
-//! Deepgram connection or real Windows hardware in this environment —
+//! STT provider connection or real Windows hardware in this environment —
 //! cross-compile-checked only (see this crate's README).
 //!
 //! No macOS equivalent yet: `macos_frame_collector`/`macos_session` would need the
@@ -98,11 +102,10 @@ pub const CREDENTIAL_SERVICE: &str = "1on1-recorder";
 pub const SELECTED_STT_PROVIDER_ACCOUNT: &str = "stt-selected-provider";
 
 /// Which `stt-api::SttProvider` adapter a live transcription session should use. One
-/// variant per adapter crate under `crates/stt-*`, added here regardless of whether
-/// [`stt_wiring::build_stt_provider`] has been wired up to construct it yet
-/// (task #48 does the rest for OpenAI/Google/AssemblyAI) — so every `match` over this
-/// enum stays exhaustiveness-checked as adapters are added, instead of an
-/// unimplemented one silently doing nothing.
+/// variant per adapter crate under `crates/stt-*`; [`stt_wiring::build_stt_provider`]
+/// (task #47/#48) constructs all four — every `match` over this enum stays
+/// exhaustiveness-checked as adapters are added, instead of an unimplemented one
+/// silently doing nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SttProviderKind {
     Deepgram,
@@ -147,9 +150,13 @@ impl Default for SttProviderKind {
 #[cfg(feature = "live-transcription")]
 mod stt_wiring {
     use super::*;
+    use crate::resample::resample;
     use session_store::TranscriptSegment;
     use stt_api::{AudioChunk, SttEvent, SttProvider, SttSession, SttSessionConfig};
+    use stt_assemblyai::AssemblyAIProvider;
     use stt_deepgram::DeepgramProvider;
+    use stt_google::{GoogleProvider, GoogleSttCredentials};
+    use stt_openai::OpenAiProvider;
 
     /// Errors from [`build_stt_provider`] — distinct from `stt_api::SttError`, which
     /// covers failures *within* an already-constructed provider's session, not
@@ -162,19 +169,24 @@ mod stt_wiring {
             #[source]
             source: credential_store::StoreError,
         },
-        /// Deliberately not folded into `CredentialMissing` or hidden behind a
-        /// catch-all match arm: task #48 wires up the remaining adapters one at a
-        /// time, and each one it adds removes an arm from this factory's `match`
-        /// rather than leaving a `_ => ...` that would keep compiling silently.
-        #[error("STT provider {0:?} is not yet wired into the factory (see task #48)")]
-        NotImplemented(SttProviderKind),
+        /// Google's stored credential is a JSON blob (see [`GoogleSttCredentials`]
+        /// and this module's `build_stt_provider` arm for `SttProviderKind::Google`),
+        /// not a bare string like the other three providers' — so unlike
+        /// `CredentialMissing`, this is reachable even once *something* is stored
+        /// under the account, if that something isn't valid JSON for the shape.
+        #[error("stored credential for STT provider {kind:?} is not valid: {source}")]
+        InvalidCredential {
+            kind: SttProviderKind,
+            #[source]
+            source: serde_json::Error,
+        },
     }
 
     /// Constructs the `Box<dyn SttProvider>` for `kind`, loading whatever credential
-    /// that provider needs from `credential_store`. Only [`SttProviderKind::Deepgram`]
-    /// is implemented today (task #47's scope); the other variants are listed
-    /// explicitly so adding a fifth adapter's enum variant without a matching arm
-    /// here fails to compile instead of silently falling through.
+    /// that provider needs from `credential_store`. Every [`SttProviderKind`] variant
+    /// is listed explicitly (no `_ => ...` catch-all) so adding a fifth adapter's enum
+    /// variant without a matching arm here fails to compile instead of silently
+    /// falling through.
     pub fn build_stt_provider(kind: SttProviderKind, credential_store: &dyn CredentialStore) -> Result<Box<dyn SttProvider>, SttProviderFactoryError> {
         match kind {
             SttProviderKind::Deepgram => {
@@ -183,9 +195,44 @@ mod stt_wiring {
                     .map_err(|source| SttProviderFactoryError::CredentialMissing { kind, source })?;
                 Ok(Box::new(DeepgramProvider::new(api_key)))
             }
-            SttProviderKind::OpenAi => Err(SttProviderFactoryError::NotImplemented(kind)),
-            SttProviderKind::Google => Err(SttProviderFactoryError::NotImplemented(kind)),
-            SttProviderKind::AssemblyAi => Err(SttProviderFactoryError::NotImplemented(kind)),
+            SttProviderKind::OpenAi => {
+                let api_key = credential_store
+                    .load(stt_openai::CREDENTIAL_SERVICE, stt_openai::OPENAI_STT_API_KEY_ACCOUNT)
+                    .map_err(|source| SttProviderFactoryError::CredentialMissing { kind, source })?;
+                Ok(Box::new(OpenAiProvider::new(api_key)))
+            }
+            SttProviderKind::Google => {
+                let raw = credential_store
+                    .load(stt_google::CREDENTIAL_SERVICE, stt_google::GOOGLE_STT_CREDENTIALS_ACCOUNT)
+                    .map_err(|source| SttProviderFactoryError::CredentialMissing { kind, source })?;
+                let credentials: GoogleSttCredentials =
+                    serde_json::from_str(&raw).map_err(|source| SttProviderFactoryError::InvalidCredential { kind, source })?;
+                Ok(Box::new(GoogleProvider::new(credentials)))
+            }
+            SttProviderKind::AssemblyAi => {
+                let api_key = credential_store
+                    .load(stt_assemblyai::CREDENTIAL_SERVICE, stt_assemblyai::ASSEMBLYAI_API_KEY_ACCOUNT)
+                    .map_err(|source| SttProviderFactoryError::CredentialMissing { kind, source })?;
+                Ok(Box::new(AssemblyAIProvider::new(api_key)))
+            }
+        }
+    }
+
+    /// Sample rate each provider's session must be opened at (task #48):
+    /// `stt-openai` requires exactly 24kHz and `stt-assemblyai` requires exactly
+    /// 16kHz mono PCM16, both hard-rejecting any other rate at `start_session` (see
+    /// each crate's module doc comment) — `capture_rate_hz` audio is resampled down
+    /// to these before `send_audio` (see `run_live_transcription` below).
+    /// `stt-deepgram` accepts whatever rate it's given and `stt-google` only requires
+    /// a nonzero one, so for those the capture pipeline's own nominal rate is used
+    /// unchanged, avoiding a needless resample. Centralized here — one place to
+    /// update if a provider's required rate ever changes — rather than duplicated at
+    /// each call site.
+    fn target_sample_rate_hz(kind: SttProviderKind, capture_rate_hz: u32) -> u32 {
+        match kind {
+            SttProviderKind::OpenAi => 24_000,
+            SttProviderKind::AssemblyAi => 16_000,
+            SttProviderKind::Deepgram | SttProviderKind::Google => capture_rate_hz,
         }
     }
 
@@ -231,14 +278,18 @@ mod stt_wiring {
         };
         // Phase 1A capture is a fixed format (design.md; see
         // `windows_frame_collector`'s "falls back to 48kHz mono" comment) — the
-        // session is opened once, up front, at the manifest's nominal rate rather
-        // than per-chunk, since Deepgram's session config (like every other
-        // provider's) is fixed for the connection's lifetime.
+        // session is opened once, up front, at the target rate rather than
+        // per-chunk, since a provider's session config (like every provider's) is
+        // fixed for the connection's lifetime. `target_rate_hz` may differ from
+        // `sample_rate_hz` (the capture pipeline's own rate) for providers that
+        // require a fixed rate (see `target_sample_rate_hz`); each incoming chunk is
+        // resampled to it below, right before `send_audio`.
         // Diarization is additional info within a single track (e.g. multiple people
         // on the Remote track in a group call) — the app's primary speaker split is
-        // still Self/Remote (see this module's doc comment), not Deepgram's `speaker`
-        // index alone.
-        let config = SttSessionConfig::new(sample_rate_hz).with_interim_results(true).with_vad_events(true).with_diarization(true);
+        // still Self/Remote (see this module's doc comment), not a provider's own
+        // `speaker` index alone.
+        let target_rate_hz = target_sample_rate_hz(selected_kind, sample_rate_hz);
+        let config = SttSessionConfig::new(target_rate_hz).with_interim_results(true).with_vad_events(true).with_diarization(true);
 
         set_both_status(&status_sink, TrackTranscriptionStatus::Connecting);
 
@@ -290,14 +341,19 @@ mod stt_wiring {
             tokio::select! {
                 maybe = audio_rx.recv(), if audio_open => {
                     match maybe {
-                        Some((track, samples, _sample_rate)) => {
+                        Some((track, samples, chunk_rate_hz)) => {
                             let (session, samples_sent) = match track {
                                 TrackKind::SelfMic => (self_session.as_mut(), &mut self_samples_sent),
                                 TrackKind::RemoteAudio => (remote_session.as_mut(), &mut remote_samples_sent),
                             };
                             if let Some(session) = session {
-                                let chunk = AudioChunk { pcm: &samples, start_sample: *samples_sent };
-                                *samples_sent += samples.len() as u64;
+                                // `AudioChunk::start_sample` is documented as "at
+                                // `SttSessionConfig::sample_rate_hz`" — i.e. the
+                                // *target* rate's sample count, so resample happens
+                                // before the counter advances, not after.
+                                let resampled = resample(&samples, chunk_rate_hz, target_rate_hz);
+                                let chunk = AudioChunk { pcm: &resampled, start_sample: *samples_sent };
+                                *samples_sent += resampled.len() as u64;
                                 if let Err(err) = session.send_audio(chunk).await {
                                     tracing::warn!(%err, ?track, "live transcription: send_audio failed");
                                 }
@@ -518,6 +574,76 @@ mod stt_wiring {
                 audio: recorder_domain::AudioManifest { sample_rate: 48_000, segment_duration_ms: 30_000, tracks: vec![TrackKind::SelfMic, TrackKind::RemoteAudio] },
                 consent: recorder_domain::ConsentManifest { confirmed_by_user: true, confirmed_at: chrono::Utc::now() },
             }
+        }
+
+        #[test]
+        fn target_sample_rate_hz_pins_openai_and_assemblyai_leaves_others_at_capture_rate() {
+            assert_eq!(target_sample_rate_hz(SttProviderKind::OpenAi, 48_000), 24_000);
+            assert_eq!(target_sample_rate_hz(SttProviderKind::AssemblyAi, 48_000), 16_000);
+            assert_eq!(target_sample_rate_hz(SttProviderKind::Deepgram, 48_000), 48_000);
+            assert_eq!(target_sample_rate_hz(SttProviderKind::Google, 48_000), 48_000);
+        }
+
+        /// Minimal in-memory `CredentialStore` for exercising `build_stt_provider`
+        /// without touching a real OS keyring — same "just a `HashMap`" shape as
+        /// `credential_store::EncryptedFileStore`'s test doubles elsewhere in this
+        /// workspace, kept local since no shared test-only crate exposes one.
+        struct InMemoryCredentialStore(std::collections::HashMap<(String, String), String>);
+
+        impl InMemoryCredentialStore {
+            fn with(service: &str, account: &str, secret: &str) -> Self {
+                let mut map = std::collections::HashMap::new();
+                map.insert((service.to_string(), account.to_string()), secret.to_string());
+                Self(map)
+            }
+        }
+
+        impl CredentialStore for InMemoryCredentialStore {
+            fn save(&self, _service: &str, _account: &str, _secret: &str) -> Result<(), credential_store::StoreError> {
+                unimplemented!("not needed by these tests")
+            }
+            fn load(&self, service: &str, account: &str) -> Result<String, credential_store::StoreError> {
+                self.0.get(&(service.to_string(), account.to_string())).cloned().ok_or_else(|| credential_store::StoreError::NotFound {
+                    service: service.to_string(),
+                    account: account.to_string(),
+                })
+            }
+            fn delete(&self, _service: &str, _account: &str) -> Result<(), credential_store::StoreError> {
+                unimplemented!("not needed by these tests")
+            }
+        }
+
+        #[test]
+        fn build_stt_provider_reports_credential_missing_for_every_kind_when_store_is_empty() {
+            let store = InMemoryCredentialStore(std::collections::HashMap::new());
+            for kind in [SttProviderKind::Deepgram, SttProviderKind::OpenAi, SttProviderKind::Google, SttProviderKind::AssemblyAi] {
+                let Err(err) = build_stt_provider(kind, &store) else { panic!("expected CredentialMissing for {kind:?}") };
+                assert!(matches!(err, SttProviderFactoryError::CredentialMissing { kind: k, .. } if k == kind));
+            }
+        }
+
+        #[test]
+        fn build_stt_provider_constructs_openai_and_assemblyai_from_a_bare_api_key() {
+            let store = InMemoryCredentialStore::with(stt_openai::CREDENTIAL_SERVICE, stt_openai::OPENAI_STT_API_KEY_ACCOUNT, "sk-test");
+            assert!(build_stt_provider(SttProviderKind::OpenAi, &store).is_ok());
+
+            let store = InMemoryCredentialStore::with(stt_assemblyai::CREDENTIAL_SERVICE, stt_assemblyai::ASSEMBLYAI_API_KEY_ACCOUNT, "aai-test");
+            assert!(build_stt_provider(SttProviderKind::AssemblyAi, &store).is_ok());
+        }
+
+        #[test]
+        fn build_stt_provider_constructs_google_from_valid_credentials_json() {
+            let credentials = GoogleSttCredentials::new("my-project", "global");
+            let json = serde_json::to_string(&credentials).unwrap();
+            let store = InMemoryCredentialStore::with(stt_google::CREDENTIAL_SERVICE, stt_google::GOOGLE_STT_CREDENTIALS_ACCOUNT, &json);
+            assert!(build_stt_provider(SttProviderKind::Google, &store).is_ok());
+        }
+
+        #[test]
+        fn build_stt_provider_reports_invalid_credential_for_malformed_google_json() {
+            let store = InMemoryCredentialStore::with(stt_google::CREDENTIAL_SERVICE, stt_google::GOOGLE_STT_CREDENTIALS_ACCOUNT, "not json");
+            let Err(err) = build_stt_provider(SttProviderKind::Google, &store) else { panic!("expected InvalidCredential") };
+            assert!(matches!(err, SttProviderFactoryError::InvalidCredential { kind: SttProviderKind::Google, .. }));
         }
     }
 }

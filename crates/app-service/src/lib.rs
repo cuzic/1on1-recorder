@@ -10,6 +10,8 @@
 mod error;
 mod normalize;
 mod pipeline;
+#[cfg(feature = "live-transcription")]
+mod resample;
 mod segmenter;
 mod session_lifecycle;
 mod timeline_adapter;
