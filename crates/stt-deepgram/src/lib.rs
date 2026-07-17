@@ -22,6 +22,13 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+/// `credential-store` service/account this crate's API key is expected under
+/// (design.md §12.4), matching `summarize::CREDENTIAL_SERVICE`/`*_ACCOUNT`'s pattern
+/// so the settings UI (writer) and the capture pipeline (reader) agree on the same
+/// two strings without either hardcoding them independently.
+pub const CREDENTIAL_SERVICE: &str = "1on1-recorder";
+pub const DEEPGRAM_API_KEY_ACCOUNT: &str = "deepgram-api-key";
+
 const LISTEN_URL: &str = "wss://api.deepgram.com/v1/listen";
 const DEFAULT_MODEL: &str = "nova-3";
 /// Deepgram's own guidance: `utterance_end_ms` must be 1000ms or higher, since interim

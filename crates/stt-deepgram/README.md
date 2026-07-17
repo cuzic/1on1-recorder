@@ -32,6 +32,11 @@ PoC adapter. Not yet verified against a live connection — protocol details are
 Deepgram's official docs only (see the design doc's source links). The first live
 spike against a real API key is tracked as a follow-up.
 
+An `examples/deepgram_poc.rs` spike is available for that follow-up: it streams a
+synthesized sine-wave tone (no real meeting audio available in this dev environment)
+through a live session and prints every `SttEvent` as it arrives. Run it with a real
+key via `DEEPGRAM_API_KEY=xxx cargo run --example deepgram_poc -p stt-deepgram`.
+
 ## License
 
 Licensed under either of
