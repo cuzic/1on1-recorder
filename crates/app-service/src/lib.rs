@@ -14,6 +14,7 @@ mod pipeline;
 mod resample;
 mod segmenter;
 mod session_lifecycle;
+mod stt_provider_kind;
 mod timeline_adapter;
 mod upload_worker;
 
@@ -60,5 +61,10 @@ pub use normalize::normalize_to_mono;
 pub use pipeline::run_pipeline;
 pub use segmenter::{segment_pcm, PendingSegment};
 pub use session_lifecycle::{begin_session, end_session, recover_incomplete_sessions};
+// Unconditional (no `windows-supervisor`/`live-transcription` gate, unlike
+// `live_transcription`'s own re-export below): `apps/desktop`'s settings screen
+// (task #49) needs to save/load the user's selected STT provider on every
+// platform, not just where a real live-transcription session can actually open.
+pub use stt_provider_kind::{SttProviderKind, CREDENTIAL_SERVICE, SELECTED_STT_PROVIDER_ACCOUNT};
 pub use timeline_adapter::align_track;
 pub use upload_worker::{run_until_drained, upload_pending_once, UploadPassSummary};

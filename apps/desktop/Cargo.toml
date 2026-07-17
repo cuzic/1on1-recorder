@@ -20,7 +20,17 @@ recorder-domain = { path = "../../crates/recorder-domain" }
 session-store = { path = "../../crates/session-store" }
 credential-store = { path = "../../crates/credential-store" }
 upload-client = { path = "../../crates/upload-client" }
+# All four `stt-*` adapter crates (not just Deepgram) so the settings screen (#49)
+# can read each one's `credential-store` account constants — and, for Google,
+# serialize `GoogleSttCredentials` — without hardcoding strings that could drift
+# from `app-service::live_transcription::build_stt_provider`'s own copies. Plain
+# (not platform-gated) dependencies, same as `stt-deepgram` already was, since the
+# settings UI itself runs on every platform even where live transcription doesn't.
 stt-deepgram = { path = "../../crates/stt-deepgram" }
+stt-openai = { path = "../../crates/stt-openai" }
+stt-google = { path = "../../crates/stt-google" }
+stt-assemblyai = { path = "../../crates/stt-assemblyai" }
+serde_json = { workspace = true }
 summarize = { path = "../../crates/summarize" }
 # For building the `genai::Client` that `summarize::summarize` (#38) takes — the
 # app owns client construction (model string picked in settings + auth resolver
