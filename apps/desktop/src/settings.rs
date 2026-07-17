@@ -167,7 +167,28 @@ impl SummaryProvider {
     pub(crate) fn from_key(key: &str) -> Self {
         Self::ALL.into_iter().find(|p| p.key() == key).unwrap_or(SummaryProvider::Claude)
     }
+
+    /// Representative current models offered in the settings picker's `<select>`
+    /// (`default_model()` is always included). Not exhaustive — the UI falls back
+    /// to a freeform "カスタム" entry (see [`CUSTOM_MODEL`]) for anything else, so
+    /// this list doesn't need to track every new model release.
+    fn known_models(self) -> &'static [&'static str] {
+        match self {
+            SummaryProvider::Claude => &["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5"],
+            SummaryProvider::OpenAi => &["gpt-4o-mini", "gpt-4o", "gpt-5-mini"],
+            SummaryProvider::Gemini => &["gemini-3-flash-preview", "gemini-3-pro-preview", "gemini-2.5-flash"],
+            // Same `groq::` namespace requirement as `default_model` above.
+            SummaryProvider::Groq => &["groq::openai/gpt-oss-20b", "groq::openai/gpt-oss-120b", "groq::llama-3.3-70b-versatile"],
+            SummaryProvider::DeepSeek => &["deepseek-v4-flash", "deepseek-v4"],
+            SummaryProvider::XAi => &["grok-4", "grok-4-fast", "grok-3"],
+        }
+    }
 }
+
+/// Sentinel `<select>` value meaning "not one of `SummaryProvider::known_models()`
+/// — show the freeform text input instead". Not a valid `genai` model string, so it
+/// can't collide with a real model name.
+const CUSTOM_MODEL: &str = "__custom__";
 
 const STYLE: &str = r#"
 .settings-container {
@@ -275,6 +296,12 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                 .unwrap_or_else(|_| provider().default_model().to_string())
         }
     });
+    // Selects a `known_models()` entry, or `CUSTOM_MODEL` when the saved model
+    // isn't one (e.g. a value from before this picker existed, or hand-entered).
+    let mut model_select = use_signal(move || {
+        let saved = model_input();
+        if provider().known_models().contains(&saved.as_str()) { saved } else { CUSTOM_MODEL.to_string() }
+    });
     let mut provider_key_configured = use_signal({
         let state = state.clone();
         move || state.credential_store.load(summarize::CREDENTIAL_SERVICE, provider().api_key_account()).is_ok()
@@ -362,10 +389,19 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
             let new_provider = SummaryProvider::from_key(&evt.value());
             provider.set(new_provider);
             model_input.set(new_provider.default_model().to_string());
+            model_select.set(new_provider.default_model().to_string());
             provider_key_input.set(String::new());
             provider_key_configured.set(state.credential_store.load(summarize::CREDENTIAL_SERVICE, new_provider.api_key_account()).is_ok());
             summary_message.set(None);
         }
+    };
+
+    let onchange_model = move |evt: FormEvent| {
+        let value = evt.value();
+        if value != CUSTOM_MODEL {
+            model_input.set(value.clone());
+        }
+        model_select.set(value);
     };
 
     let save_summary = {
@@ -485,10 +521,22 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                 }
                 label {
                     "モデル"
-                    input {
-                        r#type: "text",
-                        value: "{model_input}",
-                        oninput: move |e| model_input.set(e.value()),
+                    select {
+                        onchange: onchange_model,
+                        for m in provider().known_models() {
+                            option { value: "{m}", selected: model_select() == *m, "{m}" }
+                        }
+                        option { value: CUSTOM_MODEL, selected: model_select() == CUSTOM_MODEL, "カスタム..." }
+                    }
+                }
+                if model_select() == CUSTOM_MODEL {
+                    label {
+                        "カスタムモデル名"
+                        input {
+                            r#type: "text",
+                            value: "{model_input}",
+                            oninput: move |e| model_input.set(e.value()),
+                        }
                     }
                 }
                 p { class: "status-badge", if provider_key_configured() { "APIキー設定済み" } else { "APIキー未設定" } }
