@@ -1,9 +1,11 @@
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use credential_store::CredentialStore;
 use dioxus::desktop::trayicon::{self, DioxusTrayIcon, DioxusTrayMenu};
 use dioxus::desktop::{use_tray_icon_event_handler, use_tray_menu_event_handler, use_window};
+use dioxus::html::geometry::PixelsVector2D;
 use dioxus::prelude::*;
 use recorder_domain::{SessionId, TrackKind};
 use session_store::{Summary, TranscriptSegment};
@@ -13,6 +15,7 @@ use crate::app_state::AppState;
 use crate::settings::{self, Screen, SummaryProvider};
 use crate::status::Status;
 use crate::transcript;
+use crate::transcription_status;
 
 const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 
@@ -192,6 +195,9 @@ button.gear {
 }
 .summary-text {
   width: 100%;
+  box-sizing: border-box;
+  max-height: 240px;
+  overflow-y: auto;
   white-space: pre-wrap;
   font-size: 0.9em;
   text-align: left;
@@ -200,6 +206,11 @@ button.gear {
   border-radius: 8px;
 }
 "#;
+
+// #53: how close (in px) to the panel's bottom counts as "already at the
+// bottom" for auto-scroll purposes — small enough to not trigger while
+// reading older messages, large enough to absorb sub-pixel rounding.
+const AUTO_SCROLL_NEAR_BOTTOM_PX: f64 = 24.0;
 
 fn format_elapsed(ms: u64) -> String {
     let total_seconds = ms / 1000;
@@ -262,6 +273,33 @@ pub fn App() -> Element {
     let mut summary_text = use_signal(|| None::<String>);
     let mut summary_message = use_signal(|| None::<String>);
     let mut summary_busy = use_signal(|| false);
+
+    // #53: auto-scroll the transcript panel to the bottom as new bubbles arrive,
+    // but only when the user hasn't scrolled up to read older messages.
+    let mut transcript_panel_mounted = use_signal(|| None::<Rc<MountedData>>);
+    let visible_transcript_key = use_memo(move || {
+        let segments = transcript_segments();
+        let visible = transcript::visible_segments(&segments);
+        (visible.len(), visible.last().map(|s| s.text.clone()))
+    });
+    use_effect(move || {
+        // Subscribe to changes in what's actually rendered (count + last row's
+        // text), not the raw poll tick — an unchanged view shouldn't re-check
+        // scroll position every 250ms.
+        let _ = visible_transcript_key();
+        let Some(el) = transcript_panel_mounted() else { return };
+        spawn(async move {
+            let (Ok(offset), Ok(scroll_size), Ok(client_rect)) =
+                (el.get_scroll_offset().await, el.get_scroll_size().await, el.get_client_rect().await)
+            else {
+                return;
+            };
+            let distance_from_bottom = scroll_size.height - offset.y - client_rect.size.height;
+            if distance_from_bottom <= AUTO_SCROLL_NEAR_BOTTOM_PX {
+                let _ = el.scroll(PixelsVector2D::new(0.0, scroll_size.height), ScrollBehavior::Smooth).await;
+            }
+        });
+    });
 
     let poll_state = state.clone();
     use_future(move || {
@@ -431,6 +469,10 @@ pub fn App() -> Element {
     let uploaded_segments = current.uploaded_segments;
     let pending_segments = current.pending_segments;
     let last_error = current.last_error.clone();
+    // #52: STT connection visibility, so an empty transcript panel doesn't read as
+    // ambiguous "nobody has spoken yet" vs. "STT is broken" — see
+    // `transcription_status::describe`'s doc comment.
+    let transcription_status_line = transcription_status::describe(&current.transcription_status);
     let last_session_line = current.last_session_id.clone().map(|session_id| match current.last_total_duration_ms {
         Some(duration_ms) => format!("Last session: {session_id} ({})", format_elapsed(duration_ms)),
         None => format!("Last session: {session_id}"),
@@ -439,6 +481,11 @@ pub fn App() -> Element {
     let action_error_text = action_error();
     let is_busy = busy();
     let is_summary_busy = summary_busy();
+
+    // #51: collapse Deepgram's Partial/Final row stream into one bubble per
+    // in-flight utterance — see `transcript::visible_segments`'s doc comment.
+    let raw_segments = transcript_segments();
+    let visible_segments = transcript::visible_segments(&raw_segments);
 
     if screen() == Screen::Settings {
         return rsx! {
@@ -502,12 +549,18 @@ pub fn App() -> Element {
 
                     button { class: "stop", disabled: is_busy, onclick: on_stop_recording, "Stop" }
 
+                    if let Some(msg) = transcription_status_line {
+                        p { class: "hint", "{msg}" }
+                    }
+
                     // #33/#34: live transcript, grouped into chat-style bubbles by
                     // track (Self/Remote — this app's primary speaker axis; see
                     // `transcript::track_label`'s doc comment) with an optional
                     // Deepgram diarization index appended.
-                    div { class: "transcript-panel",
-                        for seg in transcript_segments() {
+                    div {
+                        class: "transcript-panel",
+                        onmounted: move |e| transcript_panel_mounted.set(Some(e.data())),
+                        for seg in visible_segments {
                             div {
                                 class: if seg.track == Some(TrackKind::SelfMic) { "bubble-row bubble-self" } else if seg.track == Some(TrackKind::RemoteAudio) { "bubble-row bubble-remote" } else { "bubble-row bubble-unknown" },
                                 div {
