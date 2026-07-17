@@ -1,0 +1,33 @@
+[package]
+name = "stt-google"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "stt-api adapter for Google Cloud Speech-to-Text v2's StreamingRecognize API (gRPC)."
+readme = "README.md"
+keywords = ["speech-to-text", "stt", "google", "streaming"]
+categories = ["multimedia::audio", "asynchronous"]
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+futures-core = "0.3"
+gcp_auth = { version = "0.12", default-features = false, features = ["ring"] }
+prost = "0.14"
+prost-types = "0.14"
+serde = { workspace = true }
+serde_json = { workspace = true }
+stt-api = { path = "../stt-api" }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync"] }
+tokio-stream = "0.1"
+tonic = { version = "0.14", default-features = true, features = ["tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+tracing = "0.1"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
