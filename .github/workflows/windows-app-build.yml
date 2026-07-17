@@ -1,0 +1,76 @@
+name: Windows App Build & Test
+
+# Tier 0 (`build`) is a blocking gate: compiles/lints/tests the main workspace with
+# Windows's real capture backend (capture-windows, app-service's
+# windows-supervisor/live-transcription features) enabled, plus the dioxus-desktop
+# app itself. No real audio hardware is needed for this — see
+# crates/capture-windows/README.md-style caveats for what has and hasn't been
+# verified against real WASAPI devices.
+#
+# This is the windows-latest analogue of macos-build.yml's Tier 0 job.
+# `windows-build.yml` (a separate, older workflow) only builds `spikes/` — it
+# predates the real app's windows-supervisor/live-transcription features and was
+# never a gate for them.
+#
+# No Tier 1 (real-capture E2E) job here yet, unlike macOS's `e2e-best-effort`:
+# there is no established headless-CI virtual-microphone equivalent to macOS's
+# BlackHole in use in this repo yet. Confident end-to-end verification still
+# depends on a manual real-Windows pass (see the project's task list, task #9).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "apps/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+      - ".github/workflows/windows-app-build.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "apps/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (capture-windows + app-service windows-supervisor/live-transcription features)
+        run: |
+          cargo build -p capture-windows --target x86_64-pc-windows-msvc
+          cargo build -p app-service --features windows-supervisor --target x86_64-pc-windows-msvc
+          cargo build -p app-service --features live-transcription --target x86_64-pc-windows-msvc
+          cargo build -p desktop --target x86_64-pc-windows-msvc
+
+      - name: Clippy
+        # --no-deps scopes linting to capture-windows/app-service/desktop themselves,
+        # not every workspace-local path dependency clippy walks into while building
+        # them — this job's -D warnings gate is meant for this Windows work
+        # specifically, not as a first-ever blanket clippy pass over pre-existing,
+        # previously-unlinted code elsewhere in the workspace.
+        run: |
+          cargo clippy -p capture-windows --target x86_64-pc-windows-msvc --no-deps -- -D warnings
+          cargo clippy -p app-service --features live-transcription --target x86_64-pc-windows-msvc --no-deps -- -D warnings
+          cargo clippy -p desktop --target x86_64-pc-windows-msvc --no-deps -- -D warnings
+
+      - name: Test
+        # No real WASAPI device or Deepgram connection needed here: capture-windows's
+        # own unit tests are pure arithmetic/fixture-driven, and app-service's
+        # windows_frame_collector/live_transcription tests construct fixture events
+        # directly rather than driving real WASAPI or a real Deepgram connection.
+        run: |
+          cargo test -p capture-windows --target x86_64-pc-windows-msvc
+          cargo test -p app-service --features live-transcription --target x86_64-pc-windows-msvc
