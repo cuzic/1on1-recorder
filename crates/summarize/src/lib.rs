@@ -26,6 +26,18 @@ pub const CLAUDE_API_KEY_ACCOUNT: &str = "claude-api-key";
 /// Convenience account name for the OpenAI API key.
 pub const OPENAI_API_KEY_ACCOUNT: &str = "openai-api-key";
 
+/// Convenience account name for the Gemini API key.
+pub const GEMINI_API_KEY_ACCOUNT: &str = "gemini-api-key";
+
+/// Convenience account name for the Groq API key.
+pub const GROQ_API_KEY_ACCOUNT: &str = "groq-api-key";
+
+/// Convenience account name for the DeepSeek API key.
+pub const DEEPSEEK_API_KEY_ACCOUNT: &str = "deepseek-api-key";
+
+/// Convenience account name for the xAI (Grok) API key.
+pub const XAI_API_KEY_ACCOUNT: &str = "xai-api-key";
+
 /// Account name under which the user's currently selected summary provider (e.g.
 /// `"claude"` or `"openai"`) is stored — written by the settings UI, read by later
 /// summary-triggering code (#38), so both agree on where "which provider is active"

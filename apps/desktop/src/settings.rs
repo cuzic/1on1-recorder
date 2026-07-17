@@ -99,15 +99,30 @@ impl SttProvider {
 pub(crate) enum SummaryProvider {
     Claude,
     OpenAi,
+    Gemini,
+    Groq,
+    DeepSeek,
+    XAi,
 }
 
 impl SummaryProvider {
-    const ALL: [SummaryProvider; 2] = [SummaryProvider::Claude, SummaryProvider::OpenAi];
+    const ALL: [SummaryProvider; 6] = [
+        SummaryProvider::Claude,
+        SummaryProvider::OpenAi,
+        SummaryProvider::Gemini,
+        SummaryProvider::Groq,
+        SummaryProvider::DeepSeek,
+        SummaryProvider::XAi,
+    ];
 
     pub(crate) fn key(self) -> &'static str {
         match self {
             SummaryProvider::Claude => "claude",
             SummaryProvider::OpenAi => "openai",
+            SummaryProvider::Gemini => "gemini",
+            SummaryProvider::Groq => "groq",
+            SummaryProvider::DeepSeek => "deepseek",
+            SummaryProvider::XAi => "xai",
         }
     }
 
@@ -115,6 +130,10 @@ impl SummaryProvider {
         match self {
             SummaryProvider::Claude => "Claude (Anthropic)",
             SummaryProvider::OpenAi => "OpenAI",
+            SummaryProvider::Gemini => "Gemini (Google)",
+            SummaryProvider::Groq => "Groq",
+            SummaryProvider::DeepSeek => "DeepSeek",
+            SummaryProvider::XAi => "xAI (Grok)",
         }
     }
 
@@ -122,6 +141,15 @@ impl SummaryProvider {
         match self {
             SummaryProvider::Claude => "claude-sonnet-4-5",
             SummaryProvider::OpenAi => "gpt-4o-mini",
+            SummaryProvider::Gemini => "gemini-3-flash-preview",
+            // `genai` requires Groq models to be namespaced (`groq::_model_`) since
+            // v0.6.0 — unlike Gemini/DeepSeek/xAI, Groq model names have no
+            // recognizable prefix genai can dispatch on automatically.
+            SummaryProvider::Groq => "groq::openai/gpt-oss-20b",
+            // `deepseek-chat`/`deepseek-reasoner` are being deprecated by DeepSeek;
+            // `deepseek-v4-flash` is genai's current default DeepSeek model.
+            SummaryProvider::DeepSeek => "deepseek-v4-flash",
+            SummaryProvider::XAi => "grok-4",
         }
     }
 
@@ -129,6 +157,10 @@ impl SummaryProvider {
         match self {
             SummaryProvider::Claude => summarize::CLAUDE_API_KEY_ACCOUNT,
             SummaryProvider::OpenAi => summarize::OPENAI_API_KEY_ACCOUNT,
+            SummaryProvider::Gemini => summarize::GEMINI_API_KEY_ACCOUNT,
+            SummaryProvider::Groq => summarize::GROQ_API_KEY_ACCOUNT,
+            SummaryProvider::DeepSeek => summarize::DEEPSEEK_API_KEY_ACCOUNT,
+            SummaryProvider::XAi => summarize::XAI_API_KEY_ACCOUNT,
         }
     }
 
