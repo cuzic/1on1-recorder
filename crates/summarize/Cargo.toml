@@ -1,0 +1,17 @@
+[package]
+name = "summarize"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin wrapper over the genai crate for summarizing diarized meeting transcripts (multi-provider: Anthropic/OpenAI/Gemini/etc. via a model string)."
+
+[dependencies]
+async-trait = "0.1"
+credential-store = { path = "../credential-store" }
+genai = "0.7.0-beta.13"
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
