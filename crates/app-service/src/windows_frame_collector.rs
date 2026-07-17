@@ -11,6 +11,7 @@ use capture_api::rebinding::BindingKind;
 use capture_windows::CapturedFrameRecord;
 use crossbeam_channel::Receiver;
 use recorder_domain::{CapturedFrame, TrackKind};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::windows_supervisor::FrameSinkEvent;
 
@@ -91,13 +92,24 @@ pub struct CollectedFrames {
 /// the competing-consumer race `FrameSinkEvent` itself exists to avoid; see
 /// `windows_supervisor`'s doc comment).
 ///
+/// `stt_sink`, if given, is a second side channel of the same shape: every
+/// frame's raw PCM (plus its track and sample rate) is forwarded there too, so
+/// `live_transcription` can stream audio into an STT provider as capture
+/// happens, without this function itself knowing anything about STT. A `send`
+/// failure (the receiving end was dropped, e.g. no STT session ever started)
+/// is silently ignored — same "best-effort side channel" spirit as `level_sink`.
+///
 /// Buffers an entire session's samples in memory — acceptable for proving real
 /// `capture-windows` audio flows through the exact pipeline stage 1 validated with
 /// `pseudo_source`, but not how a long-running recording should work in
 /// production. Segmenting incrementally as capture progresses (bounding memory,
 /// uploading while still recording) is stage 3's job (task #11), not this
 /// function's.
-pub fn collect_frames(rx: &Receiver<FrameSinkEvent>, level_sink: Option<&Mutex<LevelSnapshot>>) -> CollectedFrames {
+pub fn collect_frames(
+    rx: &Receiver<FrameSinkEvent>,
+    level_sink: Option<&Mutex<LevelSnapshot>>,
+    stt_sink: Option<&UnboundedSender<(TrackKind, Vec<f32>, u32)>>,
+) -> CollectedFrames {
     let mut self_frames = Vec::new();
     let mut remote_frames = Vec::new();
     let mut formats: HashMap<BindingKind, (u32, u16)> = HashMap::new();
@@ -125,6 +137,10 @@ pub fn collect_frames(rx: &Receiver<FrameSinkEvent>, level_sink: Option<&Mutex<L
                         TrackKind::SelfMic => (snapshot.self_rms, snapshot.self_peak) = (rms, peak),
                         TrackKind::RemoteAudio => (snapshot.remote_rms, snapshot.remote_peak) = (rms, peak),
                     }
+                }
+
+                if let Some(sink) = stt_sink {
+                    let _ = sink.send((track, frame.samples.clone(), sample_rate));
                 }
 
                 match track {

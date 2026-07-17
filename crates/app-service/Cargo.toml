@@ -12,16 +12,23 @@ capture-api = { path = "../capture-api", optional = true }
 capture-macos = { path = "../capture-macos", optional = true }
 capture-windows = { path = "../capture-windows", optional = true }
 chrono = "0.4"
+credential-store = { path = "../credential-store", optional = true }
 crossbeam-channel = { version = "0.5", optional = true }
 recorder-domain = { path = "../recorder-domain" }
 screencapturekit = { version = "8", features = ["macos_15_0"], optional = true }
 segment-store = { path = "../segment-store" }
 session-store = { path = "../session-store" }
+stt-api = { path = "../stt-api", optional = true }
+stt-deepgram = { path = "../stt-deepgram", optional = true }
 thiserror = { workspace = true }
 # "time" for the upload worker's retry-pacing sleep (task #11) — needed
 # unconditionally since the upload worker itself is OS-independent, unlike
 # windows-supervisor's own extra tokio features (see that feature below).
-tokio = { version = "1", features = ["time"] }
+# "sync" for the live-transcription side channel (`mpsc`, see
+# `windows_frame_collector`/`live_transcription`) — cheap (no extra crates pulled
+# in), unlike stt-deepgram's websocket/TLS stack, so it stays unconditional rather
+# than living behind the `live-transcription` feature below.
+tokio = { version = "1", features = ["time", "sync"] }
 tracing = { version = "0.1", optional = true }
 upload-client = { path = "../upload-client" }
 windows = { version = "0.58", features = ["Win32_Media_Audio", "Win32_System_Com"], optional = true }
@@ -38,7 +45,7 @@ upload-client = { path = "../upload-client", features = ["mock-server"] }
 # (capture-windows itself is Windows-only) — this crate's default (no-features)
 # build stays OS-independent for stage 1's pseudo-source pipeline and stage 3's
 # upload worker/session lifecycle.
-windows-supervisor = ["dep:capture-api", "dep:capture-windows", "dep:crossbeam-channel", "dep:tracing", "dep:windows", "tokio/rt"]
+windows-supervisor = ["dep:capture-api", "dep:capture-windows", "dep:credential-store", "dep:crossbeam-channel", "dep:tracing", "dep:windows", "tokio/rt", "tokio/macros"]
 
 # The macOS analogue of windows-supervisor: connects capture-api's FSM to real
 # capture-macos (ScreenCaptureKit) capture threads via macos_supervisor, plus the
@@ -47,3 +54,17 @@ windows-supervisor = ["dep:capture-api", "dep:capture-windows", "dep:crossbeam-c
 # itself is macOS-only, and — unlike capture-windows — has not yet been compiled or
 # run at all; see capture-macos's crate doc comment).
 macos-supervisor = ["dep:capture-api", "dep:capture-macos", "dep:crossbeam-channel", "dep:screencapturekit", "dep:tracing", "tokio/rt"]
+
+# Real-time transcription during a Windows recording (design's "録音中にリアルタイム
+# で文字起こしを表示したい"): opens Deepgram streaming STT sessions and persists
+# `SttEvent`s via `session-store` as `windows_frame_collector::collect_frames`
+# produces frames, instead of waiting for the batch `run_pipeline` stage 1/2 already
+# do. Layered on top of (not merged into) `windows-supervisor` so a plain
+# `--features windows-supervisor` build never pulls in stt-deepgram's
+# websocket/TLS stack (`tokio-tungstenite`/`native-tls`) — `windows_session`'s
+# `live_transcription` module compiles to a no-op stub without this feature. No
+# macOS equivalent yet: `capture-macos`/`macos_frame_collector`/`macos_session`
+# would need the identical `stt_sink`/`live_transcription` extension point once
+# that crate is ever actually compiled/run (see its own crate doc comment) — not
+# done here since macOS capture itself isn't in scope yet.
+live-transcription = ["windows-supervisor", "dep:stt-api", "dep:stt-deepgram"]

@@ -18,6 +18,8 @@ mod upload_worker;
 pub mod pseudo_source;
 
 #[cfg(feature = "windows-supervisor")]
+pub mod live_transcription;
+#[cfg(feature = "windows-supervisor")]
 pub mod windows_frame_collector;
 #[cfg(feature = "windows-supervisor")]
 pub mod windows_session;

@@ -9,10 +9,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use capture_windows::device_watch::DeviceWatch;
-use recorder_domain::{SessionManifest, SessionSummary, UploadAdapter};
+use recorder_domain::{SessionManifest, SessionSummary, TrackKind, UploadAdapter};
 use session_store::SessionStore;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::error::AppServiceError;
+use crate::live_transcription::run_live_transcription;
 use crate::pipeline::run_pipeline;
 use crate::windows_frame_collector::{collect_frames, CollectedFrames, LevelSnapshot};
 use crate::windows_supervisor::WindowsSupervisor;
@@ -29,6 +31,15 @@ use crate::windows_supervisor::WindowsSupervisor;
 /// #11). Like the rest of `windows_supervisor`, this has only been
 /// cross-compile-checked, never run on real Windows hardware — see this crate's
 /// README.
+///
+/// `credential_store`, if given, is where `live_transcription` looks up a
+/// Deepgram API key (see that module) to stream real-time transcription
+/// alongside the batch capture this function already does — `None`, or no key
+/// found under it, just means no live transcription for this session (recording
+/// itself is unaffected either way). Wired up unconditionally (not only under the
+/// `live-transcription` feature) so this function's signature doesn't need its
+/// own `#[cfg]`; without that feature, `live_transcription::run_live_transcription`
+/// is a stub that ignores it.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_windows_capture_session(
     manifest: &SessionManifest,
@@ -39,11 +50,21 @@ pub async fn run_windows_capture_session(
     store: &SessionStore,
     adapter: &dyn UploadAdapter,
     level_sink: Option<Arc<Mutex<LevelSnapshot>>>,
+    credential_store: Option<Arc<dyn credential_store::CredentialStore + Send + Sync>>,
 ) -> Result<SessionSummary, AppServiceError> {
-    let collected = tokio::task::spawn_blocking(move || run_capture_blocking(callback_timeout_ms, shutdown_rx, level_sink))
-        .await
-        .expect("capture supervisor thread panicked")
-        .map_err(|e| AppServiceError::Capture(e.to_string()))?;
+    // Same shape as `level_sink`'s side channel (see `windows_frame_collector`'s doc
+    // comment), but for raw PCM instead of RMS/peak. `stt_tx` is moved into
+    // `run_capture_blocking`'s closure below and dropped there once capture and the
+    // collector thread are fully done, which is what lets `run_live_transcription`'s
+    // `audio_rx.recv()` loop end (and finalize both STT sessions) at the right time
+    // without a separate shutdown signal.
+    let (stt_tx, stt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let live_transcription_fut = run_live_transcription(manifest.session_id, manifest.audio.sample_rate, credential_store, stt_rx, store);
+
+    let capture_fut = tokio::task::spawn_blocking(move || run_capture_blocking(callback_timeout_ms, shutdown_rx, level_sink, stt_tx));
+
+    let (collected, ()) = tokio::join!(capture_fut, live_transcription_fut);
+    let collected = collected.expect("capture supervisor thread panicked").map_err(|e| AppServiceError::Capture(e.to_string()))?;
 
     let self_interval = collected.self_nominal_frame_interval_ns.max(1);
     let remote_interval = collected.remote_nominal_frame_interval_ns.max(1);
@@ -73,7 +94,12 @@ fn latest_frame_end_ns(collected: &CollectedFrames, self_interval: u64, remote_i
 /// Everything that has to happen on one dedicated OS thread: `DeviceWatch::start`
 /// requires its creating thread to stay alive for as long as it's alive, and that
 /// same thread is what `WindowsSupervisor::run_until_shutdown` blocks.
-fn run_capture_blocking(callback_timeout_ms: u32, shutdown_rx: crossbeam_channel::Receiver<()>, level_sink: Option<Arc<Mutex<LevelSnapshot>>>) -> Result<CollectedFrames, capture_windows::CaptureError> {
+fn run_capture_blocking(
+    callback_timeout_ms: u32,
+    shutdown_rx: crossbeam_channel::Receiver<()>,
+    level_sink: Option<Arc<Mutex<LevelSnapshot>>>,
+    stt_tx: UnboundedSender<(TrackKind, Vec<f32>, u32)>,
+) -> Result<CollectedFrames, capture_windows::CaptureError> {
     let mut supervisor = WindowsSupervisor::new(callback_timeout_ms);
     let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
     supervisor.set_frame_sink(frame_tx);
@@ -89,7 +115,10 @@ fn run_capture_blocking(callback_timeout_ms: u32, shutdown_rx: crossbeam_channel
     supervisor.pin_devices(mic_endpoint_id, render_endpoint_id);
     supervisor.start_all()?;
 
-    let collector = std::thread::spawn(move || collect_frames(&frame_rx, level_sink.as_deref()));
+    // `stt_tx` is moved into and dropped at the end of this closure (i.e. once
+    // `collect_frames` returns) — see `run_windows_capture_session`'s doc comment
+    // on why that's what lets `run_live_transcription` know capture is done.
+    let collector = std::thread::spawn(move || collect_frames(&frame_rx, level_sink.as_deref(), Some(&stt_tx)));
 
     supervisor.run_until_shutdown(&watch_rx, &shutdown_rx)?;
     drop(supervisor); // drops frame_tx, letting `collector` finish once drained
