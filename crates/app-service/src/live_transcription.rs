@@ -85,12 +85,109 @@ fn set_both_status(sink: &Option<Arc<Mutex<TranscriptionStatus>>>, status: Track
     guard.remote_status = status;
 }
 
+/// `credential-store` service name under which the user's STT provider selection
+/// (see [`SELECTED_STT_PROVIDER_ACCOUNT`]) is stored. Same `"1on1-recorder"` string
+/// as `summarize::CREDENTIAL_SERVICE`, kept as its own constant rather than a shared
+/// one so this crate doesn't need a dependency on `summarize` just to reuse a string
+/// literal (task #47).
+pub const CREDENTIAL_SERVICE: &str = "1on1-recorder";
+
+/// Account name under which the user's currently selected [`SttProviderKind`] (e.g.
+/// `"deepgram"`) is stored — mirrors `summarize::SELECTED_PROVIDER_ACCOUNT`'s
+/// "settings UI writes it, capture pipeline reads it" pattern.
+pub const SELECTED_STT_PROVIDER_ACCOUNT: &str = "stt-selected-provider";
+
+/// Which `stt-api::SttProvider` adapter a live transcription session should use. One
+/// variant per adapter crate under `crates/stt-*`, added here regardless of whether
+/// [`stt_wiring::build_stt_provider`] has been wired up to construct it yet
+/// (task #48 does the rest for OpenAI/Google/AssemblyAI) — so every `match` over this
+/// enum stays exhaustiveness-checked as adapters are added, instead of an
+/// unimplemented one silently doing nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SttProviderKind {
+    Deepgram,
+    OpenAi,
+    Google,
+    AssemblyAi,
+}
+
+impl SttProviderKind {
+    /// Parses the string stored under [`SELECTED_STT_PROVIDER_ACCOUNT`]. `None` for
+    /// anything unrecognized (a stale value from a newer build, a corrupted entry,
+    /// etc.) rather than an error — callers fall back to [`SttProviderKind::default`],
+    /// same as "no selection made yet".
+    pub fn from_account_value(value: &str) -> Option<Self> {
+        match value {
+            "deepgram" => Some(Self::Deepgram),
+            "openai" => Some(Self::OpenAi),
+            "google" => Some(Self::Google),
+            "assemblyai" => Some(Self::AssemblyAi),
+            _ => None,
+        }
+    }
+
+    pub fn as_account_value(self) -> &'static str {
+        match self {
+            Self::Deepgram => "deepgram",
+            Self::OpenAi => "openai",
+            Self::Google => "google",
+            Self::AssemblyAi => "assemblyai",
+        }
+    }
+}
+
+impl Default for SttProviderKind {
+    /// Deepgram was the only adapter wired in before task #47 — defaulting to it
+    /// when nothing is selected keeps that behavior unchanged.
+    fn default() -> Self {
+        Self::Deepgram
+    }
+}
+
 #[cfg(feature = "live-transcription")]
-mod deepgram_wiring {
+mod stt_wiring {
     use super::*;
     use session_store::TranscriptSegment;
     use stt_api::{AudioChunk, SttEvent, SttProvider, SttSession, SttSessionConfig};
-    use stt_deepgram::{DeepgramProvider, CREDENTIAL_SERVICE, DEEPGRAM_API_KEY_ACCOUNT};
+    use stt_deepgram::DeepgramProvider;
+
+    /// Errors from [`build_stt_provider`] — distinct from `stt_api::SttError`, which
+    /// covers failures *within* an already-constructed provider's session, not
+    /// "there is no provider to construct at all".
+    #[derive(Debug, thiserror::Error)]
+    pub enum SttProviderFactoryError {
+        #[error("no credential configured for STT provider {kind:?}: {source}")]
+        CredentialMissing {
+            kind: SttProviderKind,
+            #[source]
+            source: credential_store::StoreError,
+        },
+        /// Deliberately not folded into `CredentialMissing` or hidden behind a
+        /// catch-all match arm: task #48 wires up the remaining adapters one at a
+        /// time, and each one it adds removes an arm from this factory's `match`
+        /// rather than leaving a `_ => ...` that would keep compiling silently.
+        #[error("STT provider {0:?} is not yet wired into the factory (see task #48)")]
+        NotImplemented(SttProviderKind),
+    }
+
+    /// Constructs the `Box<dyn SttProvider>` for `kind`, loading whatever credential
+    /// that provider needs from `credential_store`. Only [`SttProviderKind::Deepgram`]
+    /// is implemented today (task #47's scope); the other variants are listed
+    /// explicitly so adding a fifth adapter's enum variant without a matching arm
+    /// here fails to compile instead of silently falling through.
+    pub fn build_stt_provider(kind: SttProviderKind, credential_store: &dyn CredentialStore) -> Result<Box<dyn SttProvider>, SttProviderFactoryError> {
+        match kind {
+            SttProviderKind::Deepgram => {
+                let api_key = credential_store
+                    .load(stt_deepgram::CREDENTIAL_SERVICE, stt_deepgram::DEEPGRAM_API_KEY_ACCOUNT)
+                    .map_err(|source| SttProviderFactoryError::CredentialMissing { kind, source })?;
+                Ok(Box::new(DeepgramProvider::new(api_key)))
+            }
+            SttProviderKind::OpenAi => Err(SttProviderFactoryError::NotImplemented(kind)),
+            SttProviderKind::Google => Err(SttProviderFactoryError::NotImplemented(kind)),
+            SttProviderKind::AssemblyAi => Err(SttProviderFactoryError::NotImplemented(kind)),
+        }
+    }
 
     /// Runs for the lifetime of one recording session, ending when `audio_rx` closes
     /// (i.e. `windows_session::run_capture_blocking`'s collector thread — and the
@@ -117,17 +214,21 @@ mod deepgram_wiring {
             return;
         };
 
-        let api_key = match credential_store.load(CREDENTIAL_SERVICE, DEEPGRAM_API_KEY_ACCOUNT) {
-            Ok(key) => key,
+        let selected_kind = credential_store
+            .load(CREDENTIAL_SERVICE, SELECTED_STT_PROVIDER_ACCOUNT)
+            .ok()
+            .and_then(|value| SttProviderKind::from_account_value(&value))
+            .unwrap_or_default();
+
+        let provider = match build_stt_provider(selected_kind, credential_store.as_ref()) {
+            Ok(provider) => provider,
             Err(err) => {
-                tracing::info!(%err, "live transcription: no Deepgram API key configured, skipping");
+                tracing::info!(%err, ?selected_kind, "live transcription: no STT provider available, skipping");
                 set_both_status(&status_sink, TrackTranscriptionStatus::NotConfigured);
                 drain(&mut audio_rx).await;
                 return;
             }
         };
-
-        let provider = DeepgramProvider::new(api_key);
         // Phase 1A capture is a fixed format (design.md; see
         // `windows_frame_collector`'s "falls back to 48kHz mono" comment) — the
         // session is opened once, up front, at the manifest's nominal rate rather
@@ -422,7 +523,7 @@ mod deepgram_wiring {
 }
 
 #[cfg(feature = "live-transcription")]
-pub use deepgram_wiring::run_live_transcription;
+pub use stt_wiring::run_live_transcription;
 
 /// `live-transcription` feature disabled: no STT provider types are even compiled in,
 /// so this just drains and discards `audio_rx` — keeping
