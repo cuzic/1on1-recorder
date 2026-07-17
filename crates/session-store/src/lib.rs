@@ -9,4 +9,4 @@ mod state_codec;
 mod store;
 
 pub use error::StoreError;
-pub use store::SessionStore;
+pub use store::{SessionStore, Summary, TranscriptSegment};

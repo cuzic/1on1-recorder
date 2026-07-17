@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use recorder_domain::{AudioCodec, AudioSegment, CaptureState, SessionId, SessionManifest, TrackKind, UploadState};
-use rusqlite::{named_params, params, Connection};
+use rusqlite::{named_params, params, Connection, OptionalExtension};
 
 use crate::error::StoreError;
 use crate::schema;
@@ -14,6 +14,33 @@ use crate::state_codec;
 /// was left mid-flight by a process that never reached `Finalized`/`Failed` (crash,
 /// force-quit, OS shutdown). See `reconcile_on_startup`.
 const NON_TERMINAL_CAPTURE_STATE_TAGS: [&str; 4] = ["preparing", "recording", "stopping", "finalizing"];
+
+/// One row of diarized transcript output — corresponds to a single `stt-api`
+/// `SttEvent::PartialTranscript`/`FinalTranscript`. `track` is `None` when the
+/// transcript isn't scoped to a single captured track; `speaker` is `None` when the
+/// provider/session wasn't configured for diarization (`SttSessionConfig::diarization`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptSegment {
+    pub session_id: SessionId,
+    pub track: Option<TrackKind>,
+    pub speaker: Option<u32>,
+    pub text: String,
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+    pub is_final: bool,
+}
+
+/// One generated summary of a session. Append-only like `transcript_segments` — a
+/// session may be re-summarized (e.g. with a different provider/model) without
+/// losing earlier results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Summary {
+    pub session_id: SessionId,
+    pub text: String,
+    /// The provider/model used to generate this summary, e.g. `"openai/gpt-4o"`.
+    pub provider_model: String,
+    pub generated_at: DateTime<Utc>,
+}
 
 pub struct SessionStore {
     conn: Mutex<Connection>,
@@ -422,6 +449,103 @@ impl SessionStore {
             counts.insert(track_str.parse::<TrackKind>()?, count);
         }
         Ok(counts)
+    }
+
+    /// Registers one transcript event (interim or final) from an STT session.
+    pub fn insert_transcript_segment(&self, segment: &TranscriptSegment) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO transcript_segments (
+                session_id, track, speaker, text, start_ms, end_ms, is_final, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                segment.session_id.to_string(),
+                segment.track.map(|t| t.as_manifest_str()),
+                segment.speaker,
+                segment.text,
+                segment.start_ms,
+                segment.end_ms,
+                segment.is_final,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every transcript segment recorded for a session, oldest first.
+    pub fn list_transcript_segments(&self, session_id: SessionId) -> Result<Vec<TranscriptSegment>, StoreError> {
+        let session_id_str = session_id.to_string();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT track, speaker, text, start_ms, end_ms, is_final
+             FROM transcript_segments
+             WHERE session_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![session_id_str], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<u32>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<u64>>(3)?,
+                row.get::<_, Option<u64>>(4)?,
+                row.get::<_, bool>(5)?,
+            ))
+        })?;
+
+        let mut segments = Vec::new();
+        for row in rows {
+            let (track_str, speaker, text, start_ms, end_ms, is_final) = row?;
+            segments.push(TranscriptSegment {
+                session_id,
+                track: track_str.map(|t| t.parse::<TrackKind>()).transpose()?,
+                speaker,
+                text,
+                start_ms,
+                end_ms,
+                is_final,
+            });
+        }
+        Ok(segments)
+    }
+
+    /// Records one summarization result.
+    pub fn insert_summary(&self, summary: &Summary) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO summaries (session_id, text, provider_model, generated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![summary.session_id.to_string(), summary.text, summary.provider_model, summary.generated_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// The most recently generated summary for a session — `None` if it has never
+    /// been summarized. A session may be re-summarized multiple times (see
+    /// `Summary`'s doc comment); this is "the current one" for a UI to show.
+    pub fn get_latest_summary(&self, session_id: SessionId) -> Result<Option<Summary>, StoreError> {
+        let session_id_str = session_id.to_string();
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT text, provider_model, generated_at FROM summaries
+                 WHERE session_id = ?1
+                 ORDER BY generated_at DESC, id DESC
+                 LIMIT 1",
+                params![session_id_str],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .optional()?;
+
+        row.map(|(text, provider_model, generated_at)| {
+            Ok(Summary {
+                session_id,
+                text,
+                provider_model,
+                generated_at: DateTime::parse_from_rfc3339(&generated_at)?.with_timezone(&Utc),
+            })
+        })
+        .transpose()
     }
 
     /// Finds sessions a previous process instance left in a non-terminal

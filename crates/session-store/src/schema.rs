@@ -85,8 +85,38 @@ CREATE TABLE IF NOT EXISTS events (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
+-- One row per `stt-api` `SttEvent::PartialTranscript`/`FinalTranscript` (see
+-- `TranscriptSegment`). `track`/`speaker` are nullable: a provider without
+-- diarization support leaves `speaker` unset, and a transcript not scoped to a
+-- single captured track leaves `track` unset.
+CREATE TABLE IF NOT EXISTS transcript_segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    track TEXT,
+    speaker INTEGER,
+    text TEXT NOT NULL,
+    start_ms INTEGER,
+    end_ms INTEGER,
+    is_final INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
+-- Append-only like `transcript_segments`: a session may be re-summarized (e.g.
+-- with a different provider/model) without losing earlier results (see `Summary`).
+CREATE TABLE IF NOT EXISTS summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    provider_model TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_upload_status_state ON upload_status(state_tag);
+CREATE INDEX IF NOT EXISTS idx_transcript_segments_session ON transcript_segments(session_id);
+CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
 "#;
 
 pub fn open_with_pragmas(path: &std::path::Path) -> Result<Connection, StoreError> {
