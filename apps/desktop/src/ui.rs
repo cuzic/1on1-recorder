@@ -13,6 +13,7 @@ use session_store::{Summary, TranscriptSegment};
 use crate::actions;
 use crate::app_state::AppState;
 use crate::export;
+use crate::history;
 use crate::settings::{self, Screen, SummaryProvider};
 use crate::status::Status;
 use crate::transcript;
@@ -135,6 +136,11 @@ button:disabled {
 }
 .header-row h1 {
   margin: 0;
+}
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.3em;
 }
 button.gear {
   padding: 0.4em 0.6em;
@@ -265,6 +271,16 @@ pub fn App() -> Element {
     let mut busy = use_signal(|| false);
     let mut action_error = use_signal(|| None::<String>);
     let mut screen = use_signal(|| Screen::Main);
+    // Task #69: which session summary generation (`on_generate_summary`) and
+    // export (`on_export`) act on. Auto-follows the live/last recording (see the
+    // polling future below, which sets this whenever `status().last_session_id`
+    // changes — that covers both "recording just started" and "recording just
+    // stopped", preserving the pre-#69 behavior of always targeting the most
+    // recent session by default) but can be overridden by picking an older
+    // session in `history::History`, which persists across app restarts (unlike
+    // `AppState::last_summary`, in-memory only) since it's read from
+    // `SessionStore::list_sessions`.
+    let mut selected_session_id = use_signal(|| None::<SessionId>);
 
     // #33/#34's live transcript panel and #38's "load the last summary on screen
     // open" both key off which session is current, not off the 250ms tick itself —
@@ -311,18 +327,37 @@ pub fn App() -> Element {
     use_future(move || {
         let state = poll_state.clone();
         async move {
-            let mut last_session_id: Option<String> = None;
+            let mut last_session_id: Option<String>;
+            let mut last_recording = false;
             loop {
                 let new_status = actions::get_status(&state);
 
-                if new_status.last_session_id != last_session_id {
-                    last_session_id = new_status.last_session_id.clone();
-                    summary_message.set(None);
-                    let latest = last_session_id
-                        .as_ref()
-                        .and_then(|s| s.parse::<SessionId>().ok())
-                        .and_then(|id| state.store.get_latest_summary(id).ok().flatten());
-                    summary_text.set(latest.map(|s| s.text));
+                // Auto-select the live/last recording as the "選択中セッション"
+                // whenever recording starts or stops — edge-detected on
+                // `recording`'s value, not on whether `last_session_id` differs
+                // from this loop's own previous reading (Codex review finding):
+                // comparing against `last_session_id` breaks once a manual
+                // `history::History` pick has moved `selected_session_id` off of
+                // what this loop last saw. E.g. session B is recording (this loop
+                // already observed `last_session_id == B`), the user picks older
+                // session A from history, then B stops — `status::current` still
+                // reports `last_session_id == B` (same session, now finalized), so
+                // the old value-diff check would see "unchanged" and never
+                // re-select B, leaving the view stuck on A. Edge-detecting the
+                // recording→not-recording (and not-recording→recording)
+                // transition instead fires exactly at those two moments
+                // regardless of what was manually selected in between, and also
+                // covers the crash-recovery resume path (task #11) that doesn't
+                // go through `on_start_recording`/`on_stop_recording` (which
+                // handle the common case synchronously — see those handlers).
+                let just_started = new_status.recording && !last_recording;
+                let just_stopped = !new_status.recording && last_recording;
+                last_recording = new_status.recording;
+                last_session_id = new_status.last_session_id.clone();
+                if just_started || just_stopped {
+                    if let Some(parsed) = last_session_id.as_ref().and_then(|s| s.parse::<SessionId>().ok()) {
+                        selected_session_id.set(Some(parsed));
+                    }
                 }
 
                 // Only the recording_active view renders the panel (#33's scope), so
@@ -340,6 +375,20 @@ pub fn App() -> Element {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
+    });
+
+    // Task #69: whenever the "選択中セッション" changes (auto-follow above, or a
+    // manual pick in `history::History`), reload that session's latest summary
+    // and clear any stale success/error messages from a previous selection —
+    // mirrors what the polling future used to do inline for `last_session_id`
+    // before `selected_session_id` existed.
+    let summary_reload_state = state.clone();
+    use_effect(move || {
+        let session_id = selected_session_id();
+        summary_message.set(None);
+        export_message.set(None);
+        let latest = session_id.and_then(|id| summary_reload_state.store.get_latest_summary(id).ok().flatten());
+        summary_text.set(latest.map(|s| s.text));
     });
 
     // design.md's force-quit recovery (task #11): resume any session a previous
@@ -373,7 +422,17 @@ pub fn App() -> Element {
         action_error.set(None);
         busy.set(true);
         match actions::start_recording(&start_state) {
-            Ok(s) => status.set(s),
+            Ok(s) => {
+                // Task #69: sync `selected_session_id` immediately rather than
+                // waiting for the next 250ms poll tick — otherwise a stale
+                // selection (e.g. picked from `history::History` before this
+                // click) could still be the target of a summary/export click
+                // during that window (Codex review finding).
+                if let Some(id) = s.last_session_id.as_deref().and_then(|id| id.parse::<SessionId>().ok()) {
+                    selected_session_id.set(Some(id));
+                }
+                status.set(s);
+            }
             Err(e) => action_error.set(Some(e)),
         }
         busy.set(false);
@@ -386,7 +445,18 @@ pub fn App() -> Element {
             action_error.set(None);
             busy.set(true);
             match actions::stop_recording(&state).await {
-                Ok(s) => status.set(s),
+                Ok(s) => {
+                    // Task #69: same reasoning as `on_start_recording` — re-assert
+                    // the just-finished session as selected immediately, so it
+                    // overrides whatever was picked from `history::History` while
+                    // this session was still recording (matches this module's
+                    // documented "a history pick overrides auto-follow until the
+                    // next start/stop" behavior, without waiting on the next poll).
+                    if let Some(id) = s.last_session_id.as_deref().and_then(|id| id.parse::<SessionId>().ok()) {
+                        selected_session_id.set(Some(id));
+                    }
+                    status.set(s);
+                }
                 Err(e) => action_error.set(Some(e)),
             }
             busy.set(false);
@@ -403,7 +473,7 @@ pub fn App() -> Element {
             summary_message.set(None);
             summary_busy.set(true);
 
-            let Some(session_id) = status().last_session_id.as_deref().and_then(|s| s.parse::<SessionId>().ok()) else {
+            let Some(session_id) = selected_session_id() else {
                 summary_message.set(Some("記録されたセッションがありません".to_string()));
                 summary_busy.set(false);
                 return;
@@ -515,7 +585,7 @@ pub fn App() -> Element {
     let on_export = move |_| {
         export_message.set(None);
 
-        let Some(session_id) = status().last_session_id.as_deref().and_then(|s| s.parse::<SessionId>().ok()) else {
+        let Some(session_id) = selected_session_id() else {
             export_message.set(Some("記録されたセッションがありません".to_string()));
             return;
         };
@@ -545,7 +615,12 @@ pub fn App() -> Element {
         Some(duration_ms) => format!("Last session: {session_id} ({})", format_elapsed(duration_ms)),
         None => format!("Last session: {session_id}"),
     });
-    let has_session = current.last_session_id.is_some();
+    // Task #69: gates the summary/export buttons on the *selected* session, not
+    // merely "a session exists somewhere" — a session picked from
+    // `history::History` still enables these even with no session recorded in
+    // the current app run (`current.last_session_id` would be `None` then).
+    let selected_session_id_value = selected_session_id();
+    let has_session = selected_session_id_value.is_some();
     let action_error_text = action_error();
     let is_busy = busy();
     let is_summary_busy = summary_busy();
@@ -561,12 +636,21 @@ pub fn App() -> Element {
         };
     }
 
+    if screen() == Screen::History {
+        return rsx! {
+            history::History { screen, selected_session_id }
+        };
+    }
+
     rsx! {
         style { "{STYLE}" }
         main { class: "container",
             div { class: "header-row",
                 h1 { "1on1 Recorder" }
-                button { class: "gear", onclick: move |_| screen.set(Screen::Settings), "⚙" }
+                div { class: "header-actions",
+                    button { class: "gear", onclick: move |_| screen.set(Screen::History), title: "過去のセッション", "🕘" }
+                    button { class: "gear", onclick: move |_| screen.set(Screen::Settings), title: "設定", "⚙" }
+                }
             }
 
             if !recording_active {
@@ -645,6 +729,13 @@ pub fn App() -> Element {
             // #38: user-triggered summary — enabled whenever a session exists
             // (mid-recording or after stop), not just while recording.
             section { class: "panel summary",
+                // Task #69: makes explicit which session "要約を生成"/"エクスポート"
+                // below will act on — important once a past session can be
+                // selected from `history::History`, since it may not be the one
+                // that's currently recording/just stopped.
+                if let Some(session_id) = selected_session_id_value {
+                    p { class: "hint", "対象セッション: {session_id}" }
+                }
                 button {
                     class: "primary",
                     disabled: !has_session || is_summary_busy,

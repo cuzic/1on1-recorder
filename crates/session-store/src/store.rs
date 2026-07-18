@@ -42,6 +42,18 @@ pub struct Summary {
     pub generated_at: DateTime<Utc>,
 }
 
+/// One row of `list_sessions`' past-sessions summary — enough to render the
+/// desktop app's history screen (task #69) without pulling every session's full
+/// transcript/segments. Unlike `AppState::last_summary` (in-memory, cleared on
+/// restart), this comes straight from `sessions`, so it survives an app restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionListItem {
+    pub session_id: SessionId,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub capture_state: CaptureState,
+}
+
 pub struct SessionStore {
     conn: Mutex<Connection>,
 }
@@ -546,6 +558,45 @@ impl SessionStore {
             })
         })
         .transpose()
+    }
+
+    /// Every session ever recorded, newest first (`started_at` descending) —
+    /// backs the desktop app's past-sessions history screen (task #69), the only
+    /// way to reach a session recorded in an earlier app run once
+    /// `AppState::last_summary` (in-memory only) has been cleared by a restart.
+    pub fn list_sessions(&self) -> Result<Vec<SessionListItem>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, started_at, ended_at,
+                    capture_state_tag, capture_state_recoverable, capture_state_reason
+             FROM sessions
+             ORDER BY started_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<bool>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            let (session_id_str, started_at, ended_at, tag, recoverable, reason) = row?;
+            let session_id = session_id_str
+                .parse::<SessionId>()
+                .map_err(|_| StoreError::SessionNotFound(session_id_str))?;
+            items.push(SessionListItem {
+                session_id,
+                started_at: DateTime::parse_from_rfc3339(&started_at)?.with_timezone(&Utc),
+                ended_at: ended_at.map(|s| DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc))).transpose()?,
+                capture_state: state_codec::decode_capture_state(&tag, recoverable, reason)?,
+            });
+        }
+        Ok(items)
     }
 
     /// Finds sessions a previous process instance left in a non-terminal

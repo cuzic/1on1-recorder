@@ -24,6 +24,11 @@ use crate::app_state::AppState;
 pub enum Screen {
     Main,
     Settings,
+    /// Task #69's past-sessions list (`history::History`) — reachable so a
+    /// session recorded in an earlier app run can still be selected for
+    /// summary generation/export once `AppState::last_summary` (in-memory
+    /// only) has been cleared by a restart.
+    History,
 }
 
 /// The live-transcription STT providers exposed in the picker (#49). Wraps
