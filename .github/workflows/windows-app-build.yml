@@ -12,10 +12,10 @@ name: Windows App Build & Test
 # predates the real app's windows-supervisor/live-transcription features and was
 # never a gate for them.
 #
-# No Tier 1 (real-capture E2E) job here yet, unlike macOS's `e2e-best-effort`:
-# there is no established headless-CI virtual-microphone equivalent to macOS's
-# BlackHole in use in this repo yet. Confident end-to-end verification still
-# depends on a manual real-Windows pass (see the project's task list, task #9).
+# Tier 1 (`e2e-best-effort`) is the windows-latest analogue of macos-build.yml's
+# own `e2e-best-effort` job — same non-gating philosophy, see its comments below.
+# Confident end-to-end verification still depends on a manual real-Windows pass
+# (see the project's task list, task #9).
 
 on:
   push:
@@ -95,3 +95,67 @@ jobs:
         run: |
           cargo test -p capture-windows --target x86_64-pc-windows-msvc
           cargo test -p app-service --features live-transcription --target x86_64-pc-windows-msvc
+
+  e2e-best-effort:
+    runs-on: windows-latest
+    needs: build
+    # This job is allowed to fail without turning the overall check red — the
+    # windows-latest runner image ships with no audio device at all (no sound card
+    # in the VM: WASAPI has no default capture/render endpoint until something
+    # provides one), so this installs VB-CABLE, a third-party virtual audio driver,
+    # and rebinds the default recording device to it via AudioDeviceCmdlets (a
+    # community PowerShell module) — all in one CI step, with no reboot. Neither is
+    # a Microsoft- or VB-Audio-supported CI mechanism, and whether the driver is
+    # actually usable without a reboot on this runner image is exactly what this
+    # job exists to find out. Treat a red/skipped result here as "unable to verify
+    # automatically today", not as a real regression signal — same philosophy as
+    # macos-build.yml's own e2e-best-effort job.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install VB-CABLE (virtual audio device)
+        # Downloaded directly from VB-Audio's own site (not a third-party-bundled
+        # redistribution of the driver pack) for supply-chain trust. Installs a
+        # linked "CABLE Input" (playback) / "CABLE Output" (recording) pair — `-i -h`
+        # is VB-CABLE's own documented silent-install switch pair (`-u -h` to
+        # uninstall), not a Windows-standard convention.
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip" -OutFile vbcable.zip
+          Expand-Archive -Path vbcable.zip -DestinationPath vbcable
+          Start-Process -FilePath "vbcable\VBCABLE_Setup_x64.exe" -ArgumentList "-i","-h" -Wait -NoNewWindow
+
+      - name: Set CABLE Output as the default recording device
+        # No official CLI ships with VB-CABLE for this; AudioDeviceCmdlets
+        # (community module, frgnca/AudioDeviceCmdlets) is the commonly used
+        # workaround. `Set-AudioDevice` without `-DefaultOnly` sets both the plain
+        # default and the default-communications role, matching every `DeviceRole`
+        # capture-windows's `resolve_capture_device` can be asked to resolve.
+        shell: pwsh
+        run: |
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser
+          Import-Module AudioDeviceCmdlets
+          Get-AudioDevice -List
+          $recording = Get-AudioDevice -List | Where-Object { $_.Type -eq "Recording" -and $_.Name -like "*CABLE Output*" }
+          if (-not $recording) { throw "CABLE Output recording device not found" }
+          Set-AudioDevice -ID $recording.ID
+
+      - name: Build smoke-test example
+        run: cargo build -p capture-windows --example smoke_test --target x86_64-pc-windows-msvc
+
+      - name: Run capture smoke test
+        shell: pwsh
+        run: .\target\x86_64-pc-windows-msvc\debug\examples\smoke_test.exe --duration-secs 10 --out smoke-test.raw
+
+      - name: Assert audio data was actually captured
+        shell: bash
+        run: ./scripts/ci/assert-segment-written.sh smoke-test.raw
