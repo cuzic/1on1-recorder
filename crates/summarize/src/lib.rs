@@ -138,6 +138,48 @@ pub async fn summarize(
         .ok_or(SummarizeError::EmptyResponse)
 }
 
+/// Unifies [`SummarizeError`] (the `genai` path) and [`cli_backend::CliSummarizeError`]
+/// (the CLI-subprocess path) so [`Summarizer::summarize`] has one return type
+/// regardless of which execution path a given provider uses.
+#[derive(Debug, thiserror::Error)]
+pub enum SummarizerError {
+    #[error(transparent)]
+    Genai(#[from] SummarizeError),
+    #[error(transparent)]
+    Cli(#[from] cli_backend::CliSummarizeError),
+}
+
+/// Common interface over the two ways this crate turns a transcript into a summary
+/// (a `genai::Client` call vs. a `claude`/`codex` CLI subprocess), so callers can
+/// build one `Box<dyn Summarizer>` up front and then call it uniformly — see
+/// `stt-api`'s `SttProvider`/`SttSession` for the same `async_trait` pattern.
+#[async_trait::async_trait]
+pub trait Summarizer: Send + Sync {
+    async fn summarize(&self, turns: &[TranscriptTurn], options: &SummarizeOptions) -> Result<String, SummarizerError>;
+}
+
+/// [`Summarizer`] backed by a `genai::Client` — covers both plain API-key providers
+/// and Vertex AI providers ([`build_vertex_client`]), since the two differ only in
+/// how the `Client` is constructed, not in how it's called.
+pub struct GenaiSummarizer(pub Client);
+
+#[async_trait::async_trait]
+impl Summarizer for GenaiSummarizer {
+    async fn summarize(&self, turns: &[TranscriptTurn], options: &SummarizeOptions) -> Result<String, SummarizerError> {
+        Ok(summarize(&self.0, turns, options).await?)
+    }
+}
+
+/// [`Summarizer`] backed by a `claude`/`codex` CLI subprocess (#59).
+pub struct CliSummarizer(pub cli_backend::CliBackend);
+
+#[async_trait::async_trait]
+impl Summarizer for CliSummarizer {
+    async fn summarize(&self, turns: &[TranscriptTurn], options: &SummarizeOptions) -> Result<String, SummarizerError> {
+        Ok(cli_backend::summarize_via_cli(self.0, turns, options).await?)
+    }
+}
+
 fn build_chat_request(turns: &[TranscriptTurn], options: &SummarizeOptions) -> ChatRequest {
     let system = options
         .system_prompt

@@ -443,21 +443,19 @@ pub fn App() -> Element {
             }
             let options = summarize::SummarizeOptions::new(model.clone());
 
-            // Three independent execution paths: a `claude`/`codex` CLI subprocess
-            // (#59, no API key needed), Google Vertex AI (a GCP project/location/
-            // service-account bundle), and plain `genai` (a bare API key) — see
-            // `SummaryProvider::uses_cli`/`is_vertex`.
-            let result: Result<String, String> = if let Some(backend) = provider.cli_backend() {
-                summarize::cli_backend::summarize_via_cli(backend, &turns, &options).await.map_err(|e| e.to_string())
+            // Three independent ways to build a `Summarizer`: a `claude`/`codex` CLI
+            // subprocess (#59, no API key needed), Google Vertex AI (a GCP project/
+            // location/service-account bundle), and plain `genai` (a bare API key) —
+            // see `SummaryProvider::uses_cli`/`is_vertex`. Once built, all three are
+            // invoked identically below.
+            let summarizer: Result<Box<dyn summarize::Summarizer>, String> = if let Some(backend) = provider.cli_backend() {
+                Ok(Box::new(summarize::CliSummarizer(backend)))
             } else if provider.is_vertex() {
                 // `matches!(stored_credential, Some(Err(_)))` already returned above,
                 // so this is `Some(Ok(_))`.
                 let raw = stored_credential.and_then(Result::ok).unwrap_or_default();
                 match serde_json::from_str::<summarize::VertexCredentials>(&raw) {
-                    Ok(credentials) => {
-                        let client = summarize::build_vertex_client(credentials);
-                        summarize::summarize(&client, &turns, &options).await.map_err(|e| e.to_string())
-                    }
+                    Ok(credentials) => Ok(Box::new(summarize::GenaiSummarizer(summarize::build_vertex_client(credentials)))),
                     Err(e) => Err(format!("認証情報の読み込みに失敗しました: {e}")),
                 }
             } else {
@@ -465,7 +463,12 @@ pub fn App() -> Element {
                 let account = provider.api_key_account().expect("genai providers have an api_key_account");
                 let resolver = summarize::credential_store_auth_resolver(state.credential_store.clone(), account);
                 let client = genai::Client::builder().with_auth_resolver(resolver).build();
-                summarize::summarize(&client, &turns, &options).await.map_err(|e| e.to_string())
+                Ok(Box::new(summarize::GenaiSummarizer(client)))
+            };
+
+            let result: Result<String, String> = match summarizer {
+                Ok(summarizer) => summarizer.summarize(&turns, &options).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e),
             };
 
             match result {
