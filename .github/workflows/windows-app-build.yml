@@ -138,9 +138,20 @@ jobs:
         # workaround. `Set-AudioDevice` without `-DefaultOnly` sets both the plain
         # default and the default-communications role, matching every `DeviceRole`
         # capture-windows's `resolve_capture_device` can be asked to resolve.
-        shell: pwsh
+        #
+        # shell: powershell (Windows PowerShell 5.1), not pwsh (7): pwsh's
+        # PackageManagement doesn't have the legacy NuGet provider bootstrapped by
+        # default, so `Install-PackageProvider -Name NuGet` fails there with "No
+        # match was found for the specified search criteria for the provider
+        # 'NuGet'" — a well-known pwsh-vs-Windows-PowerShell gap, not specific to
+        # this package. 5.1's built-in bootstrap handles it.
+        shell: powershell
         run: |
-          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+          try {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+          } catch {
+            Write-Host "Install-PackageProvider failed, continuing (Install-Module -Force below should still bootstrap it): $_"
+          }
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
           Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser
           Import-Module AudioDeviceCmdlets
