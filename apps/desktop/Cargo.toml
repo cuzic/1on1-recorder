@@ -30,6 +30,7 @@ stt-deepgram = { path = "../../crates/stt-deepgram" }
 stt-openai = { path = "../../crates/stt-openai" }
 stt-google = { path = "../../crates/stt-google" }
 stt-assemblyai = { path = "../../crates/stt-assemblyai" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 summarize = { path = "../../crates/summarize" }
 # For building the `genai::Client` that `summarize::summarize` (#38) takes — the
@@ -60,3 +61,6 @@ crossbeam-channel = "0.5"
 
 [target.'cfg(all(not(windows), not(target_os = "macos")))'.dependencies]
 app-service = { path = "../../crates/app-service" }
+
+[dev-dependencies]
+tempfile = "3"

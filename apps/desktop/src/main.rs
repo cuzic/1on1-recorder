@@ -1,4 +1,5 @@
 mod actions;
+mod app_settings;
 mod app_state;
 mod config;
 mod level;
@@ -67,11 +68,15 @@ fn main() {
     let token_provider = Arc::new(credential_store::CredentialStoreTokenProvider::new(credential_store.clone(), config.credential_service.clone(), config.credential_account.clone()));
     let adapter = Arc::new(upload_client::HttpUploadClient::new(config.api_base_url.clone(), Duration::from_secs(30), token_provider));
 
+    let app_settings = app_settings::AppSettings::load(&app_data_dir);
+
     let state = Arc::new(AppState {
         store,
         adapter,
         config,
         credential_store,
+        app_data_dir: app_data_dir.clone(),
+        app_settings: Mutex::new(app_settings),
         consent_confirmed: Mutex::new(false),
         current: Mutex::new(None),
         last_error: Mutex::new(None),
