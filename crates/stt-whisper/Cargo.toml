@@ -1,0 +1,41 @@
+[package]
+name = "stt-whisper"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "stt-api adapter for local/offline speech-to-text via whisper.cpp (whisper-rs). SPIKE / design-validation scaffold, not yet wired into app-service — see src/lib.rs module docs for the design tradeoffs and open questions before treating this as production-ready."
+readme = "README.md"
+keywords = ["speech-to-text", "stt", "whisper", "offline", "local"]
+categories = ["multimedia::audio"]
+
+# NOTE (native build dependency — read before adding this crate to any build you care
+# about the speed of): unlike stt-deepgram/stt-openai/stt-google/stt-assemblyai (pure-Rust
+# WebSocket clients with zero native code), `whisper-rs` depends on `whisper-rs-sys`, which
+# compiles whisper.cpp (C/C++) from source via `cmake` at build time. Building this crate
+# therefore requires a working `cmake` + C/C++ toolchain (make + g++/clang; additionally a
+# platform SDK such as Xcode's Accelerate/CoreML on macOS if the optional `coreml` feature
+# below is ever enabled, or a CUDA/ROCm/Vulkan SDK for the `cuda`/`hipblas`/`vulkan`
+# features) on every machine that builds it — a clean `cargo build -p stt-whisper` can take
+# minutes even before whisper-rs's own Rust bindings compile, versus seconds for the four
+# existing STT crates. This is why the root `Cargo.toml` lists `stt-whisper` in
+# `[workspace] members` (so `cargo build -p stt-whisper` / `--workspace` work) but
+# deliberately *excludes* it from `[workspace] default-members` (so a plain `cargo
+# build`/`cargo check` with no `-p`/`--workspace` flag — what most contributors run day to
+# day — does not pay this cost). See the crate root doc comment (src/lib.rs) for why this
+# same reasoning implies `app-service` should only ever pull this crate in behind an
+# optional Cargo feature, not a hard dependency, once/if it moves past the spike stage.
+[dependencies]
+async-trait = "0.1"
+stt-api = { path = "../stt-api" }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tracing = "0.1"
+# `default-features = false` matches whisper-rs's own `default = []` (no GPU backend is
+# enabled unless a feature below is turned on) — see src/lib.rs's "CPU推論のみでの
+# リアルタイム性能" section for why that default matters here. Downstream integration can
+# opt into `metal` (macOS), `cuda`, `vulkan`, etc. by enabling the matching whisper-rs
+# feature in the consuming crate's Cargo.toml.
+whisper-rs = { version = "0.16", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

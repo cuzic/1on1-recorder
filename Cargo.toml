@@ -16,6 +16,34 @@ members = [
     "crates/stt-deepgram",
     "crates/stt-google",
     "crates/stt-openai",
+    "crates/stt-whisper",
+    "crates/summarize",
+    "crates/upload-client",
+]
+# `stt-whisper` is deliberately excluded here: unlike every other member, it pulls in
+# whisper-rs's native (cmake + C/C++) build of whisper.cpp, which materially slows down
+# a from-scratch build. `default-members` controls what a plain `cargo build`/`cargo
+# check` (no `-p`/`--workspace`) targets; everything except `stt-whisper` stays in that
+# default set, so day-to-day builds don't pay whisper.cpp's compile cost. Explicitly
+# request it with `cargo build -p stt-whisper` / `--workspace` instead. See
+# crates/stt-whisper/Cargo.toml's top comment and crates/stt-whisper/src/lib.rs's
+# module doc comment for the full rationale.
+default-members = [
+    "apps/desktop",
+    "crates/app-service",
+    "crates/audio-timeline",
+    "crates/capture-api",
+    "crates/capture-macos",
+    "crates/capture-windows",
+    "crates/credential-store",
+    "crates/recorder-domain",
+    "crates/segment-store",
+    "crates/session-store",
+    "crates/stt-api",
+    "crates/stt-assemblyai",
+    "crates/stt-deepgram",
+    "crates/stt-google",
+    "crates/stt-openai",
     "crates/summarize",
     "crates/upload-client",
 ]
