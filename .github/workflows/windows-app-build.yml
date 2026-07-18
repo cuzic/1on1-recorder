@@ -163,6 +163,20 @@ jobs:
       - name: Build smoke-test example
         run: cargo build -p capture-windows --example smoke_test --target x86_64-pc-windows-msvc
 
+      - name: Ensure Windows Audio services are running
+        # A first attempt at this job failed `IAudioClient::Activate`/`Initialize`
+        # with "Access is denied (0x80070005)" — the classic symptom of
+        # AudioEndpointBuilder/Audiosrv not running, which this runner image
+        # apparently doesn't start by default given it normally has no sound card
+        # at all (see this job's top-level comment). Cheap and safe to call even if
+        # they're already running.
+        shell: pwsh
+        run: |
+          Get-Service AudioEndpointBuilder, Audiosrv | Format-Table -AutoSize
+          Start-Service AudioEndpointBuilder -ErrorAction SilentlyContinue
+          Start-Service Audiosrv -ErrorAction SilentlyContinue
+          Get-Service AudioEndpointBuilder, Audiosrv | Format-Table -AutoSize
+
       - name: Run capture smoke test
         shell: pwsh
         run: .\target\x86_64-pc-windows-msvc\debug\examples\smoke_test.exe --duration-secs 10 --out smoke-test.raw
