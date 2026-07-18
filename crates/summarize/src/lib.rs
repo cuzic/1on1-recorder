@@ -287,14 +287,25 @@ impl VertexCredentials {
 
 const VERTEX_OAUTH_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
-/// Vertex AI's regional REST base (verified 2026-07-17 against
+/// Vertex AI's REST base (verified 2026-07-17 against
 /// <https://docs.cloud.google.com/vertex-ai/docs/reference/rest> — every
 /// `publishers/{publisher}/models/{model}:{method}` call hangs off this prefix).
 /// `genai`'s built-in Vertex adapter would otherwise build this same URL from the
 /// `VERTEX_PROJECT_ID`/`VERTEX_LOCATION` env vars; building it here instead lets
 /// [`build_vertex_client`] avoid touching process-global env state.
+///
+/// The `location == "global"` case is a real, documented Vertex AI location (used by
+/// e.g. `gemini-3.1-pro-preview` and the Claude-on-Vertex global endpoint), but unlike
+/// every regional location it has **no** `{location}-` hostname prefix — the host is
+/// bare `aiplatform.googleapis.com`. Always prefixing (as every other Vertex client
+/// library originally did too, per their own since-fixed bug trackers) would build the
+/// nonexistent host `global-aiplatform.googleapis.com`.
 fn vertex_base_url(project_id: &str, location: &str) -> String {
-    format!("https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/")
+    if location == "global" {
+        format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/")
+    } else {
+        format!("https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/")
+    }
 }
 
 async fn resolve_vertex_token(credentials: &VertexCredentials) -> Result<String, genai::resolver::Error> {
@@ -425,6 +436,14 @@ mod tests {
         assert_eq!(
             vertex_base_url("my-project", "us-central1"),
             "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/"
+        );
+    }
+
+    #[test]
+    fn vertex_base_url_global_location_has_no_host_prefix() {
+        assert_eq!(
+            vertex_base_url("my-project", "global"),
+            "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global/"
         );
     }
 

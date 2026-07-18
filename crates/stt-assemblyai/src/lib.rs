@@ -58,10 +58,34 @@ pub const CREDENTIAL_SERVICE: &str = "1on1-recorder";
 pub const ASSEMBLYAI_API_KEY_ACCOUNT: &str = "assemblyai-api-key";
 
 const STREAMING_URL: &str = "wss://streaming.assemblyai.com/v3/ws";
-const DEFAULT_MODEL: &str = "universal-3-5-pro";
+/// Verified 2026-07-17 against AssemblyAI's own Streaming v3 API reference: the only
+/// valid `speech_model` values are `universal-streaming-english`,
+/// `universal-streaming-multilingual`, and `u3-rt-pro` (Universal-3 Pro Streaming,
+/// the highest-accuracy option — this project's meeting-transcription use case wants
+/// accuracy over the cheaper English-only/multilingual defaults). Any other value is
+/// rejected by the server and the session never starts.
+const DEFAULT_MODEL: &str = "u3-rt-pro";
 /// This adapter sends raw PCM16 (`encoding=pcm_s16le`), which is the only encoding
 /// where AssemblyAI actually honors `sample_rate` rather than ignoring it.
 const SUPPORTED_SAMPLE_RATE_HZ: u32 = 16_000;
+const BYTES_PER_SAMPLE: usize = 2; // PCM16 mono, little-endian.
+
+/// AssemblyAI Streaming v3 requires each binary audio frame to carry 50-1000ms of
+/// audio at the negotiated sample rate (frames outside that range get the session
+/// closed) — `100ms` is their own documented "good starting point" for a custom
+/// pipeline, so [`AssemblyAISession`] buffers caller-provided PCM up to this size
+/// before flushing, rather than forwarding whatever chunk size the caller happens to
+/// send (which, at 16kHz, can be well under 50ms — e.g. a 10ms capture-side chunk is
+/// only 320 bytes).
+const TARGET_CHUNK_MS: u32 = 100;
+/// The protocol's documented floor; a trailing buffered remainder shorter than this
+/// at [`AssemblyAISession::finalize`] time is dropped rather than sent, since sending
+/// it would just get the session closed instead of transcribed.
+const MIN_CHUNK_MS: u32 = 50;
+
+fn chunk_bytes(ms: u32) -> usize {
+    (SUPPORTED_SAMPLE_RATE_HZ as usize * ms as usize / 1000) * BYTES_PER_SAMPLE
+}
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -120,6 +144,7 @@ impl SttProvider for AssemblyAIProvider {
             Box::new(AssemblyAISession {
                 commands: cmd_tx,
                 drained: Some(drained_rx),
+                pending: Vec::new(),
             }),
             event_rx,
         ))
@@ -137,23 +162,41 @@ enum WsCommand {
 struct AssemblyAISession {
     commands: mpsc::UnboundedSender<WsCommand>,
     drained: Option<oneshot::Receiver<Result<(), SttError>>>,
+    /// PCM16 bytes accumulated across `send_audio` calls, not yet flushed as a
+    /// `WsCommand::Audio` frame — see `TARGET_CHUNK_MS`'s doc comment.
+    pending: Vec<u8>,
 }
 
 #[async_trait]
 impl SttSession for AssemblyAISession {
     async fn send_audio(&mut self, chunk: AudioChunk<'_>) -> Result<(), SttError> {
-        let mut bytes = Vec::with_capacity(chunk.pcm.len() * 2);
+        self.pending.reserve(chunk.pcm.len() * BYTES_PER_SAMPLE);
         for &sample in chunk.pcm {
             let clamped = sample.clamp(-1.0, 1.0);
             let pcm16 = (clamped * i16::MAX as f32).round() as i16;
-            bytes.extend_from_slice(&pcm16.to_le_bytes());
+            self.pending.extend_from_slice(&pcm16.to_le_bytes());
         }
-        self.commands
-            .send(WsCommand::Audio(bytes))
-            .map_err(|_| SttError::SessionClosed)
+        let target = chunk_bytes(TARGET_CHUNK_MS);
+        while self.pending.len() >= target {
+            let frame: Vec<u8> = self.pending.drain(..target).collect();
+            self.commands
+                .send(WsCommand::Audio(frame))
+                .map_err(|_| SttError::SessionClosed)?;
+        }
+        Ok(())
     }
 
     async fn finalize(mut self: Box<Self>) -> Result<(), SttError> {
+        // Flush a trailing buffered remainder if it clears the protocol's 50ms
+        // floor; a `send_audio` loop can never leave `pending` above `TARGET_CHUNK_MS`
+        // worth of bytes (it flushes as soon as that's reached), so this is always
+        // within the 50-1000ms range and safe to send as a single final frame.
+        if self.pending.len() >= chunk_bytes(MIN_CHUNK_MS) {
+            let frame = std::mem::take(&mut self.pending);
+            self.commands
+                .send(WsCommand::Audio(frame))
+                .map_err(|_| SttError::SessionClosed)?;
+        }
         self.commands
             .send(WsCommand::Close)
             .map_err(|_| SttError::SessionClosed)?;
@@ -395,7 +438,7 @@ mod tests {
         assert!(url.starts_with(STREAMING_URL));
 
         let params = query_pairs(&url);
-        assert_eq!(params["speech_model"], "universal-3-5-pro");
+        assert_eq!(params["speech_model"], DEFAULT_MODEL);
         assert_eq!(params["sample_rate"], "16000");
         assert_eq!(params["encoding"], "pcm_s16le");
         assert_eq!(params["language_codes"], r#"["ja"]"#);

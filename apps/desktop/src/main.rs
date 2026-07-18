@@ -27,7 +27,29 @@ const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 /// platform data dir is not app-specific, so the app name is appended here to get
 /// the same effective layout (`.../1on1-recorder/sessions`, `.../credentials`, etc).
 fn app_data_dir() -> std::path::PathBuf {
-    dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("1on1-recorder")
+    let base = dirs::data_dir().unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("1on1-recorder");
+    migrate_from_old_tauri_app_data_dir(&base, &dir);
+    dir
+}
+
+/// One-time migration for local installs made before the Dioxus migration (#30),
+/// when this directory was namespaced under the old Tauri shell's
+/// `tauri.conf.json` `identifier` (`com.example.onononerecorder`) instead of the
+/// plain app name used above. Without this, any credentials/session history saved
+/// by the old Tauri build would silently appear missing under the new path rather
+/// than carrying over. Only renames when the new directory doesn't exist yet, so it
+/// never clobbers a install that already has both (e.g. a stale old directory left
+/// behind after a previous successful migration).
+fn migrate_from_old_tauri_app_data_dir(base: &std::path::Path, new_dir: &std::path::Path) {
+    let old_dir = base.join("com.example.onononerecorder");
+    if new_dir.exists() || !old_dir.exists() {
+        return;
+    }
+    match std::fs::rename(&old_dir, new_dir) {
+        Ok(()) => tracing::info!(?old_dir, ?new_dir, "migrated app data directory from old Tauri shell's identifier-based path"),
+        Err(err) => tracing::warn!(%err, ?old_dir, ?new_dir, "failed to migrate old Tauri app data directory"),
+    }
 }
 
 fn main() {

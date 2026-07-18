@@ -117,6 +117,11 @@ pub async fn summarize_via_cli(
 
 async fn run_claude(work_dir: &Path, prompt: &str, model: Option<&str>) -> Result<String, CliSummarizeError> {
     let mut command = Command::new(CliBackend::ClaudeCode.binary());
+    // Without this, dropping the `.output()` future (e.g. the caller's `spawn`ed
+    // task getting cancelled) leaves the `claude` subprocess running in the
+    // background instead of killing it — Tokio's `Child` doesn't kill on drop by
+    // default.
+    command.kill_on_drop(true);
     command.current_dir(work_dir).args([
         "--print",
         "--output-format",
@@ -162,6 +167,8 @@ async fn run_codex(work_dir: &Path, prompt: &str, model: Option<&str>) -> Result
     let output_path = work_dir.join("codex-output.txt");
 
     let mut command = Command::new(CliBackend::Codex.binary());
+    // See `run_claude`'s identical `kill_on_drop` for why this is needed.
+    command.kill_on_drop(true);
     command
         .current_dir(work_dir)
         .args(["exec", "-s", "read-only", "--skip-git-repo-check", "--ephemeral", "-C"])

@@ -323,7 +323,7 @@ mod stt_wiring {
                         }
                     }
                 }
-                maybe = self_events.as_mut().unwrap().recv(), if self_events.is_some() => {
+                maybe = recv_track_event(&mut self_events) => {
                     match maybe {
                         Some(event) => {
                             note_event(&mut self_last_interim, &event);
@@ -338,7 +338,7 @@ mod stt_wiring {
                         }
                     }
                 }
-                maybe = remote_events.as_mut().unwrap().recv(), if remote_events.is_some() => {
+                maybe = recv_track_event(&mut remote_events) => {
                     match maybe {
                         Some(event) => {
                             note_event(&mut remote_last_interim, &event);
@@ -354,6 +354,21 @@ mod stt_wiring {
                     }
                 }
             }
+        }
+    }
+
+    /// Awaits the next event for a track whose events channel may already be
+    /// `None` (that track's session never started, or already closed). Used
+    /// instead of `events.as_mut().unwrap().recv()` behind a `select!` `if`
+    /// guard: `tokio::select!` still evaluates a disabled branch's async
+    /// expression (just doesn't poll it — see the `select!` macro docs), so an
+    /// `unwrap()` there would panic as soon as the *other* track's branch stays
+    /// enabled while this one is `None`. Awaiting `pending()` for the `None` case
+    /// instead means the branch simply never becomes ready, with no unwrap.
+    async fn recv_track_event(events: &mut Option<UnboundedReceiver<SttEvent>>) -> Option<SttEvent> {
+        match events {
+            Some(rx) => rx.recv().await,
+            None => std::future::pending().await,
         }
     }
 

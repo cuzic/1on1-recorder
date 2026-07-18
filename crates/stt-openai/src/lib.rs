@@ -265,7 +265,15 @@ async fn reader_task(
 
         match serde_json::from_str::<OpenAiServerEvent>(&text) {
             Ok(OpenAiServerEvent::InputAudioBufferCommitted { item_id }) => {
-                if draining.load(Ordering::SeqCst) && expected_item_id.is_none() {
+                // Keep overwriting rather than latching onto the first commit seen
+                // while draining: `finalize()` sends at most one commit and never
+                // sends more audio afterward (it consumes `self: Box<Self>`), so our
+                // own manual commit is always the *last* `committed` event to arrive
+                // while draining — the first one can be a VAD auto-commit for an
+                // unrelated turn that was already in flight when finalize() ran, and
+                // locking onto it would mean our own commit's `completed` event is
+                // never recognized (see the module doc comment's race description).
+                if draining.load(Ordering::SeqCst) {
                     expected_item_id = Some(item_id);
                 }
             }

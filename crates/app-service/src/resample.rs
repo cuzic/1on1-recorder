@@ -10,10 +10,13 @@
 use audio_timeline::linear_resample;
 
 /// Resamples `samples` (mono PCM `f32`, nominally `-1.0..=1.0`) from `from_hz` to
-/// `to_hz`. A no-op clone when the rates already match or `samples` is empty (mirrors
-/// `normalize::normalize_to_mono`'s same two short-circuits).
+/// `to_hz`. A no-op clone when the rates already match, `samples` is empty, or
+/// `from_hz` is 0 (mirrors `normalize::normalize_to_mono`'s same short-circuits;
+/// `from_hz == 0` would otherwise divide-by-zero into an `f64::INFINITY` target
+/// length that saturates to `usize::MAX` on the cast below, then OOMs `linear_resample`'s
+/// allocation).
 pub fn resample(samples: &[f32], from_hz: u32, to_hz: u32) -> Vec<f32> {
-    if from_hz == to_hz || samples.is_empty() {
+    if from_hz == to_hz || from_hz == 0 || samples.is_empty() {
         return samples.to_vec();
     }
     let target_len = ((samples.len() as f64) * to_hz as f64 / from_hz as f64).round() as usize;
@@ -32,6 +35,11 @@ mod tests {
     #[test]
     fn empty_input_stays_empty() {
         assert!(resample(&[], 48_000, 16_000).is_empty());
+    }
+
+    #[test]
+    fn zero_from_hz_is_returned_unchanged_instead_of_panicking() {
+        assert_eq!(resample(&[0.1, 0.2, 0.3], 0, 16_000), vec![0.1, 0.2, 0.3]);
     }
 
     #[test]
