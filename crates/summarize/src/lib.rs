@@ -22,6 +22,8 @@ use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
 use serde::{Deserialize, Serialize};
 
+pub mod cli_backend;
+
 /// OS keyring service name under which all provider API keys used by this crate are
 /// stored (design.md §12.4). Account names are per-provider, e.g. [`CLAUDE_API_KEY_ACCOUNT`].
 pub const CREDENTIAL_SERVICE: &str = "1on1-recorder";
@@ -145,6 +147,19 @@ fn build_chat_request(turns: &[TranscriptTurn], options: &SummarizeOptions) -> C
         ChatMessage::system(system),
         ChatMessage::user(render_transcript(turns)),
     ])
+}
+
+/// Builds the single prompt string [`cli_backend::summarize_via_cli`] hands to the
+/// `claude`/`codex` CLIs, which — unlike `genai`'s `ChatRequest` — take one prompt
+/// argument rather than separate system/user messages. Reuses the same system
+/// prompt resolution and transcript rendering as [`build_chat_request`] so the two
+/// execution paths (genai vs. CLI subprocess) produce equivalent input.
+pub(crate) fn build_cli_prompt(turns: &[TranscriptTurn], options: &SummarizeOptions) -> String {
+    let system = options
+        .system_prompt
+        .as_deref()
+        .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+    format!("{system}\n\n{}", render_transcript(turns))
 }
 
 fn render_transcript(turns: &[TranscriptTurn]) -> String {

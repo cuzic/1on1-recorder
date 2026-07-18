@@ -138,10 +138,12 @@ pub(crate) enum SummaryProvider {
     ClaudeVertex,
     GeminiVertex,
     ClaudeBedrock,
+    ClaudeCli,
+    Codex,
 }
 
 impl SummaryProvider {
-    const ALL: [SummaryProvider; 9] = [
+    const ALL: [SummaryProvider; 11] = [
         SummaryProvider::Claude,
         SummaryProvider::OpenAi,
         SummaryProvider::Gemini,
@@ -151,6 +153,8 @@ impl SummaryProvider {
         SummaryProvider::ClaudeVertex,
         SummaryProvider::GeminiVertex,
         SummaryProvider::ClaudeBedrock,
+        SummaryProvider::ClaudeCli,
+        SummaryProvider::Codex,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -164,6 +168,8 @@ impl SummaryProvider {
             SummaryProvider::ClaudeVertex => "claude-vertex",
             SummaryProvider::GeminiVertex => "gemini-vertex",
             SummaryProvider::ClaudeBedrock => "claude-bedrock",
+            SummaryProvider::ClaudeCli => "claude-cli",
+            SummaryProvider::Codex => "codex",
         }
     }
 
@@ -178,6 +184,8 @@ impl SummaryProvider {
             SummaryProvider::ClaudeVertex => "Claude (Google Vertex AI)",
             SummaryProvider::GeminiVertex => "Gemini (Google Vertex AI)",
             SummaryProvider::ClaudeBedrock => "Claude (AWS Bedrock)",
+            SummaryProvider::ClaudeCli => "Claude (Claude Code CLI)",
+            SummaryProvider::Codex => "Codex (Codex CLI)",
         }
     }
 
@@ -207,26 +215,34 @@ impl SummaryProvider {
             // name — verified against `genai` 0.7.0-beta.13's
             // `adapter/adapters/bedrock/shared.rs` curated model list.
             SummaryProvider::ClaudeBedrock => "bedrock_api::anthropic.claude-sonnet-4-5-20250929-v1:0",
+            // These two go through `claude --model`/`codex -m`, not `genai` — plain
+            // CLI model aliases, not `genai` model spec strings.
+            SummaryProvider::ClaudeCli => "sonnet",
+            SummaryProvider::Codex => "gpt-5.5",
         }
     }
 
-    /// `credential-store` account this provider's credential is saved under.
+    /// `credential-store` account this provider's credential is saved under, or
+    /// `None` for [`SummaryProvider::ClaudeCli`]/[`SummaryProvider::Codex`] (see
+    /// [`Self::uses_cli`]): both authenticate as the `claude`/`codex` CLI's own
+    /// OAuth/subscription login, so there is no API key for this app to store.
     /// [`SummaryProvider::ClaudeVertex`]/[`SummaryProvider::GeminiVertex`] store a
     /// [`summarize::VertexCredentials`] JSON blob here instead of a bare API key
     /// (see [`Self::is_vertex`]) — `credential-store` doesn't care about the shape
     /// of what's stored, so the same account-based "設定済み/未設定" check in
     /// `summary_provider_is_configured` works for both credential shapes unchanged.
-    pub(crate) fn api_key_account(self) -> &'static str {
+    pub(crate) fn api_key_account(self) -> Option<&'static str> {
         match self {
-            SummaryProvider::Claude => summarize::CLAUDE_API_KEY_ACCOUNT,
-            SummaryProvider::OpenAi => summarize::OPENAI_API_KEY_ACCOUNT,
-            SummaryProvider::Gemini => summarize::GEMINI_API_KEY_ACCOUNT,
-            SummaryProvider::Groq => summarize::GROQ_API_KEY_ACCOUNT,
-            SummaryProvider::DeepSeek => summarize::DEEPSEEK_API_KEY_ACCOUNT,
-            SummaryProvider::XAi => summarize::XAI_API_KEY_ACCOUNT,
-            SummaryProvider::ClaudeVertex => summarize::CLAUDE_VERTEX_CREDENTIALS_ACCOUNT,
-            SummaryProvider::GeminiVertex => summarize::GEMINI_VERTEX_CREDENTIALS_ACCOUNT,
-            SummaryProvider::ClaudeBedrock => summarize::BEDROCK_API_KEY_ACCOUNT,
+            SummaryProvider::Claude => Some(summarize::CLAUDE_API_KEY_ACCOUNT),
+            SummaryProvider::OpenAi => Some(summarize::OPENAI_API_KEY_ACCOUNT),
+            SummaryProvider::Gemini => Some(summarize::GEMINI_API_KEY_ACCOUNT),
+            SummaryProvider::Groq => Some(summarize::GROQ_API_KEY_ACCOUNT),
+            SummaryProvider::DeepSeek => Some(summarize::DEEPSEEK_API_KEY_ACCOUNT),
+            SummaryProvider::XAi => Some(summarize::XAI_API_KEY_ACCOUNT),
+            SummaryProvider::ClaudeVertex => Some(summarize::CLAUDE_VERTEX_CREDENTIALS_ACCOUNT),
+            SummaryProvider::GeminiVertex => Some(summarize::GEMINI_VERTEX_CREDENTIALS_ACCOUNT),
+            SummaryProvider::ClaudeBedrock => Some(summarize::BEDROCK_API_KEY_ACCOUNT),
+            SummaryProvider::ClaudeCli | SummaryProvider::Codex => None,
         }
     }
 
@@ -241,6 +257,26 @@ impl SummaryProvider {
     /// `stt_google::GoogleSttCredentials`.
     pub(crate) fn is_vertex(self) -> bool {
         matches!(self, SummaryProvider::ClaudeVertex | SummaryProvider::GeminiVertex)
+    }
+
+    /// `true` for [`SummaryProvider::ClaudeCli`]/[`SummaryProvider::Codex`] (#59),
+    /// which shell out to the `claude`/`codex` CLIs (`summarize::cli_backend`)
+    /// instead of calling a provider API through `genai` — no API key, so the
+    /// "credential registration" section shows CLI-detection status instead of an
+    /// input field, and `ui.rs`'s generate-summary handler dispatches to
+    /// `summarize::cli_backend::summarize_via_cli` rather than `summarize::summarize`.
+    pub(crate) fn uses_cli(self) -> bool {
+        matches!(self, SummaryProvider::ClaudeCli | SummaryProvider::Codex)
+    }
+
+    /// The [`summarize::cli_backend::CliBackend`] this provider runs on. Only
+    /// meaningful when [`Self::uses_cli`] is `true`.
+    pub(crate) fn cli_backend(self) -> Option<summarize::cli_backend::CliBackend> {
+        match self {
+            SummaryProvider::ClaudeCli => Some(summarize::cli_backend::CliBackend::ClaudeCode),
+            SummaryProvider::Codex => Some(summarize::cli_backend::CliBackend::Codex),
+            _ => None,
+        }
     }
 
     /// Representative current models offered in the settings picker's `<select>`
@@ -265,6 +301,11 @@ impl SummaryProvider {
                 "bedrock_api::anthropic.claude-opus-4-1-20250805-v1:0",
                 "bedrock_api::anthropic.claude-haiku-4-5-20251001-v1:0",
             ],
+            // `claude --model` aliases (see `claude --help`), not `genai` model
+            // spec strings.
+            SummaryProvider::ClaudeCli => &["sonnet", "opus", "haiku"],
+            // Model slugs from this sandbox's `~/.codex/models_cache.json`.
+            SummaryProvider::Codex => &["gpt-5.5", "gpt-5.5-codex"],
         }
     }
 }
@@ -285,8 +326,31 @@ fn load_active_summary_provider(state: &AppState) -> SummaryProvider {
         .unwrap_or(SummaryProvider::Claude)
 }
 
+/// "設定済み/未設定" for the provider picker. [`SummaryProvider::uses_cli`]
+/// providers have no stored credential to check (#59) — they're always shown as
+/// usable here; whether the underlying CLI is actually installed is checked
+/// separately (async, since it spawns a subprocess) in the credential section.
 fn summary_provider_is_configured(state: &AppState, provider: SummaryProvider) -> bool {
-    state.credential_store.load(summarize::CREDENTIAL_SERVICE, provider.api_key_account()).is_ok()
+    match provider.api_key_account() {
+        Some(account) => state.credential_store.load(summarize::CREDENTIAL_SERVICE, account).is_ok(),
+        None => true,
+    }
+}
+
+/// Status text for the "資格情報の登録" section when `provider` is CLI-based
+/// (#59) — replaces the API key form, since these providers have nothing to save.
+/// `available` is the latest [`summarize::cli_backend::CliBackend::is_available`]
+/// result for `provider` (see the `use_effect` that keeps `summary_cli_available`
+/// in sync with `summary_edit_provider`).
+fn summary_cli_status_text(provider: SummaryProvider, available: Option<bool>) -> String {
+    let Some(backend) = provider.cli_backend() else {
+        return String::new();
+    };
+    match available {
+        Some(true) => format!("{} コマンドを検出しました(ログイン状態は要約生成時に確認されます)", backend.binary()),
+        Some(false) => format!("{} コマンドが見つかりません。インストールしてPATHに追加し、ログインしてください", backend.binary()),
+        None => "確認中...".to_string(),
+    }
 }
 
 const STYLE: &str = r#"
@@ -399,6 +463,24 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
     let mut summary_vertex_location_input = use_signal(|| "global".to_string());
     let mut summary_vertex_json_input = use_signal(String::new);
     let mut summary_credential_message = use_signal(|| None::<String>);
+    // `Some(true/false)` once `<binary> --version` has been checked for the
+    // currently-edited CLI-based provider (#59); `None` while checking or when
+    // `summary_edit_provider()` isn't CLI-based. Re-checked whenever the edited
+    // provider changes (see the `use_effect` below), since detection is async
+    // (spawns a subprocess) and can't happen inline in `summary_provider_is_configured`.
+    let mut summary_cli_available = use_signal(|| None::<bool>);
+    use_effect(move || {
+        let provider = summary_edit_provider();
+        match provider.cli_backend() {
+            Some(backend) => {
+                summary_cli_available.set(None);
+                spawn(async move {
+                    summary_cli_available.set(Some(backend.is_available().await));
+                });
+            }
+            None => summary_cli_available.set(None),
+        }
+    });
 
     // ---- 要約: 使用するプロバイダ・モデルの選択 ----
     let mut summary_active_provider = use_signal({
@@ -537,6 +619,14 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
         move |_| {
             let current_provider = summary_edit_provider();
 
+            // CLI-based providers (#59) have no credential to save — the section
+            // shows CLI-detection status instead of a form, so this handler is
+            // unreachable via the UI for them (no save button is rendered), but
+            // guard anyway rather than unwrapping `api_key_account()`.
+            let Some(api_key_account) = current_provider.api_key_account() else {
+                return;
+            };
+
             if current_provider.is_vertex() {
                 let project = summary_vertex_project_input().trim().to_string();
                 let location = summary_vertex_location_input().trim().to_string();
@@ -553,7 +643,7 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                         return;
                     }
                 };
-                match state.credential_store.save(summarize::CREDENTIAL_SERVICE, current_provider.api_key_account(), &serialized) {
+                match state.credential_store.save(summarize::CREDENTIAL_SERVICE, api_key_account, &serialized) {
                     Ok(()) => {
                         summary_edit_key_configured.set(true);
                         summary_vertex_project_input.set(String::new());
@@ -571,7 +661,7 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                 summary_credential_message.set(Some("APIキーを入力してください".to_string()));
                 return;
             }
-            match state.credential_store.save(summarize::CREDENTIAL_SERVICE, current_provider.api_key_account(), &key) {
+            match state.credential_store.save(summarize::CREDENTIAL_SERVICE, api_key_account, &key) {
                 Ok(()) => {
                     summary_edit_key_configured.set(true);
                     summary_edit_key_input.set(String::new());
@@ -720,51 +810,60 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                         }
                     }
                 }
-                p { class: "status-badge", if summary_edit_key_configured() { "設定済み" } else { "未設定" } }
-                if summary_edit_provider().is_vertex() {
-                    label {
-                        "プロジェクトID"
-                        input {
-                            r#type: "text",
-                            placeholder: "my-gcp-project",
-                            value: "{summary_vertex_project_input}",
-                            oninput: move |e| summary_vertex_project_input.set(e.value()),
-                        }
-                    }
-                    label {
-                        "ロケーション"
-                        input {
-                            r#type: "text",
-                            placeholder: "global",
-                            value: "{summary_vertex_location_input}",
-                            oninput: move |e| summary_vertex_location_input.set(e.value()),
-                        }
-                    }
-                    label {
-                        "サービスアカウントJSON"
-                        textarea {
-                            placeholder: "サービスアカウントキーJSONファイルの中身を貼り付け",
-                            value: "{summary_vertex_json_input}",
-                            oninput: move |e| summary_vertex_json_input.set(e.value()),
-                        }
-                    }
+                if summary_edit_provider().uses_cli() {
+                    // CLI-based providers (#59) authenticate as the `claude`/
+                    // `codex` CLI's own OAuth/subscription login — nothing for
+                    // this app to save, so show detection status instead of a
+                    // form/save button.
+                    p { class: "hint", "APIキーは不要です。このプロバイダは claude/codex CLI 自体のログイン(OAuth/サブスクリプション認証)をそのまま使います。" }
+                    p { class: "status-badge", "{summary_cli_status_text(summary_edit_provider(), summary_cli_available())}" }
                 } else {
-                    if summary_edit_provider() == SummaryProvider::ClaudeBedrock {
-                        p { class: "hint", "AWSコンソールのBedrock「API keys」画面で発行した長期(long-term) APIキーを貼り付けてください。短期(short-term)キーは最大12時間で失効するため、常駐アプリの資格情報には不向きです。" }
-                    }
-                    label {
-                        "APIキー"
-                        input {
-                            r#type: "password",
-                            placeholder: if summary_edit_provider() == SummaryProvider::ClaudeBedrock { "Bedrock APIキー(長期)" } else { "APIキー" },
-                            value: "{summary_edit_key_input}",
-                            oninput: move |e| summary_edit_key_input.set(e.value()),
+                    p { class: "status-badge", if summary_edit_key_configured() { "設定済み" } else { "未設定" } }
+                    if summary_edit_provider().is_vertex() {
+                        label {
+                            "プロジェクトID"
+                            input {
+                                r#type: "text",
+                                placeholder: "my-gcp-project",
+                                value: "{summary_vertex_project_input}",
+                                oninput: move |e| summary_vertex_project_input.set(e.value()),
+                            }
+                        }
+                        label {
+                            "ロケーション"
+                            input {
+                                r#type: "text",
+                                placeholder: "global",
+                                value: "{summary_vertex_location_input}",
+                                oninput: move |e| summary_vertex_location_input.set(e.value()),
+                            }
+                        }
+                        label {
+                            "サービスアカウントJSON"
+                            textarea {
+                                placeholder: "サービスアカウントキーJSONファイルの中身を貼り付け",
+                                value: "{summary_vertex_json_input}",
+                                oninput: move |e| summary_vertex_json_input.set(e.value()),
+                            }
+                        }
+                    } else {
+                        if summary_edit_provider() == SummaryProvider::ClaudeBedrock {
+                            p { class: "hint", "AWSコンソールのBedrock「API keys」画面で発行した長期(long-term) APIキーを貼り付けてください。短期(short-term)キーは最大12時間で失効するため、常駐アプリの資格情報には不向きです。" }
+                        }
+                        label {
+                            "APIキー"
+                            input {
+                                r#type: "password",
+                                placeholder: if summary_edit_provider() == SummaryProvider::ClaudeBedrock { "Bedrock APIキー(長期)" } else { "APIキー" },
+                                value: "{summary_edit_key_input}",
+                                oninput: move |e| summary_edit_key_input.set(e.value()),
+                            }
                         }
                     }
-                }
-                button { class: "primary", onclick: save_summary_credential, "保存" }
-                if let Some(msg) = summary_credential_message() {
-                    p { class: "status-badge", "{msg}" }
+                    button { class: "primary", onclick: save_summary_credential, "保存" }
+                    if let Some(msg) = summary_credential_message() {
+                        p { class: "status-badge", "{msg}" }
+                    }
                 }
             }
 

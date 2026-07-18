@@ -414,8 +414,13 @@ pub fn App() -> Element {
                 .load(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_MODEL_ACCOUNT)
                 .unwrap_or_else(|_| provider.default_model().to_string());
 
-            let stored_credential = state.credential_store.load(summarize::CREDENTIAL_SERVICE, provider.api_key_account());
-            if stored_credential.is_err() {
+            // CLI-based providers (#59) authenticate as the `claude`/`codex` CLI's
+            // own OAuth/subscription login, not a stored API key — this check only
+            // applies to the genai/Vertex paths below (`api_key_account()` is
+            // `None` for them, so `stored_credential` stays `None` and the check
+            // is skipped).
+            let stored_credential = provider.api_key_account().map(|account| state.credential_store.load(summarize::CREDENTIAL_SERVICE, account));
+            if matches!(stored_credential, Some(Err(_))) {
                 let message = if provider.is_vertex() { "設定画面でGoogle Vertex AIの認証情報を設定してください" } else { "設定画面でAPIキーを設定してください" };
                 summary_message.set(Some(message.to_string()));
                 summary_busy.set(false);
@@ -436,29 +441,34 @@ pub fn App() -> Element {
                 summary_busy.set(false);
                 return;
             }
-
-            // `ClaudeVertex`/`GeminiVertex` authenticate via a GCP project/location/
-            // service-account bundle (`summarize::VertexCredentials`), not a bare API
-            // key — `build_vertex_client` wires up its own resolvers instead of the
-            // `credential_store_auth_resolver` + plain `Client::builder()` path below.
-            let client = if provider.is_vertex() {
-                // `stored_credential.is_err()` already returned above, so this is `Ok`.
-                let raw = stored_credential.unwrap_or_default();
-                match serde_json::from_str::<summarize::VertexCredentials>(&raw) {
-                    Ok(credentials) => summarize::build_vertex_client(credentials),
-                    Err(e) => {
-                        summary_message.set(Some(format!("認証情報の読み込みに失敗しました: {e}")));
-                        summary_busy.set(false);
-                        return;
-                    }
-                }
-            } else {
-                let resolver = summarize::credential_store_auth_resolver(state.credential_store.clone(), provider.api_key_account());
-                genai::Client::builder().with_auth_resolver(resolver).build()
-            };
             let options = summarize::SummarizeOptions::new(model.clone());
 
-            match summarize::summarize(&client, &turns, &options).await {
+            // Three independent execution paths: a `claude`/`codex` CLI subprocess
+            // (#59, no API key needed), Google Vertex AI (a GCP project/location/
+            // service-account bundle), and plain `genai` (a bare API key) — see
+            // `SummaryProvider::uses_cli`/`is_vertex`.
+            let result: Result<String, String> = if let Some(backend) = provider.cli_backend() {
+                summarize::cli_backend::summarize_via_cli(backend, &turns, &options).await.map_err(|e| e.to_string())
+            } else if provider.is_vertex() {
+                // `matches!(stored_credential, Some(Err(_)))` already returned above,
+                // so this is `Some(Ok(_))`.
+                let raw = stored_credential.and_then(Result::ok).unwrap_or_default();
+                match serde_json::from_str::<summarize::VertexCredentials>(&raw) {
+                    Ok(credentials) => {
+                        let client = summarize::build_vertex_client(credentials);
+                        summarize::summarize(&client, &turns, &options).await.map_err(|e| e.to_string())
+                    }
+                    Err(e) => Err(format!("認証情報の読み込みに失敗しました: {e}")),
+                }
+            } else {
+                // Non-CLI, non-Vertex providers always have an `api_key_account()`.
+                let account = provider.api_key_account().expect("genai providers have an api_key_account");
+                let resolver = summarize::credential_store_auth_resolver(state.credential_store.clone(), account);
+                let client = genai::Client::builder().with_auth_resolver(resolver).build();
+                summarize::summarize(&client, &turns, &options).await.map_err(|e| e.to_string())
+            };
+
+            match result {
                 Ok(text) => {
                     let summary = Summary {
                         session_id,
