@@ -21,22 +21,15 @@ pub struct AppState {
     pub credential_store: Arc<credential_store::FallbackCredentialStore>,
     /// Same directory `credential_store`'s `credentials/` subdirectory and
     /// `config.session_db_path` live under (see `main.rs::app_data_dir`).
-    /// Kept here so any future `app_settings` writer can call
-    /// `self.app_settings.lock().unwrap().save(&self.app_data_dir)` without
-    /// threading the path through separately.
-    ///
-    /// Not read anywhere yet (no `app_settings` writer exists — see the field
-    /// below), so `#[allow(dead_code)]` for now rather than dropping it and
-    /// forcing the next consumer to re-derive it from `config`.
-    #[allow(dead_code)]
+    /// Used by `export.rs::export_dir` as the fallback export root
+    /// (`app_data_dir.join("exports")`) when `app_settings.exports_root` is
+    /// unset.
     pub app_data_dir: PathBuf,
     /// Non-secret app settings (Ollama base URL, summary prompt template,
     /// whisper model path, exports root, ...) — see `app_settings` module doc
-    /// comment for why these don't go through `credential_store`. No UI reads
-    /// or writes this yet; it's loaded here so future settings-screen additions
-    /// have somewhere to read from and save back to. `#[allow(dead_code)]`
-    /// until such a consumer exists.
-    #[allow(dead_code)]
+    /// comment for why these don't go through `credential_store`. Read by
+    /// `export.rs::export_dir` for `exports_root`; no settings-screen writer
+    /// exists yet for any of these fields.
     pub app_settings: Mutex<AppSettings>,
     pub consent_confirmed: Mutex<bool>,
     pub current: Mutex<Option<ActiveRecording>>,

@@ -2,6 +2,7 @@ mod actions;
 mod app_settings;
 mod app_state;
 mod config;
+mod export;
 mod level;
 mod recording;
 mod settings;

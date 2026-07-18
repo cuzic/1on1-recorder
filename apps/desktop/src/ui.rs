@@ -12,6 +12,7 @@ use session_store::{Summary, TranscriptSegment};
 
 use crate::actions;
 use crate::app_state::AppState;
+use crate::export;
 use crate::settings::{self, Screen, SummaryProvider};
 use crate::status::Status;
 use crate::transcript;
@@ -273,6 +274,11 @@ pub fn App() -> Element {
     let mut summary_text = use_signal(|| None::<String>);
     let mut summary_message = use_signal(|| None::<String>);
     let mut summary_busy = use_signal(|| false);
+    // Task #71's manual "export to Markdown" button — its own message signal
+    // (separate from `summary_message`) since export and summary generation are
+    // independent actions that can each fail/succeed without clearing the other's
+    // status line.
+    let mut export_message = use_signal(|| None::<String>);
 
     // #53: auto-scroll the transcript panel to the bottom as new bubbles arrive,
     // but only when the user hasn't scrolled up to read older messages.
@@ -500,6 +506,26 @@ pub fn App() -> Element {
         }
     };
 
+    // Task #71: manual export of the latest session's finalized transcript (plus
+    // its latest summary, if generated) to a local Markdown file. Synchronous —
+    // `export::export_session` only does `SessionStore` reads and a local file
+    // write, no network/await, so this mirrors `on_start_recording` rather than
+    // the async `on_generate_summary`/`on_stop_recording` handlers above.
+    let export_state = state.clone();
+    let on_export = move |_| {
+        export_message.set(None);
+
+        let Some(session_id) = status().last_session_id.as_deref().and_then(|s| s.parse::<SessionId>().ok()) else {
+            export_message.set(Some("記録されたセッションがありません".to_string()));
+            return;
+        };
+
+        match export::export_session(&export_state, session_id) {
+            Ok(path) => export_message.set(Some(format!("エクスポートしました: {}", path.display()))),
+            Err(e) => export_message.set(Some(format!("エクスポートに失敗しました: {e}"))),
+        }
+    };
+
     let current = status();
     let recording_active = current.recording;
     let consent_confirmed = current.consent_confirmed;
@@ -630,6 +656,19 @@ pub fn App() -> Element {
                 }
                 if let Some(text) = summary_text() {
                     div { class: "summary-text", "{text}" }
+                }
+                // #71: manual export of the latest session's transcript/summary to a
+                // local Markdown file — enabled whenever a session exists, same as
+                // the summary button above; a session with no summary yet still
+                // exports its transcript (see `export::render_markdown`).
+                button {
+                    class: "primary",
+                    disabled: !has_session,
+                    onclick: on_export,
+                    "エクスポート"
+                }
+                if let Some(msg) = export_message() {
+                    p { class: "hint", "{msg}" }
                 }
             }
 
