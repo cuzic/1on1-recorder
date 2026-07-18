@@ -2,6 +2,15 @@
 //! API key). Reachable from `ui::App` via a `Signal<Screen>` swap — no router crate
 //! needed for two screens. Secrets are never displayed once saved (`credential-store`
 //! `load` is only used to decide "設定済み/未設定", not to populate an input).
+//!
+//! Each provider category (STT, summary) is split into two independent sections:
+//! "credential registration" (register a key/credential for any one provider) and
+//! "active selection" (pick which already-registered provider is actually used).
+//! Before this split, one form did both jobs at once — switching the active
+//! provider required re-entering that provider's API key every time, since the
+//! save handler rejected an empty key even when the user only meant to switch, not
+//! re-register. The two `save_*_credential`/`save_*_active` pairs below fix that:
+//! switching which provider is active never touches its stored credential.
 
 use std::sync::Arc;
 
@@ -78,7 +87,7 @@ impl SttProvider {
 
     /// `credential-store` (service, account) for a bare-API-key provider. `None`
     /// for Google, which is saved through its own JSON-blob path instead (see
-    /// `save_stt` below).
+    /// `save_stt_credential` below).
     fn api_key_service_account(self) -> Option<(&'static str, &'static str)> {
         match self {
             SttProvider::Deepgram => Some((stt_deepgram::CREDENTIAL_SERVICE, stt_deepgram::DEEPGRAM_API_KEY_ACCOUNT)),
@@ -86,6 +95,29 @@ impl SttProvider {
             SttProvider::AssemblyAi => Some((stt_assemblyai::CREDENTIAL_SERVICE, stt_assemblyai::ASSEMBLYAI_API_KEY_ACCOUNT)),
             SttProvider::Google => None,
         }
+    }
+}
+
+/// Loads which STT provider is currently selected as active (`SELECTED_STT_PROVIDER_ACCOUNT`),
+/// falling back to Deepgram when nothing has been saved yet — shared by the "which
+/// provider am I editing credentials for" and "which provider is active" signals'
+/// initial values, since both start out pointed at today's active provider.
+fn load_active_stt_provider(state: &AppState) -> SttProvider {
+    state
+        .credential_store
+        .load(app_service::CREDENTIAL_SERVICE, app_service::SELECTED_STT_PROVIDER_ACCOUNT)
+        .ok()
+        .map(|key| SttProvider::from_key(&key))
+        .unwrap_or(SttProvider::Deepgram)
+}
+
+/// "設定済み/未設定" for `provider`: Google's credential is a JSON blob under its
+/// own account (see `SttProvider::is_google`/`GoogleSttCredentials`), the other
+/// three are a bare API key under `SttProvider::api_key_service_account`.
+fn stt_provider_is_configured(state: &AppState, provider: SttProvider) -> bool {
+    match provider.api_key_service_account() {
+        Some((service, account)) => state.credential_store.load(service, account).is_ok(),
+        None => state.credential_store.load(stt_google::CREDENTIAL_SERVICE, stt_google::GOOGLE_STT_CREDENTIALS_ACCOUNT).is_ok(),
     }
 }
 
@@ -190,6 +222,21 @@ impl SummaryProvider {
 /// can't collide with a real model name.
 const CUSTOM_MODEL: &str = "__custom__";
 
+/// Loads which summary provider is currently active (`SELECTED_PROVIDER_ACCOUNT`),
+/// falling back to Claude — same role as `load_active_stt_provider` above.
+fn load_active_summary_provider(state: &AppState) -> SummaryProvider {
+    state
+        .credential_store
+        .load(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_PROVIDER_ACCOUNT)
+        .ok()
+        .map(|key| SummaryProvider::from_key(&key))
+        .unwrap_or(SummaryProvider::Claude)
+}
+
+fn summary_provider_is_configured(state: &AppState, provider: SummaryProvider) -> bool {
+    state.credential_store.load(summarize::CREDENTIAL_SERVICE, provider.api_key_account()).is_ok()
+}
+
 const STYLE: &str = r#"
 .settings-container {
   margin: 0;
@@ -224,6 +271,13 @@ const STYLE: &str = r#"
   margin: 0;
   font-size: 1em;
 }
+.settings-section h3 {
+  margin: 0.6em 0 0;
+  font-size: 0.85em;
+  opacity: 0.75;
+  border-top: 1px solid #333;
+  padding-top: 0.6em;
+}
 .settings-section label {
   font-size: 0.85em;
   opacity: 0.8;
@@ -255,37 +309,46 @@ const STYLE: &str = r#"
 pub fn Settings(mut screen: Signal<Screen>) -> Element {
     let state = use_context::<Arc<AppState>>();
 
-    let mut stt_provider = use_signal({
+    // ---- STT: 資格情報の登録(どのプロバイダを編集中かは表示のためだけの状態で、
+    // 「使用するプロバイダ」の選択とは独立。初期値だけ現在アクティブなプロバイダに
+    // 合わせておく) ----
+    let mut stt_edit_provider = use_signal({
         let state = state.clone();
-        move || {
-            state
-                .credential_store
-                .load(app_service::CREDENTIAL_SERVICE, app_service::SELECTED_STT_PROVIDER_ACCOUNT)
-                .ok()
-                .map(|key| SttProvider::from_key(&key))
-                .unwrap_or(SttProvider::Deepgram)
-        }
+        move || load_active_stt_provider(&state)
     });
-    let mut stt_configured = use_signal({
+    let mut stt_edit_configured = use_signal({
         let state = state.clone();
-        move || stt_provider_is_configured(&state, stt_provider())
+        move || stt_provider_is_configured(&state, stt_edit_provider())
     });
     let mut stt_key_input = use_signal(String::new);
     let mut stt_google_project_input = use_signal(String::new);
     let mut stt_google_location_input = use_signal(|| "global".to_string());
     let mut stt_google_json_input = use_signal(String::new);
-    let mut stt_message = use_signal(|| None::<String>);
+    let mut stt_credential_message = use_signal(|| None::<String>);
 
-    let mut provider = use_signal({
+    // ---- STT: 使用するプロバイダの選択 ----
+    let mut stt_active_provider = use_signal({
         let state = state.clone();
-        move || {
-            state
-                .credential_store
-                .load(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_PROVIDER_ACCOUNT)
-                .ok()
-                .map(|key| SummaryProvider::from_key(&key))
-                .unwrap_or(SummaryProvider::Claude)
-        }
+        move || load_active_stt_provider(&state)
+    });
+    let mut stt_active_message = use_signal(|| None::<String>);
+
+    // ---- 要約: 資格情報の登録 ----
+    let mut summary_edit_provider = use_signal({
+        let state = state.clone();
+        move || load_active_summary_provider(&state)
+    });
+    let mut summary_edit_key_configured = use_signal({
+        let state = state.clone();
+        move || summary_provider_is_configured(&state, summary_edit_provider())
+    });
+    let mut summary_edit_key_input = use_signal(String::new);
+    let mut summary_credential_message = use_signal(|| None::<String>);
+
+    // ---- 要約: 使用するプロバイダ・モデルの選択 ----
+    let mut summary_active_provider = use_signal({
+        let state = state.clone();
+        move || load_active_summary_provider(&state)
     });
     let mut model_input = use_signal({
         let state = state.clone();
@@ -293,107 +356,149 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
             state
                 .credential_store
                 .load(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_MODEL_ACCOUNT)
-                .unwrap_or_else(|_| provider().default_model().to_string())
+                .unwrap_or_else(|_| summary_active_provider().default_model().to_string())
         }
     });
     // Selects a `known_models()` entry, or `CUSTOM_MODEL` when the saved model
     // isn't one (e.g. a value from before this picker existed, or hand-entered).
     let mut model_select = use_signal(move || {
         let saved = model_input();
-        if provider().known_models().contains(&saved.as_str()) { saved } else { CUSTOM_MODEL.to_string() }
+        if summary_active_provider().known_models().contains(&saved.as_str()) { saved } else { CUSTOM_MODEL.to_string() }
     });
-    let mut provider_key_configured = use_signal({
-        let state = state.clone();
-        move || state.credential_store.load(summarize::CREDENTIAL_SERVICE, provider().api_key_account()).is_ok()
-    });
-    let mut provider_key_input = use_signal(String::new);
-    let mut summary_message = use_signal(|| None::<String>);
+    let mut summary_active_message = use_signal(|| None::<String>);
 
-    let onchange_stt_provider = {
+    // ==== STTハンドラ ====
+
+    let onchange_stt_edit_provider = {
         let state = state.clone();
         move |evt: FormEvent| {
             let new_provider = SttProvider::from_key(&evt.value());
-            stt_provider.set(new_provider);
+            stt_edit_provider.set(new_provider);
             stt_key_input.set(String::new());
             stt_google_project_input.set(String::new());
             stt_google_location_input.set("global".to_string());
             stt_google_json_input.set(String::new());
-            stt_configured.set(stt_provider_is_configured(&state, new_provider));
-            stt_message.set(None);
+            stt_edit_configured.set(stt_provider_is_configured(&state, new_provider));
+            stt_credential_message.set(None);
         }
     };
 
-    let save_stt = {
+    // Saves only `stt_edit_provider`'s own credential — never touches which
+    // provider is active (see `save_stt_active` below for that).
+    let save_stt_credential = {
         let state = state.clone();
         move |_| {
-            let current_provider = stt_provider();
-            if let Err(e) = state.credential_store.save(app_service::CREDENTIAL_SERVICE, app_service::SELECTED_STT_PROVIDER_ACCOUNT, current_provider.key()) {
-                stt_message.set(Some(format!("保存に失敗しました: {e}")));
-                return;
-            }
+            let current_provider = stt_edit_provider();
 
             if current_provider.is_google() {
                 let project = stt_google_project_input().trim().to_string();
                 let location = stt_google_location_input().trim().to_string();
                 let json = stt_google_json_input().trim().to_string();
                 if project.is_empty() || location.is_empty() || json.is_empty() {
-                    stt_message.set(Some("プロジェクトID・ロケーション・サービスアカウントJSONをすべて入力してください".to_string()));
+                    stt_credential_message.set(Some("プロジェクトID・ロケーション・サービスアカウントJSONをすべて入力してください".to_string()));
                     return;
                 }
                 let credentials = stt_google::GoogleSttCredentials::new(project, location).with_service_account_json(json);
                 let serialized = match serde_json::to_string(&credentials) {
                     Ok(s) => s,
                     Err(e) => {
-                        stt_message.set(Some(format!("認証情報の変換に失敗しました: {e}")));
+                        stt_credential_message.set(Some(format!("認証情報の変換に失敗しました: {e}")));
                         return;
                     }
                 };
                 match state.credential_store.save(stt_google::CREDENTIAL_SERVICE, stt_google::GOOGLE_STT_CREDENTIALS_ACCOUNT, &serialized) {
                     Ok(()) => {
-                        stt_configured.set(true);
+                        stt_edit_configured.set(true);
                         stt_google_project_input.set(String::new());
                         stt_google_location_input.set("global".to_string());
                         stt_google_json_input.set(String::new());
-                        stt_message.set(Some("保存しました".to_string()));
+                        stt_credential_message.set(Some("保存しました".to_string()));
                     }
-                    Err(e) => stt_message.set(Some(format!("保存に失敗しました: {e}"))),
+                    Err(e) => stt_credential_message.set(Some(format!("保存に失敗しました: {e}"))),
                 }
                 return;
             }
 
             let key = stt_key_input().trim().to_string();
             if key.is_empty() {
-                stt_message.set(Some("APIキーを入力してください".to_string()));
+                stt_credential_message.set(Some("APIキーを入力してください".to_string()));
                 return;
             }
             // `SttProvider::Google` is handled above and always returns before here,
             // so this is always `Some` — see `SttProvider::api_key_service_account`.
             let Some((service, account)) = current_provider.api_key_service_account() else {
-                stt_message.set(Some("未対応のプロバイダです".to_string()));
+                stt_credential_message.set(Some("未対応のプロバイダです".to_string()));
                 return;
             };
             match state.credential_store.save(service, account, &key) {
                 Ok(()) => {
-                    stt_configured.set(true);
+                    stt_edit_configured.set(true);
                     stt_key_input.set(String::new());
-                    stt_message.set(Some("保存しました".to_string()));
+                    stt_credential_message.set(Some("保存しました".to_string()));
                 }
-                Err(e) => stt_message.set(Some(format!("保存に失敗しました: {e}"))),
+                Err(e) => stt_credential_message.set(Some(format!("保存に失敗しました: {e}"))),
             }
         }
     };
 
-    let onchange_provider = {
+    let onchange_stt_active_provider = move |evt: FormEvent| {
+        stt_active_provider.set(SttProvider::from_key(&evt.value()));
+        stt_active_message.set(None);
+    };
+
+    // Saves only which STT provider is active — never touches any provider's
+    // stored credential (see `save_stt_credential` above for that). Allowed even
+    // if the chosen provider has no credential saved yet; `live_transcription.rs`
+    // already treats a missing credential as "skip live transcription for this
+    // session", not a hard error.
+    let save_stt_active = {
+        let state = state.clone();
+        move |_| match state.credential_store.save(app_service::CREDENTIAL_SERVICE, app_service::SELECTED_STT_PROVIDER_ACCOUNT, stt_active_provider().key()) {
+            Ok(()) => stt_active_message.set(Some("保存しました".to_string())),
+            Err(e) => stt_active_message.set(Some(format!("保存に失敗しました: {e}"))),
+        }
+    };
+
+    // ==== 要約ハンドラ ====
+
+    let onchange_summary_edit_provider = {
         let state = state.clone();
         move |evt: FormEvent| {
             let new_provider = SummaryProvider::from_key(&evt.value());
-            provider.set(new_provider);
-            model_input.set(new_provider.default_model().to_string());
-            model_select.set(new_provider.default_model().to_string());
-            provider_key_input.set(String::new());
-            provider_key_configured.set(state.credential_store.load(summarize::CREDENTIAL_SERVICE, new_provider.api_key_account()).is_ok());
-            summary_message.set(None);
+            summary_edit_provider.set(new_provider);
+            summary_edit_key_input.set(String::new());
+            summary_edit_key_configured.set(summary_provider_is_configured(&state, new_provider));
+            summary_credential_message.set(None);
         }
+    };
+
+    // Saves only `summary_edit_provider`'s own API key — never touches which
+    // provider/model is active (see `save_summary_active` below for that).
+    let save_summary_credential = {
+        let state = state.clone();
+        move |_| {
+            let key = summary_edit_key_input().trim().to_string();
+            if key.is_empty() {
+                summary_credential_message.set(Some("APIキーを入力してください".to_string()));
+                return;
+            }
+            match state.credential_store.save(summarize::CREDENTIAL_SERVICE, summary_edit_provider().api_key_account(), &key) {
+                Ok(()) => {
+                    summary_edit_key_configured.set(true);
+                    summary_edit_key_input.set(String::new());
+                    summary_credential_message.set(Some("保存しました".to_string()));
+                }
+                Err(e) => summary_credential_message.set(Some(format!("保存に失敗しました: {e}"))),
+            }
+        }
+    };
+
+    let onchange_summary_active_provider = move |evt: FormEvent| {
+        let new_provider = SummaryProvider::from_key(&evt.value());
+        summary_active_provider.set(new_provider);
+        model_input.set(new_provider.default_model().to_string());
+        model_select.set(new_provider.default_model().to_string());
+        summary_active_message.set(None);
     };
 
     let onchange_model = move |evt: FormEvent| {
@@ -404,43 +509,27 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
         model_select.set(value);
     };
 
-    let save_summary = {
+    // Saves only which summary provider/model is active — never touches any
+    // provider's stored API key (see `save_summary_credential` above for that).
+    // Allowed even if the chosen provider has no key saved yet; #38's "要約を生成"
+    // already surfaces "設定画面でAPIキーを設定してください" at generation time.
+    let save_summary_active = {
         let state = state.clone();
         move |_| {
-            let current_provider = provider();
             let model = {
                 let m = model_input().trim().to_string();
-                if m.is_empty() {
-                    current_provider.default_model().to_string()
-                } else {
-                    m
-                }
+                if m.is_empty() { summary_active_provider().default_model().to_string() } else { m }
             };
-
-            if let Err(e) = state.credential_store.save(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_PROVIDER_ACCOUNT, current_provider.key()) {
-                summary_message.set(Some(format!("保存に失敗しました: {e}")));
+            if let Err(e) = state.credential_store.save(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_PROVIDER_ACCOUNT, summary_active_provider().key()) {
+                summary_active_message.set(Some(format!("保存に失敗しました: {e}")));
                 return;
             }
             if let Err(e) = state.credential_store.save(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_MODEL_ACCOUNT, &model) {
-                summary_message.set(Some(format!("保存に失敗しました: {e}")));
+                summary_active_message.set(Some(format!("保存に失敗しました: {e}")));
                 return;
             }
             model_input.set(model);
-
-            let key = provider_key_input().trim().to_string();
-            if !key.is_empty() {
-                match state.credential_store.save(summarize::CREDENTIAL_SERVICE, current_provider.api_key_account(), &key) {
-                    Ok(()) => {
-                        provider_key_configured.set(true);
-                        provider_key_input.set(String::new());
-                    }
-                    Err(e) => {
-                        summary_message.set(Some(format!("APIキーの保存に失敗しました: {e}")));
-                        return;
-                    }
-                }
-            }
-            summary_message.set(Some("保存しました".to_string()));
+            summary_active_message.set(Some("保存しました".to_string()));
         }
     };
 
@@ -453,18 +542,19 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
             }
 
             section { class: "settings-section",
-                h2 { "音声認識 (STT)" }
+                h2 { "音声認識 (STT) の資格情報" }
+                p { class: "hint", "プロバイダごとにAPIキー/認証情報を登録します。実際に使うプロバイダの選択は下の「使用する音声認識プロバイダ」で行います。" }
                 label {
-                    "プロバイダ"
+                    "編集するプロバイダ"
                     select {
-                        onchange: onchange_stt_provider,
+                        onchange: onchange_stt_edit_provider,
                         for p in SttProvider::ALL {
-                            option { value: "{p.key()}", selected: p == stt_provider(), "{p.label()}" }
+                            option { value: "{p.key()}", selected: p == stt_edit_provider(), "{p.label()}" }
                         }
                     }
                 }
-                p { class: "status-badge", if stt_configured() { "設定済み" } else { "未設定" } }
-                if stt_provider().is_google() {
+                p { class: "status-badge", if stt_edit_configured() { "設定済み" } else { "未設定" } }
+                if stt_edit_provider().is_google() {
                     label {
                         "プロジェクトID"
                         input {
@@ -502,20 +592,73 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                         }
                     }
                 }
-                button { class: "primary", onclick: save_stt, "保存" }
-                if let Some(msg) = stt_message() {
+                button { class: "primary", onclick: save_stt_credential, "保存" }
+                if let Some(msg) = stt_credential_message() {
                     p { class: "status-badge", "{msg}" }
                 }
             }
 
             section { class: "settings-section",
-                h2 { "要約 (LLM)" }
+                h2 { "使用する音声認識プロバイダ" }
                 label {
                     "プロバイダ"
                     select {
-                        onchange: onchange_provider,
+                        onchange: onchange_stt_active_provider,
+                        for p in SttProvider::ALL {
+                            option {
+                                value: "{p.key()}",
+                                selected: p == stt_active_provider(),
+                                if stt_provider_is_configured(&state, p) { "{p.label()} (設定済み)" } else { "{p.label()} (未設定)" }
+                            }
+                        }
+                    }
+                }
+                button { class: "primary", onclick: save_stt_active, "この設定を保存" }
+                if let Some(msg) = stt_active_message() {
+                    p { class: "status-badge", "{msg}" }
+                }
+            }
+
+            section { class: "settings-section",
+                h2 { "要約 (LLM) の資格情報" }
+                p { class: "hint", "プロバイダごとにAPIキーを登録します。実際に使うプロバイダ・モデルの選択は下の「使用する要約プロバイダ・モデル」で行います。" }
+                label {
+                    "編集するプロバイダ"
+                    select {
+                        onchange: onchange_summary_edit_provider,
                         for p in SummaryProvider::ALL {
-                            option { value: "{p.key()}", selected: p == provider(), "{p.label()}" }
+                            option { value: "{p.key()}", selected: p == summary_edit_provider(), "{p.label()}" }
+                        }
+                    }
+                }
+                p { class: "status-badge", if summary_edit_key_configured() { "APIキー設定済み" } else { "APIキー未設定" } }
+                label {
+                    "APIキー"
+                    input {
+                        r#type: "password",
+                        placeholder: "APIキー",
+                        value: "{summary_edit_key_input}",
+                        oninput: move |e| summary_edit_key_input.set(e.value()),
+                    }
+                }
+                button { class: "primary", onclick: save_summary_credential, "保存" }
+                if let Some(msg) = summary_credential_message() {
+                    p { class: "status-badge", "{msg}" }
+                }
+            }
+
+            section { class: "settings-section",
+                h2 { "使用する要約プロバイダ・モデル" }
+                label {
+                    "プロバイダ"
+                    select {
+                        onchange: onchange_summary_active_provider,
+                        for p in SummaryProvider::ALL {
+                            option {
+                                value: "{p.key()}",
+                                selected: p == summary_active_provider(),
+                                if summary_provider_is_configured(&state, p) { "{p.label()} (設定済み)" } else { "{p.label()} (未設定)" }
+                            }
                         }
                     }
                 }
@@ -523,7 +666,7 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                     "モデル"
                     select {
                         onchange: onchange_model,
-                        for m in provider().known_models() {
+                        for m in summary_active_provider().known_models() {
                             option { value: "{m}", selected: model_select() == *m, "{m}" }
                         }
                         option { value: CUSTOM_MODEL, selected: model_select() == CUSTOM_MODEL, "カスタム..." }
@@ -539,31 +682,11 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                         }
                     }
                 }
-                p { class: "status-badge", if provider_key_configured() { "APIキー設定済み" } else { "APIキー未設定" } }
-                label {
-                    "APIキー"
-                    input {
-                        r#type: "password",
-                        placeholder: "APIキー",
-                        value: "{provider_key_input}",
-                        oninput: move |e| provider_key_input.set(e.value()),
-                    }
-                }
-                button { class: "primary", onclick: save_summary, "保存" }
-                if let Some(msg) = summary_message() {
+                button { class: "primary", onclick: save_summary_active, "この設定を保存" }
+                if let Some(msg) = summary_active_message() {
                     p { class: "status-badge", "{msg}" }
                 }
             }
         }
-    }
-}
-
-/// "設定済み/未設定" for `provider`: Google's credential is a JSON blob under its
-/// own account (see `SttProvider::is_google`/`GoogleSttCredentials`), the other
-/// three are a bare API key under `SttProvider::api_key_service_account`.
-fn stt_provider_is_configured(state: &AppState, provider: SttProvider) -> bool {
-    match provider.api_key_service_account() {
-        Some((service, account)) => state.credential_store.load(service, account).is_ok(),
-        None => state.credential_store.load(stt_google::CREDENTIAL_SERVICE, stt_google::GOOGLE_STT_CREDENTIALS_ACCOUNT).is_ok(),
     }
 }
