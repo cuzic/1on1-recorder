@@ -18,6 +18,7 @@ use credential_store::CredentialStore;
 use dioxus::prelude::*;
 
 use crate::app_state::AppState;
+use crate::summary_template::{self, SummaryTemplatePreset};
 
 /// Which top-level screen `ui::App` renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,6 +425,16 @@ const STYLE: &str = r#"
   opacity: 0.7;
   margin: 0;
 }
+.summary-template-preview {
+  max-height: 10em;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-size: 0.8em;
+  opacity: 0.75;
+  padding: 0.5em;
+  border: 1px solid #555;
+  border-radius: 6px;
+}
 "#;
 
 #[component]
@@ -508,6 +519,29 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
         if summary_active_provider().known_models().contains(&saved.as_str()) { saved } else { CUSTOM_MODEL.to_string() }
     });
     let mut summary_active_message = use_signal(|| None::<String>);
+
+    // ---- 要約: プロンプトテンプレートの選択(プロバイダ・モデルの選択とは独立) ----
+    let mut summary_template_select = use_signal({
+        let state = state.clone();
+        move || {
+            let stored = state.app_settings.lock().unwrap().summary_template.clone();
+            summary_template::select_key_for(&stored).to_string()
+        }
+    });
+    // Only meaningful when `summary_template_select() == CUSTOM_TEMPLATE` — prefilled
+    // with the existing custom text so re-opening Settings doesn't blank it out.
+    let mut summary_template_custom_input = use_signal({
+        let state = state.clone();
+        move || {
+            let stored = state.app_settings.lock().unwrap().summary_template.clone();
+            if summary_template::select_key_for(&stored) == summary_template::CUSTOM_TEMPLATE {
+                stored.unwrap_or_default()
+            } else {
+                String::new()
+            }
+        }
+    });
+    let mut summary_template_message = use_signal(|| None::<String>);
 
     // ==== STTハンドラ ====
 
@@ -717,6 +751,62 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
         }
     };
 
+    // ==== 要約プロンプトテンプレートハンドラ ====
+
+    let onchange_summary_template = move |evt: FormEvent| {
+        summary_template_select.set(evt.value());
+        summary_template_message.set(None);
+    };
+
+    // Resolves the current selection ([`summary_template::NO_TEMPLATE`], a
+    // built-in preset key, or [`summary_template::CUSTOM_TEMPLATE`]) into an
+    // `AppSettings::summary_template` value and persists it via
+    // `AppSettings::save` — the same non-secret store `export.rs`'s
+    // `exports_root` already reads from (see `app_settings.rs`'s doc comment
+    // for why this doesn't go through `credential_store`).
+    let save_summary_template = {
+        let state = state.clone();
+        move |_| {
+            let selected = summary_template_select();
+            let new_value: Option<String> = if selected == summary_template::NO_TEMPLATE {
+                None
+            } else if selected == summary_template::CUSTOM_TEMPLATE {
+                let text = summary_template_custom_input().trim().to_string();
+                if text.is_empty() {
+                    summary_template_message.set(Some("カスタムプロンプトを入力してください".to_string()));
+                    return;
+                }
+                Some(text)
+            } else {
+                // Any other value is a preset key; fall back to `None` for a
+                // stale/unknown key rather than panicking.
+                SummaryTemplatePreset::from_key(&selected).map(|preset| preset.prompt().to_string())
+            };
+
+            let save_result = {
+                let mut settings = state.app_settings.lock().unwrap();
+                // Roll back to the pre-edit value if the write fails (Codex
+                // review finding): without this, a failed save (e.g. a
+                // temporarily read-only app_data_dir) would still leave the
+                // in-memory `summary_template` on the new value, so the very
+                // next summary generation would silently use an unsaved
+                // template that reverts on the next restart — the opposite of
+                // what "保存に失敗しました" is telling the user.
+                let previous = settings.summary_template.clone();
+                settings.summary_template = new_value;
+                let result = settings.save(&state.app_data_dir);
+                if result.is_err() {
+                    settings.summary_template = previous;
+                }
+                result
+            };
+            match save_result {
+                Ok(()) => summary_template_message.set(Some("保存しました".to_string())),
+                Err(e) => summary_template_message.set(Some(format!("保存に失敗しました: {e}"))),
+            }
+        }
+    };
+
     rsx! {
         style { "{STYLE}" }
         main { class: "settings-container",
@@ -909,6 +999,51 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                 }
                 button { class: "primary", onclick: save_summary_active, "この設定を保存" }
                 if let Some(msg) = summary_active_message() {
+                    p { class: "status-badge", "{msg}" }
+                }
+            }
+
+            section { class: "settings-section",
+                h2 { "要約プロンプトテンプレート" }
+                p { class: "hint", "要約生成時にLLMへ渡すシステムプロンプトを選べます。使用する要約プロバイダ・モデルの選択とは独立です。" }
+                label {
+                    "テンプレート"
+                    select {
+                        onchange: onchange_summary_template,
+                        option {
+                            value: summary_template::NO_TEMPLATE,
+                            selected: summary_template_select() == summary_template::NO_TEMPLATE,
+                            "組み込みデフォルト"
+                        }
+                        for preset in SummaryTemplatePreset::ALL {
+                            option {
+                                value: "{preset.key()}",
+                                selected: summary_template_select() == preset.key(),
+                                "{preset.label()}"
+                            }
+                        }
+                        option {
+                            value: summary_template::CUSTOM_TEMPLATE,
+                            selected: summary_template_select() == summary_template::CUSTOM_TEMPLATE,
+                            "カスタム..."
+                        }
+                    }
+                }
+                if summary_template_select() == summary_template::CUSTOM_TEMPLATE {
+                    label {
+                        "カスタムプロンプト"
+                        textarea {
+                            placeholder: "要約生成時にLLMに渡すシステムプロンプトを入力",
+                            value: "{summary_template_custom_input}",
+                            oninput: move |e| summary_template_custom_input.set(e.value()),
+                        }
+                    }
+                } else if let Some(preset) = SummaryTemplatePreset::from_key(&summary_template_select()) {
+                    p { class: "hint", "プレビュー:" }
+                    div { class: "summary-template-preview", "{preset.prompt()}" }
+                }
+                button { class: "primary", onclick: save_summary_template, "この設定を保存" }
+                if let Some(msg) = summary_template_message() {
                     p { class: "status-badge", "{msg}" }
                 }
             }

@@ -8,6 +8,7 @@ mod level;
 mod recording;
 mod settings;
 mod status;
+mod summary_template;
 mod transcript;
 mod transcription_status;
 mod ui;

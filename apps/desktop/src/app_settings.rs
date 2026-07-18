@@ -93,13 +93,11 @@ impl AppSettings {
     /// or file locking, since this app is single-user/single-process (see this
     /// module's doc comment).
     ///
-    /// Not yet called from any UI (no settings screen writes `AppSettings`
-    /// fields yet — this task only adds the store itself, see this module's
-    /// doc comment), so it's dead code from `main`'s reachability graph today;
-    /// exercised by this module's own tests instead. `#[allow(dead_code)]`
-    /// rather than deleting it, since a load-only store would be a trap for
-    /// the next task that adds a writable field.
-    #[allow(dead_code)]
+    /// Called from `settings.rs`'s "要約プロンプトテンプレート" section
+    /// (`save_summary_template`), the first settings-UI writer of any
+    /// `AppSettings` field — see `summary_template.rs` for the preset
+    /// definitions that section resolves into `summary_template` before
+    /// calling this.
     pub fn save(&self, app_data_dir: &Path) -> std::io::Result<()> {
         let path = Self::path(app_data_dir);
         let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;

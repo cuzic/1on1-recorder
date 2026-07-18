@@ -519,7 +519,14 @@ pub fn App() -> Element {
                 summary_busy.set(false);
                 return;
             }
-            let options = summarize::SummarizeOptions::new(model.clone());
+            // Task: "要約プロンプトテンプレート" (`settings::Settings`'s dedicated
+            // section, independent of the provider/model picker above) — `None`
+            // when unset falls through to `summarize::DEFAULT_SYSTEM_PROMPT` via
+            // `crate::summary_template::summarize_options_for`, exactly like
+            // `SummarizeOptions::new` alone used to behave before this template
+            // existed.
+            let summary_template = state.app_settings.lock().unwrap().summary_template.clone();
+            let options = crate::summary_template::summarize_options_for(model.clone(), summary_template);
 
             // Three independent ways to build a `Summarizer`: a `claude`/`codex` CLI
             // subprocess (#59, no API key needed), Google Vertex AI (a GCP project/
