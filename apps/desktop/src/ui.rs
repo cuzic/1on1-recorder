@@ -418,7 +418,9 @@ pub fn App() -> Element {
             // own OAuth/subscription login, not a stored API key — this check only
             // applies to the genai/Vertex paths below (`api_key_account()` is
             // `None` for them, so `stored_credential` stays `None` and the check
-            // is skipped).
+            // is skipped). A future API-key-free genai provider (e.g. Ollama)
+            // would also have `api_key_account() == None` and be skipped here in
+            // the same way — see the `None` arm of the `summarizer` match below.
             let stored_credential = provider.api_key_account().map(|account| state.credential_store.load(summarize::CREDENTIAL_SERVICE, account));
             if matches!(stored_credential, Some(Err(_))) {
                 let message = if provider.is_vertex() { "設定画面でGoogle Vertex AIの認証情報を設定してください" } else { "設定画面でAPIキーを設定してください" };
@@ -445,9 +447,9 @@ pub fn App() -> Element {
 
             // Three independent ways to build a `Summarizer`: a `claude`/`codex` CLI
             // subprocess (#59, no API key needed), Google Vertex AI (a GCP project/
-            // location/service-account bundle), and plain `genai` (a bare API key) —
-            // see `SummaryProvider::uses_cli`/`is_vertex`. Once built, all three are
-            // invoked identically below.
+            // location/service-account bundle), and plain `genai` (with or without
+            // an API key) — see `SummaryProvider::uses_cli`/`is_vertex`. Once built,
+            // all three are invoked identically below.
             let summarizer: Result<Box<dyn summarize::Summarizer>, String> = if let Some(backend) = provider.cli_backend() {
                 Ok(Box::new(summarize::CliSummarizer(backend)))
             } else if provider.is_vertex() {
@@ -458,11 +460,19 @@ pub fn App() -> Element {
                     Ok(credentials) => Ok(Box::new(summarize::GenaiSummarizer(summarize::build_vertex_client(credentials)))),
                     Err(e) => Err(format!("認証情報の読み込みに失敗しました: {e}")),
                 }
-            } else {
-                // Non-CLI, non-Vertex providers always have an `api_key_account()`.
-                let account = provider.api_key_account().expect("genai providers have an api_key_account");
+            } else if let Some(account) = provider.api_key_account() {
+                // Today every non-CLI, non-Vertex provider has an `api_key_account()`,
+                // so this is the only reachable arm here.
                 let resolver = summarize::credential_store_auth_resolver(state.credential_store.clone(), account);
                 let client = genai::Client::builder().with_auth_resolver(resolver).build();
+                Ok(Box::new(summarize::GenaiSummarizer(client)))
+            } else {
+                // No stored provider currently has `api_key_account() == None`
+                // outside the CLI/Vertex cases handled above, so this arm is
+                // unreachable today. It exists for a future API-key-free genai
+                // provider (e.g. Ollama), which would build a plain client with
+                // no auth resolver.
+                let client = genai::Client::builder().build();
                 Ok(Box::new(summarize::GenaiSummarizer(client)))
             };
 
