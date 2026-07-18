@@ -42,6 +42,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # stt-google's build.rs (tonic-build/prost-build, task #42) shells out to
+      # `protoc` to compile its vendored .proto file; windows-latest doesn't ship it,
+      # so every check/build/test step below failed with "Could not find `protoc`"
+      # from the moment stt-google was added until this step existed.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
