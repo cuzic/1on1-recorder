@@ -137,10 +137,11 @@ pub(crate) enum SummaryProvider {
     XAi,
     ClaudeVertex,
     GeminiVertex,
+    ClaudeBedrock,
 }
 
 impl SummaryProvider {
-    const ALL: [SummaryProvider; 8] = [
+    const ALL: [SummaryProvider; 9] = [
         SummaryProvider::Claude,
         SummaryProvider::OpenAi,
         SummaryProvider::Gemini,
@@ -149,6 +150,7 @@ impl SummaryProvider {
         SummaryProvider::XAi,
         SummaryProvider::ClaudeVertex,
         SummaryProvider::GeminiVertex,
+        SummaryProvider::ClaudeBedrock,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -161,6 +163,7 @@ impl SummaryProvider {
             SummaryProvider::XAi => "xai",
             SummaryProvider::ClaudeVertex => "claude-vertex",
             SummaryProvider::GeminiVertex => "gemini-vertex",
+            SummaryProvider::ClaudeBedrock => "claude-bedrock",
         }
     }
 
@@ -174,6 +177,7 @@ impl SummaryProvider {
             SummaryProvider::XAi => "xAI (Grok)",
             SummaryProvider::ClaudeVertex => "Claude (Google Vertex AI)",
             SummaryProvider::GeminiVertex => "Gemini (Google Vertex AI)",
+            SummaryProvider::ClaudeBedrock => "Claude (AWS Bedrock)",
         }
     }
 
@@ -196,6 +200,13 @@ impl SummaryProvider {
             // self-documenting and matches `genai`'s own Vertex convention.
             SummaryProvider::ClaudeVertex => "vertex::claude-sonnet-4-5",
             SummaryProvider::GeminiVertex => "vertex::gemini-3-flash-preview",
+            // `bedrock_api::` namespaces the model the same way `groq::`/`vertex::` do
+            // above, selecting `genai`'s Bedrock-via-API-key adapter (bearer-token
+            // auth, not the SigV4/default-AWS-credential-chain adapter). Bedrock
+            // model IDs are the publisher's own ID, not `genai`'s usual bare model
+            // name — verified against `genai` 0.7.0-beta.13's
+            // `adapter/adapters/bedrock/shared.rs` curated model list.
+            SummaryProvider::ClaudeBedrock => "bedrock_api::anthropic.claude-sonnet-4-5-20250929-v1:0",
         }
     }
 
@@ -215,6 +226,7 @@ impl SummaryProvider {
             SummaryProvider::XAi => summarize::XAI_API_KEY_ACCOUNT,
             SummaryProvider::ClaudeVertex => summarize::CLAUDE_VERTEX_CREDENTIALS_ACCOUNT,
             SummaryProvider::GeminiVertex => summarize::GEMINI_VERTEX_CREDENTIALS_ACCOUNT,
+            SummaryProvider::ClaudeBedrock => summarize::BEDROCK_API_KEY_ACCOUNT,
         }
     }
 
@@ -246,6 +258,13 @@ impl SummaryProvider {
             SummaryProvider::XAi => &["grok-4", "grok-4-fast", "grok-3"],
             SummaryProvider::ClaudeVertex => &["vertex::claude-sonnet-4-5", "vertex::claude-opus-4-5", "vertex::claude-haiku-4-5"],
             SummaryProvider::GeminiVertex => &["vertex::gemini-3-flash-preview", "vertex::gemini-3-pro-preview", "vertex::gemini-2.5-flash"],
+            // Bedrock model IDs (`genai`'s curated list) rather than the bare
+            // `claude-*` names the other Claude entries use.
+            SummaryProvider::ClaudeBedrock => &[
+                "bedrock_api::anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "bedrock_api::anthropic.claude-opus-4-1-20250805-v1:0",
+                "bedrock_api::anthropic.claude-haiku-4-5-20251001-v1:0",
+            ],
         }
     }
 }
@@ -730,11 +749,14 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                         }
                     }
                 } else {
+                    if summary_edit_provider() == SummaryProvider::ClaudeBedrock {
+                        p { class: "hint", "AWSコンソールのBedrock「API keys」画面で発行した長期(long-term) APIキーを貼り付けてください。短期(short-term)キーは最大12時間で失効するため、常駐アプリの資格情報には不向きです。" }
+                    }
                     label {
                         "APIキー"
                         input {
                             r#type: "password",
-                            placeholder: "APIキー",
+                            placeholder: if summary_edit_provider() == SummaryProvider::ClaudeBedrock { "Bedrock APIキー(長期)" } else { "APIキー" },
                             value: "{summary_edit_key_input}",
                             oninput: move |e| summary_edit_key_input.set(e.value()),
                         }

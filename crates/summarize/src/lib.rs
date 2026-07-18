@@ -44,6 +44,15 @@ pub const DEEPSEEK_API_KEY_ACCOUNT: &str = "deepseek-api-key";
 /// Convenience account name for the xAI (Grok) API key.
 pub const XAI_API_KEY_ACCOUNT: &str = "xai-api-key";
 
+/// Convenience account name for the AWS Bedrock API key (#58). Unlike SigV4-based
+/// Bedrock auth (`genai`'s `adapter_sigv4.rs`, hardcoded to the AWS SDK's default
+/// credential chain and not used by this crate), Bedrock's newer "API keys" feature
+/// (`adapter_api.rs`) is a bare bearer token sent as `Authorization: Bearer
+/// {api_key}` — the same shape as [`CLAUDE_API_KEY_ACCOUNT`] and friends, so it goes
+/// through the plain [`credential_store_auth_resolver`] path, not a dedicated
+/// client-builder function like [`build_vertex_client`].
+pub const BEDROCK_API_KEY_ACCOUNT: &str = "bedrock-api-key";
+
 /// Account name under which [`VertexCredentials`] (serialized as JSON, same "one
 /// JSON blob per account" shape as `stt_google::GoogleSttCredentials`) is stored for
 /// the Claude-via-Vertex provider.
