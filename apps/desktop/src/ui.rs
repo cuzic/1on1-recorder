@@ -491,12 +491,11 @@ pub fn App() -> Element {
                 .unwrap_or_else(|_| provider.default_model().to_string());
 
             // CLI-based providers (#59) authenticate as the `claude`/`codex` CLI's
-            // own OAuth/subscription login, not a stored API key — this check only
-            // applies to the genai/Vertex paths below (`api_key_account()` is
-            // `None` for them, so `stored_credential` stays `None` and the check
-            // is skipped). A future API-key-free genai provider (e.g. Ollama)
-            // would also have `api_key_account() == None` and be skipped here in
-            // the same way — see the `None` arm of the `summarizer` match below.
+            // own OAuth/subscription login, and Ollama needs no credential at all
+            // (just an optional base URL, read separately below) — neither has a
+            // stored API key, so this check only applies to the genai/Vertex paths
+            // below (`api_key_account()` is `None` for them, so `stored_credential`
+            // stays `None` and the check is skipped).
             let stored_credential = provider.api_key_account().map(|account| state.credential_store.load(summarize::CREDENTIAL_SERVICE, account));
             if matches!(stored_credential, Some(Err(_))) {
                 let message = if provider.is_vertex() { "設定画面でGoogle Vertex AIの認証情報を設定してください" } else { "設定画面でAPIキーを設定してください" };
@@ -528,11 +527,12 @@ pub fn App() -> Element {
             let summary_template = state.app_settings.lock().unwrap().summary_template.clone();
             let options = crate::summary_template::summarize_options_for(model.clone(), summary_template);
 
-            // Three independent ways to build a `Summarizer`: a `claude`/`codex` CLI
+            // Four independent ways to build a `Summarizer`: a `claude`/`codex` CLI
             // subprocess (#59, no API key needed), Google Vertex AI (a GCP project/
-            // location/service-account bundle), and plain `genai` (with or without
-            // an API key) — see `SummaryProvider::uses_cli`/`is_vertex`. Once built,
-            // all three are invoked identically below.
+            // location/service-account bundle), a local Ollama server (no API key,
+            // just an optional base URL), and plain `genai` with a stored API key —
+            // see `SummaryProvider::uses_cli`/`is_vertex`. Once built, all four are
+            // invoked identically below.
             let summarizer: Result<Box<dyn summarize::Summarizer>, String> = if let Some(backend) = provider.cli_backend() {
                 Ok(Box::new(summarize::CliSummarizer(backend)))
             } else if provider.is_vertex() {
@@ -543,18 +543,28 @@ pub fn App() -> Element {
                     Ok(credentials) => Ok(Box::new(summarize::GenaiSummarizer(summarize::build_vertex_client(credentials)))),
                     Err(e) => Err(format!("認証情報の読み込みに失敗しました: {e}")),
                 }
+            } else if provider == SummaryProvider::Ollama {
+                // No stored credential to check (`api_key_account() == None`, so
+                // `stored_credential` above is `None` and was skipped) — just an
+                // optional base URL from the non-secret `AppSettings` store (#67),
+                // read fresh here since it can change independently of which
+                // provider is selected (see the "Ollama設定" section in
+                // `settings::Settings`).
+                let base_url = state.app_settings.lock().unwrap().ollama_base_url.clone();
+                Ok(Box::new(summarize::GenaiSummarizer(summarize::build_ollama_client(base_url))))
             } else if let Some(account) = provider.api_key_account() {
-                // Today every non-CLI, non-Vertex provider has an `api_key_account()`,
-                // so this is the only reachable arm here.
+                // Every remaining provider (non-CLI, non-Vertex, non-Ollama) has an
+                // `api_key_account()`, so this is the only reachable arm here.
                 let resolver = summarize::credential_store_auth_resolver(state.credential_store.clone(), account);
                 let client = genai::Client::builder().with_auth_resolver(resolver).build();
                 Ok(Box::new(summarize::GenaiSummarizer(client)))
             } else {
-                // No stored provider currently has `api_key_account() == None`
-                // outside the CLI/Vertex cases handled above, so this arm is
-                // unreachable today. It exists for a future API-key-free genai
-                // provider (e.g. Ollama), which would build a plain client with
-                // no auth resolver.
+                // Unreachable: every API-key-free provider (`ClaudeCli`/`Codex` via
+                // `cli_backend()` above, `Ollama` above) is handled by an earlier
+                // arm. Kept as a safety net (a plain client with no auth resolver)
+                // rather than `unreachable!()`, in case a future provider variant
+                // adds `api_key_account() == None` without also adding a dedicated
+                // branch here.
                 let client = genai::Client::builder().build();
                 Ok(Box::new(summarize::GenaiSummarizer(client)))
             };

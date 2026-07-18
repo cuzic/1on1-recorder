@@ -146,10 +146,16 @@ pub(crate) enum SummaryProvider {
     ClaudeBedrock,
     ClaudeCli,
     Codex,
+    /// A local/self-hosted Ollama server (`genai`'s built-in `AdapterKind::Ollama`,
+    /// default endpoint `http://localhost:11434/`) — no API key, base URL is
+    /// configured separately in `AppSettings::ollama_base_url` (see the "Ollama設定"
+    /// section below), and the model is whatever the user has locally pulled (no
+    /// fixed [`Self::known_models`] list, unlike the hosted providers above).
+    Ollama,
 }
 
 impl SummaryProvider {
-    const ALL: [SummaryProvider; 11] = [
+    const ALL: [SummaryProvider; 12] = [
         SummaryProvider::Claude,
         SummaryProvider::OpenAi,
         SummaryProvider::Gemini,
@@ -161,6 +167,7 @@ impl SummaryProvider {
         SummaryProvider::ClaudeBedrock,
         SummaryProvider::ClaudeCli,
         SummaryProvider::Codex,
+        SummaryProvider::Ollama,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -176,6 +183,7 @@ impl SummaryProvider {
             SummaryProvider::ClaudeBedrock => "claude-bedrock",
             SummaryProvider::ClaudeCli => "claude-cli",
             SummaryProvider::Codex => "codex",
+            SummaryProvider::Ollama => "ollama",
         }
     }
 
@@ -192,6 +200,7 @@ impl SummaryProvider {
             SummaryProvider::ClaudeBedrock => "Claude (AWS Bedrock)",
             SummaryProvider::ClaudeCli => "Claude (Claude Code CLI)",
             SummaryProvider::Codex => "Codex (Codex CLI)",
+            SummaryProvider::Ollama => "Ollama (ローカル)",
         }
     }
 
@@ -225,6 +234,14 @@ impl SummaryProvider {
             // CLI model aliases, not `genai` model spec strings.
             SummaryProvider::ClaudeCli => "sonnet",
             SummaryProvider::Codex => "gpt-5.5",
+            // Not a `genai` model spec string in the usual sense — just a common
+            // Ollama library model name, prefilled as a starting point in the
+            // freeform model field (`known_models()` is empty for this provider, so
+            // the settings UI always shows the custom-text input, never a `<select>`
+            // of fixed choices). Kept non-empty so `save_summary_active`'s "fall back
+            // to `default_model()` when the field is left blank" guard never silently
+            // saves an empty model name.
+            SummaryProvider::Ollama => "llama3.2",
         }
     }
 
@@ -248,7 +265,11 @@ impl SummaryProvider {
             SummaryProvider::ClaudeVertex => Some(summarize::CLAUDE_VERTEX_CREDENTIALS_ACCOUNT),
             SummaryProvider::GeminiVertex => Some(summarize::GEMINI_VERTEX_CREDENTIALS_ACCOUNT),
             SummaryProvider::ClaudeBedrock => Some(summarize::BEDROCK_API_KEY_ACCOUNT),
-            SummaryProvider::ClaudeCli | SummaryProvider::Codex => None,
+            // `ClaudeCli`/`Codex` authenticate as the CLI's own login (see the doc
+            // comment above); `Ollama` needs no credential at all — a local server
+            // with no API key, configured instead via `AppSettings::ollama_base_url`
+            // (see the "Ollama設定" section in `Settings`'s `rsx!`).
+            SummaryProvider::ClaudeCli | SummaryProvider::Codex | SummaryProvider::Ollama => None,
         }
     }
 
@@ -312,6 +333,13 @@ impl SummaryProvider {
             SummaryProvider::ClaudeCli => &["sonnet", "opus", "haiku"],
             // Model slugs from this sandbox's `~/.codex/models_cache.json`.
             SummaryProvider::Codex => &["gpt-5.5", "gpt-5.5-codex"],
+            // Deliberately empty: unlike the hosted providers above, there's no
+            // fixed catalog to offer — the available models are whatever the user
+            // has locally `ollama pull`ed, which this app has no way to enumerate
+            // without an extra round trip to the Ollama server. The settings UI
+            // always falls back to the freeform "カスタム" input for this provider
+            // as a result (see `CUSTOM_MODEL`).
+            SummaryProvider::Ollama => &[],
         }
     }
 }
@@ -520,6 +548,14 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
     });
     let mut summary_active_message = use_signal(|| None::<String>);
 
+    // ---- Ollama: サーバーbase URLの設定(要約プロバイダの選択とは独立 — Ollamaを
+    // 選んでいなくても登録しておける、テンプレート設定と同じ考え方) ----
+    let mut ollama_base_url_input = use_signal({
+        let state = state.clone();
+        move || state.app_settings.lock().unwrap().ollama_base_url.clone().unwrap_or_default()
+    });
+    let mut ollama_base_url_message = use_signal(|| None::<String>);
+
     // ---- 要約: プロンプトテンプレートの選択(プロバイダ・モデルの選択とは独立) ----
     let mut summary_template_select = use_signal({
         let state = state.clone();
@@ -714,8 +750,17 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
     let onchange_summary_active_provider = move |evt: FormEvent| {
         let new_provider = SummaryProvider::from_key(&evt.value());
         summary_active_provider.set(new_provider);
-        model_input.set(new_provider.default_model().to_string());
-        model_select.set(new_provider.default_model().to_string());
+        let default_model = new_provider.default_model().to_string();
+        model_input.set(default_model.clone());
+        // Same "is this a `known_models()` entry, or should the freeform input show
+        // instead" fallback as `model_select`'s own initial-value `use_signal` above.
+        // Every provider except `Ollama` includes its `default_model()` as a
+        // `known_models()` entry, so this only matters for `Ollama` (empty
+        // `known_models()`) today — without it, switching to Ollama would select the
+        // "カスタム..." option in the `<select>` while leaving the custom-text input
+        // hidden, since that input's visibility is keyed off `model_select() ==
+        // CUSTOM_MODEL`, not off `default_model()` directly.
+        model_select.set(if new_provider.known_models().contains(&default_model.as_str()) { default_model } else { CUSTOM_MODEL.to_string() });
         summary_active_message.set(None);
     };
 
@@ -748,6 +793,37 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
             }
             model_input.set(model);
             summary_active_message.set(Some("保存しました".to_string()));
+        }
+    };
+
+    // ==== Ollamaハンドラ ====
+
+    // Persists `AppSettings::ollama_base_url` — `None` (falls back to `genai`'s own
+    // `summarize::DEFAULT_OLLAMA_BASE_URL`) when the field is left blank, same "empty
+    // input means unset, not an error" shape as `exports_root`. Same rollback-on-
+    // failed-save pattern as `save_summary_template` below, so a write failure
+    // (e.g. a temporarily read-only app_data_dir) doesn't leave the in-memory value
+    // ahead of what's actually on disk.
+    let save_ollama_base_url = {
+        let state = state.clone();
+        move |_| {
+            let trimmed = ollama_base_url_input().trim().to_string();
+            let new_value = if trimmed.is_empty() { None } else { Some(trimmed) };
+
+            let save_result = {
+                let mut settings = state.app_settings.lock().unwrap();
+                let previous = settings.ollama_base_url.clone();
+                settings.ollama_base_url = new_value;
+                let result = settings.save(&state.app_data_dir);
+                if result.is_err() {
+                    settings.ollama_base_url = previous;
+                }
+                result
+            };
+            match save_result {
+                Ok(()) => ollama_base_url_message.set(Some("保存しました".to_string())),
+                Err(e) => ollama_base_url_message.set(Some(format!("保存に失敗しました: {e}"))),
+            }
         }
     };
 
@@ -806,6 +882,11 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
             }
         }
     };
+
+    // Rust's `"{ident}"` format-string capture only accepts a bare identifier, not a
+    // `module::CONST` path — bound to a local first so the hint text below can
+    // interpolate it directly.
+    let ollama_default_base_url = summarize::DEFAULT_OLLAMA_BASE_URL;
 
     rsx! {
         style { "{STYLE}" }
@@ -912,6 +993,14 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                     // form/save button.
                     p { class: "hint", "APIキーは不要です。このプロバイダは claude/codex CLI 自体のログイン(OAuth/サブスクリプション認証)をそのまま使います。" }
                     p { class: "status-badge", "{summary_cli_status_text(summary_edit_provider(), summary_cli_available())}" }
+                } else if summary_edit_provider() == SummaryProvider::Ollama {
+                    // Local Ollama server (`SummaryProvider::api_key_account() ==
+                    // None`) — no credential form here; without this branch the
+                    // `else` below would still render the API key input, but
+                    // `save_summary_credential`'s `api_key_account()` guard silently
+                    // no-ops on save, so the input would look functional while doing
+                    // nothing.
+                    p { class: "hint", "このプロバイダはAPIキー不要です。下の「Ollama設定」でサーバーのbase URLを設定してください。" }
                 } else {
                     p { class: "status-badge", if summary_edit_key_configured() { "設定済み" } else { "未設定" } }
                     if summary_edit_provider().is_vertex() {
@@ -999,6 +1088,25 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                 }
                 button { class: "primary", onclick: save_summary_active, "この設定を保存" }
                 if let Some(msg) = summary_active_message() {
+                    p { class: "status-badge", "{msg}" }
+                }
+            }
+
+            section { class: "settings-section",
+                h2 { "Ollama設定" }
+                p { class: "hint", "要約プロバイダに「Ollama (ローカル)」を選んだときに接続するローカルサーバーのbase URLです。プロバイダの選択とは独立に登録しておけます。" }
+                label {
+                    "base URL"
+                    input {
+                        r#type: "text",
+                        placeholder: "{ollama_default_base_url}",
+                        value: "{ollama_base_url_input}",
+                        oninput: move |e| ollama_base_url_input.set(e.value()),
+                    }
+                }
+                p { class: "hint", "未入力のまま保存すると既定値({ollama_default_base_url})を使用します。" }
+                button { class: "primary", onclick: save_ollama_base_url, "この設定を保存" }
+                if let Some(msg) = ollama_base_url_message() {
                     p { class: "status-badge", "{msg}" }
                 }
             }

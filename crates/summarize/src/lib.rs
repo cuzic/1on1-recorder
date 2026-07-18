@@ -390,6 +390,64 @@ pub fn build_vertex_client(credentials: VertexCredentials) -> Client {
         .build()
 }
 
+/// `genai`'s own default for the Ollama adapter (`OllamaAdapter::default_endpoint`)
+/// — used as the settings-UI placeholder/hint. [`build_ollama_client`] itself never
+/// needs to fall back to this value explicitly: omitting the `ServiceTargetResolver`
+/// when `base_url` is `None` already lets `genai` apply this same default internally.
+pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/";
+
+/// Ensures `base_url` ends with `/`. `genai`'s Ollama adapter builds each request URL
+/// by directly concatenating `{base_url}api/chat` (`OllamaAdapter::get_service_url`)
+/// with no separator, so a base URL missing the trailing slash would silently produce
+/// a malformed path like `http://localhost:11434api/chat`.
+fn normalize_ollama_base_url(base_url: &str) -> String {
+    if base_url.ends_with('/') {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/")
+    }
+}
+
+/// Builds a `genai` `Client` bound to the Ollama adapter, for a local/self-hosted
+/// Ollama server (`AppSettings::ollama_base_url`) — no API key required.
+///
+/// The classic `genai::Client::builder().build()` (no adapter binding) routes each
+/// call by sniffing the model name's prefix via `AdapterKind::from_model()`, which
+/// falls back to Ollama only for names it doesn't recognize. A locally-pulled Ollama
+/// model can easily collide with a recognized prefix (e.g. a model named
+/// `gemini-local` or `deepseek-r1` — both real Ollama library model names) and would
+/// then be silently misrouted to that hosted provider's adapter instead of the local
+/// server. Binding the client to [`AdapterKind::Ollama`] via `ClientBuilder`'s
+/// `with_adapter_kind` makes routing explicit instead — the same "don't rely on
+/// name-sniffing" motivation as [`build_vertex_client`]'s `ServiceTargetResolver`.
+///
+/// `base_url`, when `Some`, overrides `genai`'s Ollama default
+/// ([`DEFAULT_OLLAMA_BASE_URL`]) via a `ServiceTargetResolver` — normalized first (see
+/// [`normalize_ollama_base_url`]). `None` leaves `genai`'s own default endpoint
+/// resolution in place.
+///
+/// No `AuthResolver` is configured: `genai`'s built-in `OllamaAdapter::default_auth`
+/// already sends a dummy bearer token (`"ollama"`) when no API key env var is set, and
+/// a local Ollama server doesn't check it — there's no real credential to pull from
+/// `credential-store` for this provider.
+pub fn build_ollama_client(base_url: Option<String>) -> Client {
+    let mut builder = Client::builder().with_adapter_kind(AdapterKind::Ollama);
+
+    if let Some(base_url) = base_url {
+        let normalized = normalize_ollama_base_url(&base_url);
+        let target_resolver = ServiceTargetResolver::from_resolver_fn(
+            move |service_target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                let ServiceTarget { auth, model, .. } = service_target;
+                let endpoint = Endpoint::from_owned(normalized.clone());
+                Ok(ServiceTarget { endpoint, auth, model })
+            },
+        );
+        builder = builder.with_service_target_resolver(target_resolver);
+    }
+
+    builder.build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +535,32 @@ mod tests {
         // `gcp_auth` or make a network request until an actual `exec_chat` runs.
         let credentials = VertexCredentials::new("my-project", "us-central1");
         let _client = build_vertex_client(credentials);
+    }
+
+    #[test]
+    fn normalize_ollama_base_url_appends_missing_trailing_slash() {
+        assert_eq!(normalize_ollama_base_url("http://localhost:11434"), "http://localhost:11434/");
+    }
+
+    #[test]
+    fn normalize_ollama_base_url_leaves_trailing_slash_untouched() {
+        assert_eq!(normalize_ollama_base_url("http://localhost:11434/"), "http://localhost:11434/");
+    }
+
+    #[test]
+    fn normalize_ollama_base_url_appends_slash_for_custom_host_and_port() {
+        assert_eq!(normalize_ollama_base_url("http://192.168.1.10:11434"), "http://192.168.1.10:11434/");
+    }
+
+    #[test]
+    fn build_ollama_client_constructs_without_base_url_override() {
+        // No `ServiceTargetResolver` branch taken; `genai`'s own Ollama default
+        // endpoint applies. Should not touch the network.
+        let _client = build_ollama_client(None);
+    }
+
+    #[test]
+    fn build_ollama_client_constructs_with_base_url_override() {
+        let _client = build_ollama_client(Some("http://localhost:12345".to_string()));
     }
 }
