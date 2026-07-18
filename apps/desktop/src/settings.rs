@@ -135,16 +135,20 @@ pub(crate) enum SummaryProvider {
     Groq,
     DeepSeek,
     XAi,
+    ClaudeVertex,
+    GeminiVertex,
 }
 
 impl SummaryProvider {
-    const ALL: [SummaryProvider; 6] = [
+    const ALL: [SummaryProvider; 8] = [
         SummaryProvider::Claude,
         SummaryProvider::OpenAi,
         SummaryProvider::Gemini,
         SummaryProvider::Groq,
         SummaryProvider::DeepSeek,
         SummaryProvider::XAi,
+        SummaryProvider::ClaudeVertex,
+        SummaryProvider::GeminiVertex,
     ];
 
     pub(crate) fn key(self) -> &'static str {
@@ -155,6 +159,8 @@ impl SummaryProvider {
             SummaryProvider::Groq => "groq",
             SummaryProvider::DeepSeek => "deepseek",
             SummaryProvider::XAi => "xai",
+            SummaryProvider::ClaudeVertex => "claude-vertex",
+            SummaryProvider::GeminiVertex => "gemini-vertex",
         }
     }
 
@@ -166,6 +172,8 @@ impl SummaryProvider {
             SummaryProvider::Groq => "Groq",
             SummaryProvider::DeepSeek => "DeepSeek",
             SummaryProvider::XAi => "xAI (Grok)",
+            SummaryProvider::ClaudeVertex => "Claude (Google Vertex AI)",
+            SummaryProvider::GeminiVertex => "Gemini (Google Vertex AI)",
         }
     }
 
@@ -182,9 +190,21 @@ impl SummaryProvider {
             // `deepseek-v4-flash` is genai's current default DeepSeek model.
             SummaryProvider::DeepSeek => "deepseek-v4-flash",
             SummaryProvider::XAi => "grok-4",
+            // `vertex::` namespaces the model the same way `groq::` does above;
+            // `summarize::build_vertex_client`'s `ServiceTargetResolver` forces the
+            // Vertex adapter regardless, but the namespace keeps these strings
+            // self-documenting and matches `genai`'s own Vertex convention.
+            SummaryProvider::ClaudeVertex => "vertex::claude-sonnet-4-5",
+            SummaryProvider::GeminiVertex => "vertex::gemini-3-flash-preview",
         }
     }
 
+    /// `credential-store` account this provider's credential is saved under.
+    /// [`SummaryProvider::ClaudeVertex`]/[`SummaryProvider::GeminiVertex`] store a
+    /// [`summarize::VertexCredentials`] JSON blob here instead of a bare API key
+    /// (see [`Self::is_vertex`]) — `credential-store` doesn't care about the shape
+    /// of what's stored, so the same account-based "設定済み/未設定" check in
+    /// `summary_provider_is_configured` works for both credential shapes unchanged.
     pub(crate) fn api_key_account(self) -> &'static str {
         match self {
             SummaryProvider::Claude => summarize::CLAUDE_API_KEY_ACCOUNT,
@@ -193,11 +213,22 @@ impl SummaryProvider {
             SummaryProvider::Groq => summarize::GROQ_API_KEY_ACCOUNT,
             SummaryProvider::DeepSeek => summarize::DEEPSEEK_API_KEY_ACCOUNT,
             SummaryProvider::XAi => summarize::XAI_API_KEY_ACCOUNT,
+            SummaryProvider::ClaudeVertex => summarize::CLAUDE_VERTEX_CREDENTIALS_ACCOUNT,
+            SummaryProvider::GeminiVertex => summarize::GEMINI_VERTEX_CREDENTIALS_ACCOUNT,
         }
     }
 
     pub(crate) fn from_key(key: &str) -> Self {
         Self::ALL.into_iter().find(|p| p.key() == key).unwrap_or(SummaryProvider::Claude)
+    }
+
+    /// `true` for [`SummaryProvider::ClaudeVertex`]/[`SummaryProvider::GeminiVertex`],
+    /// whose credential is a JSON bundle (project/location/service-account) rather
+    /// than a bare API key — same idea as [`SttProvider::is_google`], but backed by
+    /// `summarize`'s own [`summarize::VertexCredentials`] type, not
+    /// `stt_google::GoogleSttCredentials`.
+    pub(crate) fn is_vertex(self) -> bool {
+        matches!(self, SummaryProvider::ClaudeVertex | SummaryProvider::GeminiVertex)
     }
 
     /// Representative current models offered in the settings picker's `<select>`
@@ -213,6 +244,8 @@ impl SummaryProvider {
             SummaryProvider::Groq => &["groq::openai/gpt-oss-20b", "groq::openai/gpt-oss-120b", "groq::llama-3.3-70b-versatile"],
             SummaryProvider::DeepSeek => &["deepseek-v4-flash", "deepseek-v4"],
             SummaryProvider::XAi => &["grok-4", "grok-4-fast", "grok-3"],
+            SummaryProvider::ClaudeVertex => &["vertex::claude-sonnet-4-5", "vertex::claude-opus-4-5", "vertex::claude-haiku-4-5"],
+            SummaryProvider::GeminiVertex => &["vertex::gemini-3-flash-preview", "vertex::gemini-3-pro-preview", "vertex::gemini-2.5-flash"],
         }
     }
 }
@@ -343,6 +376,9 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
         move || summary_provider_is_configured(&state, summary_edit_provider())
     });
     let mut summary_edit_key_input = use_signal(String::new);
+    let mut summary_vertex_project_input = use_signal(String::new);
+    let mut summary_vertex_location_input = use_signal(|| "global".to_string());
+    let mut summary_vertex_json_input = use_signal(String::new);
     let mut summary_credential_message = use_signal(|| None::<String>);
 
     // ---- 要約: 使用するプロバイダ・モデルの選択 ----
@@ -467,22 +503,56 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
             let new_provider = SummaryProvider::from_key(&evt.value());
             summary_edit_provider.set(new_provider);
             summary_edit_key_input.set(String::new());
+            summary_vertex_project_input.set(String::new());
+            summary_vertex_location_input.set("global".to_string());
+            summary_vertex_json_input.set(String::new());
             summary_edit_key_configured.set(summary_provider_is_configured(&state, new_provider));
             summary_credential_message.set(None);
         }
     };
 
-    // Saves only `summary_edit_provider`'s own API key — never touches which
+    // Saves only `summary_edit_provider`'s own credential — never touches which
     // provider/model is active (see `save_summary_active` below for that).
     let save_summary_credential = {
         let state = state.clone();
         move |_| {
+            let current_provider = summary_edit_provider();
+
+            if current_provider.is_vertex() {
+                let project = summary_vertex_project_input().trim().to_string();
+                let location = summary_vertex_location_input().trim().to_string();
+                let json = summary_vertex_json_input().trim().to_string();
+                if project.is_empty() || location.is_empty() || json.is_empty() {
+                    summary_credential_message.set(Some("プロジェクトID・ロケーション・サービスアカウントJSONをすべて入力してください".to_string()));
+                    return;
+                }
+                let credentials = summarize::VertexCredentials::new(project, location).with_service_account_json(json);
+                let serialized = match serde_json::to_string(&credentials) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        summary_credential_message.set(Some(format!("認証情報の変換に失敗しました: {e}")));
+                        return;
+                    }
+                };
+                match state.credential_store.save(summarize::CREDENTIAL_SERVICE, current_provider.api_key_account(), &serialized) {
+                    Ok(()) => {
+                        summary_edit_key_configured.set(true);
+                        summary_vertex_project_input.set(String::new());
+                        summary_vertex_location_input.set("global".to_string());
+                        summary_vertex_json_input.set(String::new());
+                        summary_credential_message.set(Some("保存しました".to_string()));
+                    }
+                    Err(e) => summary_credential_message.set(Some(format!("保存に失敗しました: {e}"))),
+                }
+                return;
+            }
+
             let key = summary_edit_key_input().trim().to_string();
             if key.is_empty() {
                 summary_credential_message.set(Some("APIキーを入力してください".to_string()));
                 return;
             }
-            match state.credential_store.save(summarize::CREDENTIAL_SERVICE, summary_edit_provider().api_key_account(), &key) {
+            match state.credential_store.save(summarize::CREDENTIAL_SERVICE, current_provider.api_key_account(), &key) {
                 Ok(()) => {
                     summary_edit_key_configured.set(true);
                     summary_edit_key_input.set(String::new());
@@ -631,14 +701,43 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                         }
                     }
                 }
-                p { class: "status-badge", if summary_edit_key_configured() { "APIキー設定済み" } else { "APIキー未設定" } }
-                label {
-                    "APIキー"
-                    input {
-                        r#type: "password",
-                        placeholder: "APIキー",
-                        value: "{summary_edit_key_input}",
-                        oninput: move |e| summary_edit_key_input.set(e.value()),
+                p { class: "status-badge", if summary_edit_key_configured() { "設定済み" } else { "未設定" } }
+                if summary_edit_provider().is_vertex() {
+                    label {
+                        "プロジェクトID"
+                        input {
+                            r#type: "text",
+                            placeholder: "my-gcp-project",
+                            value: "{summary_vertex_project_input}",
+                            oninput: move |e| summary_vertex_project_input.set(e.value()),
+                        }
+                    }
+                    label {
+                        "ロケーション"
+                        input {
+                            r#type: "text",
+                            placeholder: "global",
+                            value: "{summary_vertex_location_input}",
+                            oninput: move |e| summary_vertex_location_input.set(e.value()),
+                        }
+                    }
+                    label {
+                        "サービスアカウントJSON"
+                        textarea {
+                            placeholder: "サービスアカウントキーJSONファイルの中身を貼り付け",
+                            value: "{summary_vertex_json_input}",
+                            oninput: move |e| summary_vertex_json_input.set(e.value()),
+                        }
+                    }
+                } else {
+                    label {
+                        "APIキー"
+                        input {
+                            r#type: "password",
+                            placeholder: "APIキー",
+                            value: "{summary_edit_key_input}",
+                            oninput: move |e| summary_edit_key_input.set(e.value()),
+                        }
                     }
                 }
                 button { class: "primary", onclick: save_summary_credential, "保存" }

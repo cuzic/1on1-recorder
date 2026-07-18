@@ -6363,8 +6363,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "credential-store",
+ "gcp_auth",
  "genai",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
 ]

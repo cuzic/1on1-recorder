@@ -9,9 +9,11 @@ description = "Thin wrapper over the genai crate for summarizing diarized meetin
 [dependencies]
 async-trait = "0.1"
 credential-store = { path = "../credential-store" }
+gcp_auth = { version = "0.12", default-features = false, features = ["ring"] }
 genai = "0.7.0-beta.13"
 serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt"] }
