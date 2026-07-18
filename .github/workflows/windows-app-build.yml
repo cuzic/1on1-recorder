@@ -164,18 +164,28 @@ jobs:
         run: cargo build -p capture-windows --example smoke_test --target x86_64-pc-windows-msvc
 
       - name: Ensure Windows Audio services are running
-        # A first attempt at this job failed `IAudioClient::Activate`/`Initialize`
-        # with "Access is denied (0x80070005)" — the classic symptom of
-        # AudioEndpointBuilder/Audiosrv not running, which this runner image
-        # apparently doesn't start by default given it normally has no sound card
-        # at all (see this job's top-level comment). Cheap and safe to call even if
-        # they're already running.
+        # Cheap and safe to call even if they're already running. Confirmed by a
+        # prior run of this job that these were already both `Running` on this
+        # runner image — kept as a diagnostic/defensive step, but the actual fix
+        # for the "Access is denied" failure below turned out to be the next step.
         shell: pwsh
         run: |
           Get-Service AudioEndpointBuilder, Audiosrv | Format-Table -AutoSize
           Start-Service AudioEndpointBuilder -ErrorAction SilentlyContinue
           Start-Service Audiosrv -ErrorAction SilentlyContinue
           Get-Service AudioEndpointBuilder, Audiosrv | Format-Table -AutoSize
+
+      - name: Grant desktop apps microphone access (privacy consent)
+        # Two prior attempts at this job failed `IAudioClient::Activate`/
+        # `Initialize` with "Access is denied (0x80070005)" even with the audio
+        # services confirmed running — Windows's Settings > Privacy & security >
+        # Microphone > "Let desktop apps access your microphone" toggle (which this
+        # runner image apparently ships OFF by default) blocks classic Win32 apps
+        # like this smoke test at the WASAPI layer regardless. See
+        # scripts/ci/seed-windows-microphone-consent.ps1's own header for why this
+        # is a best-effort community workaround, not a supported CI mechanism.
+        shell: pwsh
+        run: .\scripts\ci\seed-windows-microphone-consent.ps1
 
       - name: Run capture smoke test
         shell: pwsh
