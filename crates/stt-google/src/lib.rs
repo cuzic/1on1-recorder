@@ -512,11 +512,21 @@ fn translate_result(result: pb::StreamingRecognitionResult) -> Option<SttEvent> 
 /// supported for the active model/language/method (see crate root doc comment); an
 /// empty label means "not supported here", which this crate reports as `None`
 /// rather than an error.
+///
+/// Google's `speaker_label` is 1-based (confirmed against Google's own diarization
+/// sample output and the v1 API's `speaker_tag` doc, "ranges from '1' to
+/// diarization_speaker_count"), but `Word::speaker` is documented and consumed
+/// elsewhere (`apps/desktop/src/transcript.rs::speaker_label`) as 0-based, matching
+/// Deepgram's convention — that shared renderer adds 1 back for display. Without
+/// subtracting 1 here, every Google-diarized transcript would display one speaker
+/// number higher than the actual speaker. `checked_sub` guards the
+/// not-expected-per-Google's-own-docs case of a `"0"` label turning into a
+/// nonsensical negative index; that's reported as `None` rather than underflowing.
 fn parse_speaker_label(label: &str) -> Option<u32> {
     if label.is_empty() {
         None
     } else {
-        label.parse().ok()
+        label.parse::<u32>().ok().and_then(|n| n.checked_sub(1))
     }
 }
 
@@ -745,7 +755,9 @@ mod tests {
                 assert_eq!(audio_start_ms, Some(1_000));
                 let words = words.expect("words present");
                 assert_eq!(words.len(), 1);
-                assert_eq!(words[0].speaker, Some(2));
+                // Google's speaker_label "2" is 1-based (second speaker); stored
+                // 0-based (see `parse_speaker_label`'s doc comment) as Some(1).
+                assert_eq!(words[0].speaker, Some(1));
                 assert_eq!(words[0].confidence, Some(0.97));
             }
             other => panic!("expected FinalTranscript, got {other:?}"),
@@ -793,8 +805,16 @@ mod tests {
     #[test]
     fn parse_speaker_label_handles_empty_and_numeric() {
         assert_eq!(parse_speaker_label(""), None);
-        assert_eq!(parse_speaker_label("3"), Some(3));
+        // Google's speaker_label is 1-based; parse_speaker_label converts it to the
+        // 0-based convention `Word::speaker` uses everywhere else (Deepgram's own
+        // index is already 0-based) so the shared `transcript::speaker_label`
+        // renderer's `+1` produces the right display number for both providers.
+        assert_eq!(parse_speaker_label("1"), Some(0));
+        assert_eq!(parse_speaker_label("3"), Some(2));
         assert_eq!(parse_speaker_label("not-a-number"), None);
+        // Not expected per Google's own docs (labels start at "1"), but guard
+        // against underflow rather than panicking if it ever occurs.
+        assert_eq!(parse_speaker_label("0"), None);
     }
 
     #[test]

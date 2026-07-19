@@ -114,7 +114,25 @@ impl CredentialStore for FallbackCredentialStore {
                 utf16_bytes = secret.encode_utf16().count() * 2,
                 "secret exceeds the OS keyring's blob size limit; saving to the encrypted file store instead"
             );
-            return self.fallback.save(service, account, secret);
+            self.fallback.save(service, account, secret)?;
+            // `load` tries `self.primary` first and returns whatever it finds without
+            // consulting the fallback (see `load`'s doc comment) — so a stale primary
+            // entry from a previous, smaller `save` for the same service/account would
+            // otherwise silently shadow the fallback value just written above forever.
+            // Only run this cleanup once the fallback save has actually succeeded (the
+            // `?` above returns early on failure) — deleting the primary unconditionally
+            // would destroy a still-valid old credential on a failed save, turning "the
+            // new value didn't get saved" into "neither the new nor the old value is
+            // available anymore". Best-effort cleanup: a failure here doesn't change
+            // whether this `save` itself succeeded (the secret is already safely in the
+            // fallback store), so only log it rather than turning it into this call's
+            // error.
+            if let Err(e) = self.primary.delete(service, account) {
+                if !matches!(e, StoreError::NotFound { .. }) {
+                    tracing::warn!(error = %e, service, account, "failed to clear stale OS keyring entry after routing an oversized secret to the encrypted file store");
+                }
+            }
+            return Ok(());
         }
 
         match self.primary.save(service, account, secret) {
@@ -254,6 +272,34 @@ mod tests {
 
         store.delete("vertex-test-service", "vertex-test-account").expect("delete should succeed");
         assert!(store.load("vertex-test-service", "vertex-test-account").is_err(), "credential should be gone from both backends after delete");
+    }
+
+    #[test]
+    fn fallback_store_save_of_an_oversized_secret_is_visible_on_load_even_after_a_smaller_earlier_save() {
+        // Regression test for a Codex-review-caught bug: saving a small secret
+        // (routed to the OS keyring when available) and later replacing it with an
+        // oversized one for the same service/account (always routed to the
+        // encrypted file store) used to leave the small value sitting in the OS
+        // keyring, which `load()` would keep returning forever since it checks the
+        // primary first and only falls through to the fallback on `NotFound`. The
+        // fix clears the stale primary entry as part of the oversized-secret save
+        // path. This test's assertion (load returns the *latest* saved value) holds
+        // regardless of whether the OS keyring is actually available in this
+        // environment — see `fallback_store_round_trips_a_realistically_sized_vertex_credentials_secret`'s
+        // comment on why neither path can be assumed — but only the primary-available
+        // case actually exercises the bug this guards against.
+        let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let store = FallbackCredentialStore::new(tmp_dir.path()).expect("failed to create fallback store");
+
+        store.save("stale-primary-test-service", "stale-primary-test-account", "small-value").expect("save of the small secret should succeed");
+        let big_secret = synthetic_vertex_credentials_json();
+        assert!(exceeds_os_keyring_blob_limit(&big_secret), "test secret should exceed the OS keyring limit");
+        store.save("stale-primary-test-service", "stale-primary-test-account", &big_secret).expect("save of the oversized secret should succeed");
+
+        let loaded = store.load("stale-primary-test-service", "stale-primary-test-account").expect("load should succeed");
+        assert_eq!(loaded, big_secret, "load must return the most recently saved value, not a stale smaller one from an earlier save");
+
+        store.delete("stale-primary-test-service", "stale-primary-test-account").expect("delete should succeed");
     }
 
     #[test]

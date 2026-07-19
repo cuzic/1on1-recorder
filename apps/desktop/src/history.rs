@@ -128,8 +128,17 @@ pub fn History(mut screen: Signal<Screen>, mut selected_session_id: Signal<Optio
         let state = state.clone();
         // Loaded once on mount rather than polled — unlike the main screen's
         // live status, past sessions don't change while this screen is open
-        // (there's no way to start a new recording from here).
-        move || state.store.list_sessions().unwrap_or_default()
+        // (there's no way to start a new recording from here). Keeps the
+        // `Result` (rather than `.unwrap_or_default()`-ing it away here) so a
+        // real `StoreError` — corrupt `capture_state_tag`, invalid RFC3339
+        // `started_at`, etc. — renders as a distinct error message below instead
+        // of silently looking identical to "no sessions recorded yet".
+        move || {
+            state.store.list_sessions().map_err(|err| {
+                tracing::warn!(error = %err, "history: failed to load past sessions");
+                err.to_string()
+            })
+        }
     });
 
     rsx! {
@@ -139,11 +148,13 @@ pub fn History(mut screen: Signal<Screen>, mut selected_session_id: Signal<Optio
                 button { onclick: move |_| screen.set(Screen::Main), "← 戻る" }
                 h1 { "過去のセッション" }
             }
-            if sessions().is_empty() {
+            if let Err(err) = sessions() {
+                p { class: "hint", "セッション一覧の読み込みに失敗しました: {err}" }
+            } else if sessions().unwrap().is_empty() {
                 p { class: "hint", "記録されたセッションがありません" }
             } else {
                 div { class: "history-list",
-                    for item in sessions() {
+                    for item in sessions().unwrap() {
                         button {
                             class: "history-row",
                             key: "{item.session_id}",
