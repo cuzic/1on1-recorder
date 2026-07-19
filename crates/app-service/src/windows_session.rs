@@ -65,7 +65,11 @@ pub async fn run_windows_capture_session(
     // `audio_rx.recv()` loop end (and finalize both STT sessions) at the right time
     // without a separate shutdown signal.
     let (stt_tx, stt_rx) = tokio::sync::mpsc::unbounded_channel();
-    let live_transcription_fut = run_live_transcription(manifest.session_id, manifest.audio.sample_rate, credential_store, stt_rx, store, transcription_status_sink);
+    // TODO(silence-gate wiring task): hardcoded `false` until a real settings value
+    // is threaded through from `apps/desktop` — see `live_transcription`'s
+    // `silence_gate_enabled` parameter doc comment.
+    let live_transcription_fut =
+        run_live_transcription(manifest.session_id, manifest.audio.sample_rate, credential_store, stt_rx, store, transcription_status_sink, false);
 
     let capture_fut = tokio::task::spawn_blocking(move || run_capture_blocking(callback_timeout_ms, shutdown_rx, level_sink, stt_tx));
 

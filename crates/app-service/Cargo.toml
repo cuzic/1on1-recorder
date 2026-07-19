@@ -38,6 +38,11 @@ upload-client = { path = "../upload-client" }
 windows = { version = "0.58", features = ["Win32_Media_Audio", "Win32_System_Com"], optional = true }
 
 [dev-dependencies]
+# For a minimal `SttSession` test double in `live_transcription`'s
+# `silence_gate_enabled` wiring tests (mirrors `stt-api`'s own `async-trait`
+# version) — `SttSession::send_audio`/`finalize`/`keep_alive` are `#[async_trait]`
+# methods, so implementing the trait needs the same macro `stt-api` itself uses.
+async-trait = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 upload-client = { path = "../upload-client", features = ["mock-server"] }
