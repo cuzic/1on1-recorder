@@ -27,6 +27,12 @@ categories = ["multimedia::audio"]
 # optional Cargo feature, not a hard dependency, once/if it moves past the spike stage.
 [dependencies]
 async-trait = "0.1"
+# Pure-Rust, `serde`-only dependency (see its own Cargo.toml) — shares `rms()` with
+# `app-service::silence_gate`'s similarly crude energy-threshold VAD rather than
+# reimplementing it here. Adding it doesn't affect this crate's build-time cost
+# story (the module doc comment above explains that cost is `whisper-rs-sys`'s C++
+# build, not Rust dependency count).
+audio-timeline = { path = "../audio-timeline" }
 stt-api = { path = "../stt-api" }
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tracing = "0.1"

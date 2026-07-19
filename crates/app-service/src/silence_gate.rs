@@ -14,6 +14,8 @@
 
 use std::collections::VecDeque;
 
+use audio_timeline::rms;
+
 /// What the caller should do with a span of audio after a [`SilenceGate::process`]
 /// call. Several of these can be returned from a single `process` call, in order,
 /// since one push can span more than one state transition (e.g. the tail end of a
@@ -311,14 +313,6 @@ fn next_state(
 
 fn ms_to_samples(sample_rate_hz: u32, ms: u32) -> usize {
     (sample_rate_hz as u64 * ms as u64 / 1000) as usize
-}
-
-fn rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-    (sum_sq / samples.len() as f32).sqrt()
 }
 
 #[cfg(test)]

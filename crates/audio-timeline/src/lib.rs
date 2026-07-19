@@ -13,8 +13,10 @@
 //! independently measure how well two aligned tracks stayed in sync.
 
 pub mod aligner;
+pub mod level;
 pub mod resample;
 pub mod xcorr;
 
 pub use aligner::{AlignerStats, AudioPacket, TimelineAligner, MAX_SMOOTH_RATIO_DEVIATION};
+pub use level::rms;
 pub use resample::linear_resample;

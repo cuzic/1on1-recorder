@@ -38,7 +38,22 @@ impl TimestampMapper {
     /// been sent to the provider, the net offset between captured and sent audio is
     /// `net_offset_samples` (`captured_samples_dropped - artificial_samples_injected`,
     /// signed). Callers must call this with a non-decreasing `provider_samples_sent`.
+    ///
+    /// A run of calls sharing the same `provider_samples_sent` (e.g. several
+    /// `GateAction::Drop`s in a row during a long silence, where nothing is actually
+    /// sent so the position doesn't advance) overwrites the last checkpoint in place
+    /// rather than appending a new one — `to_wallclock_ms`'s binary search only ever
+    /// looks at the *last* checkpoint for a given position anyway (see its doc
+    /// comment), so the earlier entries for the same position would never be
+    /// observably different, just extra `Vec` growth and search candidates for the
+    /// lifetime of a long recording.
     pub fn record_checkpoint(&mut self, provider_samples_sent: u64, net_offset_samples: i64) {
+        if let Some(last) = self.checkpoints.last_mut() {
+            if last.0 == provider_samples_sent {
+                last.1 = net_offset_samples;
+                return;
+            }
+        }
         self.checkpoints.push((provider_samples_sent, net_offset_samples));
     }
 
@@ -105,6 +120,31 @@ fn signed_samples_to_ms(samples: i64, sample_rate_hz: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consecutive_checkpoints_at_the_same_position_are_compacted_in_place() {
+        // Regression test: a run of `record_checkpoint` calls sharing the same
+        // `provider_samples_sent` (as happens for a series of `GateAction::Drop`s
+        // during one long silence, since nothing sent means the position doesn't
+        // advance) must not grow the checkpoint list — only the *last* offset for a
+        // given position is ever observable via `to_wallclock_ms`, so appending a
+        // new entry each time would be unbounded memory growth for no behavioral
+        // difference.
+        let mut mapper = TimestampMapper::new(16_000);
+        for dropped in [1_600u64, 3_200, 4_800] {
+            mapper.record_checkpoint(5_000, dropped as i64);
+        }
+        assert_eq!(mapper.checkpoints.len(), 1, "same-position checkpoints should overwrite, not accumulate");
+
+        // A later, different position still appends normally.
+        mapper.record_checkpoint(6_000, 6_400);
+        assert_eq!(mapper.checkpoints.len(), 2);
+
+        // A query between the two positions (5_600 samples = 350ms) picks up the
+        // final recorded offset for position 5_000 (4_800 samples = 300ms), not an
+        // earlier value from the same compacted run.
+        assert_eq!(mapper.to_wallclock_ms(350), 350 + 300);
+    }
 
     #[test]
     fn no_checkpoints_returns_input_unchanged() {

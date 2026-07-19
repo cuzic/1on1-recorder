@@ -4,6 +4,8 @@
 //! separation matters for this spike). [`ChunkBuffer::push`] is the mid-stream path,
 //! [`ChunkBuffer::flush`] is what `finalize()` calls for the trailing remainder.
 
+use audio_timeline::rms;
+
 /// Tunables for [`ChunkBuffer`]. All `_ms` fields are milliseconds; `sample_rate_hz`
 /// must match the audio actually pushed in (this crate always uses 16000 — see the
 /// crate root docs — but the buffering logic itself doesn't hardcode that, so it can
@@ -191,13 +193,6 @@ impl ChunkBuffer {
     }
 }
 
-fn rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-    (sum_sq / samples.len() as f32).sqrt()
-}
 
 #[cfg(test)]
 mod tests {

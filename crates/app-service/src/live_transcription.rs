@@ -301,42 +301,17 @@ mod stt_wiring {
             return;
         }
 
-        let (mut self_session, mut self_events) = split(self_sess);
-        let (mut remote_session, mut remote_events) = split(remote_sess);
+        let (mut self_session, mut self_events) = self_sess.unzip();
+        let (remote_session, mut remote_events) = remote_sess.unzip();
 
         let mut self_samples_sent: u64 = 0;
-        let mut remote_samples_sent: u64 = 0;
         let mut audio_open = true;
 
-        // Remote-only VAD gate (v1 scope, see this function's doc comment): only
-        // constructed when `silence_gate_enabled`, so the `false` case's `None`s
-        // leave every branch below exactly as it was before this gate existed —
-        // unconditional send, no timestamp correction, no keepalive timer.
-        let mut remote_gate: Option<SilenceGate> =
-            silence_gate_enabled.then(|| SilenceGate::new(GateConfig { sample_rate_hz: target_rate_hz, ..GateConfig::default() }));
-        let mut remote_timestamp_mapper: Option<TimestampMapper> = silence_gate_enabled.then(|| TimestampMapper::new(target_rate_hz));
-        // `captured_samples_dropped - artificial_samples_injected` so far for the
-        // Remote track (see `TimestampMapper`'s doc comment) — advances on every
-        // `GateAction::Drop` and every keepalive-injected heartbeat.
-        let mut remote_net_offset: i64 = 0;
-        // Cumulative samples sent to the provider via `keep_alive`'s
-        // `KeepAliveEffect::InjectedAudio` (Google/OpenAI), which bypass
-        // `remote_samples_sent` entirely — that counter only tracks bytes sent
-        // through `send_audio`/`AudioChunk::start_sample`, but injected heartbeat
-        // audio reaches the provider through each adapter's own internal channel.
-        // The provider's *own* audio-duration clock (which is what its
-        // `audio_start_ms`/`audio_end_ms` are computed from) advances on both, so
-        // every `TimestampMapper` checkpoint below is keyed on
-        // `remote_samples_sent + remote_total_injected`, not `remote_samples_sent`
-        // alone — using the latter would under-count the provider's real position
-        // by however much has been injected so far, corrupting the binary search
-        // `TimestampMapper::to_wallclock_ms` does against later checkpoints.
-        let mut remote_total_injected: u64 = 0;
-        // Last time real audio (Send/SendStitched) or a keepalive was sent on the
-        // Remote track, for the idle-keepalive timer below. Only consulted when
-        // `silence_gate_enabled && remote_session.is_some()`, so its initial value
-        // is otherwise irrelevant.
-        let mut remote_last_active = Instant::now();
+        // Bundles every piece of Remote-track-only state the VAD gate, keepalive
+        // timer, and timestamp correction share (v1 scope, see this function's doc
+        // comment) — see `RemoteGateState`'s own doc comment for why this replaced
+        // half a dozen loose `remote_*` locals that always changed together.
+        let mut remote = RemoteGateState::new(remote_session, silence_gate_enabled, target_rate_hz);
         let mut remote_keepalive_timer = tokio::time::interval(Duration::from_secs(1));
 
         // #56: the last still-unconfirmed `PartialTranscript` seen per track, cleared
@@ -371,57 +346,17 @@ mod stt_wiring {
                                         }
                                     }
                                 }
+                                TrackKind::RemoteAudio if !remote.is_active() => {
+                                    // No Remote session at all (provider never connected, or
+                                    // already finalized) — skip resample/gate/RMS work
+                                    // entirely rather than paying for it on every chunk for
+                                    // the rest of the recording with nowhere to send the
+                                    // result (code-review finding: this used to run
+                                    // unconditionally whenever the gate was enabled).
+                                }
                                 TrackKind::RemoteAudio => {
                                     let resampled = resample(&samples, chunk_rate_hz, target_rate_hz);
-                                    if let Some(gate) = remote_gate.as_mut() {
-                                        // Gate enabled: route through `SilenceGate`, sending
-                                        // only the spans it judges worth paying for and
-                                        // recording a `TimestampMapper` checkpoint for every
-                                        // action so `persist_event`/`persist_pending_interim`
-                                        // can correct provider timestamps back to wall-clock.
-                                        for action in gate.process(&resampled) {
-                                            match action {
-                                                GateAction::Send(pcm) => {
-                                                    send_gated_remote_chunk(
-                                                        &mut remote_session,
-                                                        pcm,
-                                                        &mut remote_samples_sent,
-                                                        remote_total_injected,
-                                                        remote_net_offset,
-                                                        remote_timestamp_mapper.as_mut(),
-                                                        &mut remote_last_active,
-                                                    )
-                                                    .await;
-                                                }
-                                                GateAction::SendStitched(pcm) => {
-                                                    send_gated_remote_chunk(
-                                                        &mut remote_session,
-                                                        &pcm,
-                                                        &mut remote_samples_sent,
-                                                        remote_total_injected,
-                                                        remote_net_offset,
-                                                        remote_timestamp_mapper.as_mut(),
-                                                        &mut remote_last_active,
-                                                    )
-                                                    .await;
-                                                }
-                                                GateAction::Drop { sample_count } => {
-                                                    remote_net_offset += sample_count as i64;
-                                                    if let Some(mapper) = remote_timestamp_mapper.as_mut() {
-                                                        mapper.record_checkpoint(remote_samples_sent + remote_total_injected, remote_net_offset);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    } else if let Some(session) = remote_session.as_mut() {
-                                        // Gate disabled: unconditional send, identical to
-                                        // this function's pre-gate behavior.
-                                        let chunk = AudioChunk { pcm: &resampled, start_sample: remote_samples_sent };
-                                        remote_samples_sent += resampled.len() as u64;
-                                        if let Err(err) = session.send_audio(chunk).await {
-                                            tracing::warn!(%err, ?track, "live transcription: send_audio failed");
-                                        }
-                                    }
+                                    remote.handle_chunk(&resampled).await;
                                 }
                             }
                         }
@@ -432,37 +367,12 @@ mod stt_wiring {
                                     tracing::warn!(%err, track = "self", "live transcription: failed to finalize STT session");
                                 }
                             }
-                            if let Some(session) = remote_session.take() {
-                                if let Err(err) = session.finalize().await {
-                                    tracing::warn!(%err, track = "remote", "live transcription: failed to finalize STT session");
-                                }
-                            }
+                            remote.finalize().await;
                         }
                     }
                 }
-                _ = remote_keepalive_timer.tick(), if silence_gate_enabled && remote_session.is_some() => {
-                    if remote_last_active.elapsed() >= REMOTE_KEEPALIVE_IDLE_THRESHOLD {
-                        if let Some(session) = remote_session.as_mut() {
-                            match session.keep_alive().await {
-                                Ok(KeepAliveEffect::InjectedAudio { samples }) => {
-                                    remote_net_offset -= samples as i64;
-                                    // Advance the provider-clock counter too (see its
-                                    // declaration's doc comment) — this heartbeat reached
-                                    // the provider, so it counts toward the position later
-                                    // checkpoints and lookups must agree on.
-                                    remote_total_injected += samples;
-                                    if let Some(mapper) = remote_timestamp_mapper.as_mut() {
-                                        mapper.record_checkpoint(remote_samples_sent + remote_total_injected, remote_net_offset);
-                                    }
-                                }
-                                Ok(KeepAliveEffect::ControlMessage | KeepAliveEffect::Noop) => {}
-                                Err(err) => {
-                                    tracing::warn!(%err, track = "remote", "live transcription: keep_alive failed");
-                                }
-                            }
-                            remote_last_active = Instant::now();
-                        }
-                    }
+                _ = remote_keepalive_timer.tick(), if remote.is_active() && remote.gate_enabled() => {
+                    remote.keep_alive_if_idle().await;
                 }
                 maybe = recv_track_event(&mut self_events) => {
                     match maybe {
@@ -486,11 +396,11 @@ mod stt_wiring {
                             if let SttEvent::Error(err) = &event {
                                 set_status(&status_sink, TrackKind::RemoteAudio, TrackTranscriptionStatus::Error(err.to_string()));
                             }
-                            persist_event(store, session_id, Some(TrackKind::RemoteAudio), event, remote_timestamp_mapper.as_ref());
+                            persist_event(store, session_id, Some(TrackKind::RemoteAudio), event, remote.timestamp_mapper());
                         }
                         None => {
                             remote_events = None;
-                            persist_pending_interim(store, session_id, TrackKind::RemoteAudio, remote_last_interim.take(), remote_timestamp_mapper.as_ref());
+                            persist_pending_interim(store, session_id, TrackKind::RemoteAudio, remote_last_interim.take(), remote.timestamp_mapper());
                         }
                     }
                 }
@@ -498,42 +408,176 @@ mod stt_wiring {
         }
     }
 
-    /// Sends one gated Remote-track span (`GateAction::Send`/`SendStitched`) to
-    /// `remote_session` (a no-op if it's `None`), advances `remote_samples_sent`
-    /// by `pcm.len()`, records a [`TimestampMapper`] checkpoint at the new
-    /// provider-clock position (net offset unchanged by a send — only
-    /// `GateAction::Drop` and keepalive heartbeats move it), and refreshes
-    /// `remote_last_active` so the idle-keepalive timer doesn't fire needlessly
-    /// right after real audio went out. Shared by both `GateAction` variants that
-    /// carry sendable PCM so the borrowed-vs-owned slice difference between them
-    /// doesn't need duplicating this bookkeeping twice.
-    ///
-    /// `remote_total_injected` is the cumulative keepalive-injected sample count so
-    /// far (see that variable's doc comment at its declaration) — the checkpoint is
-    /// keyed on `*remote_samples_sent + remote_total_injected`, not
-    /// `*remote_samples_sent` alone, since that's the actual position in the
-    /// provider's own audio clock that this checkpoint's offset starts applying
-    /// from.
-    #[allow(clippy::too_many_arguments)]
-    async fn send_gated_remote_chunk(
-        remote_session: &mut Option<Box<dyn SttSession>>,
-        pcm: &[f32],
-        remote_samples_sent: &mut u64,
-        remote_total_injected: u64,
-        remote_net_offset: i64,
-        remote_timestamp_mapper: Option<&mut TimestampMapper>,
-        remote_last_active: &mut Instant,
-    ) {
-        let Some(session) = remote_session.as_mut() else { return };
-        let chunk = AudioChunk { pcm, start_sample: *remote_samples_sent };
-        *remote_samples_sent += pcm.len() as u64;
-        if let Err(err) = session.send_audio(chunk).await {
-            tracing::warn!(%err, track = ?TrackKind::RemoteAudio, "live transcription: send_audio failed");
+    /// Bundles every piece of Remote-track-only state the VAD gate
+    /// (`silence_gate_enabled`, v1 scope — see [`run_live_transcription`]'s doc
+    /// comment), the idle-keepalive timer, and timestamp correction share, so a
+    /// `select!` branch that needs any of it doesn't have to thread half a dozen
+    /// loose `remote_*` locals through by hand. Consolidating them here is also what
+    /// fixed a real bug caught in code review: `total_injected` used to be a
+    /// separate argument callers could (and once did) forget to fold into a
+    /// checkpoint's key.
+    struct RemoteGateState {
+        session: Option<Box<dyn SttSession>>,
+        /// Only `Some` when `silence_gate_enabled` — see `new`.
+        gate: Option<SilenceGate>,
+        mapper: Option<TimestampMapper>,
+        /// Samples actually sent to the provider via `send_audio`, i.e. what
+        /// `AudioChunk::start_sample` needs — does *not* include keepalive-injected
+        /// samples (see `total_injected`).
+        samples_sent: u64,
+        /// Cumulative samples sent to the provider via `keep_alive`'s
+        /// `KeepAliveEffect::InjectedAudio` (Google/OpenAI), which bypass
+        /// `samples_sent` entirely — that counter only tracks bytes sent through
+        /// `send_audio`, but injected heartbeat audio reaches the provider through
+        /// each adapter's own internal channel. The provider's *own* audio-duration
+        /// clock (what its `audio_start_ms`/`audio_end_ms` are computed from)
+        /// advances on both, so every `TimestampMapper` checkpoint is keyed on
+        /// `samples_sent + total_injected`, not `samples_sent` alone — using the
+        /// latter would under-count the provider's real position by however much
+        /// has been injected so far, corrupting `TimestampMapper::to_wallclock_ms`'s
+        /// binary search against later checkpoints.
+        total_injected: u64,
+        /// `captured_samples_dropped - artificial_samples_injected` so far (see
+        /// `TimestampMapper`'s doc comment) — advances on every dropped span and
+        /// every keepalive-injected heartbeat.
+        net_offset: i64,
+        /// Last time real audio (`Send`/`SendStitched`) or a keepalive reached the
+        /// provider, for `keep_alive_if_idle`. Only consulted while `gate.is_some()`
+        /// and `session.is_some()`, so its initial value is otherwise irrelevant.
+        last_active: Instant,
+    }
+
+    impl RemoteGateState {
+        fn new(session: Option<Box<dyn SttSession>>, silence_gate_enabled: bool, target_rate_hz: u32) -> Self {
+            Self {
+                session,
+                gate: silence_gate_enabled.then(|| SilenceGate::new(GateConfig { sample_rate_hz: target_rate_hz, ..GateConfig::default() })),
+                mapper: silence_gate_enabled.then(|| TimestampMapper::new(target_rate_hz)),
+                samples_sent: 0,
+                total_injected: 0,
+                net_offset: 0,
+                last_active: Instant::now(),
+            }
         }
-        if let Some(mapper) = remote_timestamp_mapper {
-            mapper.record_checkpoint(*remote_samples_sent + remote_total_injected, remote_net_offset);
+
+        fn is_active(&self) -> bool {
+            self.session.is_some()
         }
-        *remote_last_active = Instant::now();
+
+        /// Whether the VAD gate (and therefore the keepalive timer and timestamp
+        /// correction) is enabled for this track — a stand-in for
+        /// `silence_gate_enabled` that doesn't need that flag threaded separately,
+        /// since `gate` is only ever constructed from it in `new` and never changes
+        /// afterward.
+        fn gate_enabled(&self) -> bool {
+            self.gate.is_some()
+        }
+
+        fn timestamp_mapper(&self) -> Option<&TimestampMapper> {
+            self.mapper.as_ref()
+        }
+
+        /// Routes one incoming chunk (already resampled to the provider's target
+        /// rate) through the gate if enabled, or sends it unconditionally
+        /// otherwise — matching this function's pre-gate behavior exactly when
+        /// `gate` is `None`. A no-op if there's no session to send to; callers
+        /// should check `is_active` first so a session-less track doesn't pay for
+        /// `resample`ing input this would just discard (see the `select!` loop's
+        /// `TrackKind::RemoteAudio if !remote.is_active()` arm).
+        async fn handle_chunk(&mut self, resampled: &[f32]) {
+            let Some(gate) = self.gate.as_mut() else {
+                self.send_unconditional(resampled).await;
+                return;
+            };
+            // Gate enabled: send only the spans `SilenceGate` judges worth paying
+            // for, and record a `TimestampMapper` checkpoint for every action so
+            // `persist_event`/`persist_pending_interim` can correct provider
+            // timestamps back to wall-clock.
+            for action in gate.process(resampled) {
+                match action {
+                    GateAction::Send(pcm) => self.send_gated(pcm).await,
+                    GateAction::SendStitched(pcm) => self.send_gated(&pcm).await,
+                    GateAction::Drop { sample_count } => self.record_drop(sample_count),
+                }
+            }
+        }
+
+        /// Sends `pcm` unconditionally (a no-op if there's no session) and advances
+        /// `samples_sent` — the shared core of both the gate-disabled fallback path
+        /// and `send_gated` below. Does not touch `mapper`/`net_offset`/
+        /// `last_active`; callers that need those (i.e. `send_gated`) add them on
+        /// top.
+        async fn send_unconditional(&mut self, pcm: &[f32]) {
+            let Some(session) = self.session.as_mut() else { return };
+            let chunk = AudioChunk { pcm, start_sample: self.samples_sent };
+            self.samples_sent += pcm.len() as u64;
+            if let Err(err) = session.send_audio(chunk).await {
+                tracing::warn!(%err, track = ?TrackKind::RemoteAudio, "live transcription: send_audio failed");
+            }
+        }
+
+        /// Sends one gated span (`GateAction::Send`/`SendStitched`), records a
+        /// `TimestampMapper` checkpoint at the new provider-clock position (net
+        /// offset unchanged by a send — only `record_drop` and keepalive
+        /// heartbeats move it), and refreshes `last_active` so the idle-keepalive
+        /// timer doesn't fire needlessly right after real audio went out.
+        async fn send_gated(&mut self, pcm: &[f32]) {
+            self.send_unconditional(pcm).await;
+            if let Some(mapper) = self.mapper.as_mut() {
+                mapper.record_checkpoint(self.samples_sent + self.total_injected, self.net_offset);
+            }
+            self.last_active = Instant::now();
+        }
+
+        /// Accounts for a `GateAction::Drop`: `sample_count` samples were judged
+        /// silence and never sent, so `net_offset` grows by that much and a
+        /// checkpoint is recorded at the (unchanged) provider-clock position.
+        fn record_drop(&mut self, sample_count: u64) {
+            self.net_offset += sample_count as i64;
+            if let Some(mapper) = self.mapper.as_mut() {
+                mapper.record_checkpoint(self.samples_sent + self.total_injected, self.net_offset);
+            }
+        }
+
+        /// Calls `SttSession::keep_alive` if the Remote track has gone
+        /// `REMOTE_KEEPALIVE_IDLE_THRESHOLD` without any real audio, so the
+        /// provider's idle-connection timeout doesn't fire during a long
+        /// silence-gated gap. A no-op unless the gate is enabled and there's a
+        /// session to keep alive — callers should still guard the `select!`
+        /// branch itself on `is_active() && gate_enabled()` to avoid polling this
+        /// needlessly once neither holds.
+        async fn keep_alive_if_idle(&mut self) {
+            if !self.gate_enabled() || self.last_active.elapsed() < REMOTE_KEEPALIVE_IDLE_THRESHOLD {
+                return;
+            }
+            let Some(session) = self.session.as_mut() else { return };
+            match session.keep_alive().await {
+                Ok(KeepAliveEffect::InjectedAudio { samples }) => {
+                    self.net_offset -= samples as i64;
+                    // Advance the provider-clock counter too (see `total_injected`'s
+                    // doc comment) — this heartbeat reached the provider, so it
+                    // counts toward the position later checkpoints and lookups must
+                    // agree on.
+                    self.total_injected += samples;
+                    if let Some(mapper) = self.mapper.as_mut() {
+                        mapper.record_checkpoint(self.samples_sent + self.total_injected, self.net_offset);
+                    }
+                }
+                Ok(KeepAliveEffect::ControlMessage | KeepAliveEffect::Noop) => {}
+                Err(err) => {
+                    tracing::warn!(%err, track = "remote", "live transcription: keep_alive failed");
+                }
+            }
+            self.last_active = Instant::now();
+        }
+
+        async fn finalize(&mut self) {
+            if let Some(session) = self.session.take() {
+                if let Err(err) = session.finalize().await {
+                    tracing::warn!(%err, track = "remote", "live transcription: failed to finalize STT session");
+                }
+            }
+        }
     }
 
     /// Awaits the next event for a track whose events channel may already be
@@ -548,20 +592,6 @@ mod stt_wiring {
         match events {
             Some(rx) => rx.recv().await,
             None => std::future::pending().await,
-        }
-    }
-
-    /// Splits `SttProvider::start_session`'s `(Box<dyn SttSession>, UnboundedReceiver<SttEvent>)`
-    /// pair (or nothing, if that track's session never started) into independently
-    /// tracked `Option`s, so the send-audio and event-draining halves below can each
-    /// hold/clear their own half without fighting over one combined `Option`.
-    #[allow(clippy::type_complexity)]
-    fn split(
-        session: Option<(Box<dyn SttSession>, UnboundedReceiver<SttEvent>)>,
-    ) -> (Option<Box<dyn SttSession>>, Option<UnboundedReceiver<SttEvent>>) {
-        match session {
-            Some((session, events)) => (Some(session), Some(events)),
-            None => (None, None),
         }
     }
 
@@ -723,10 +753,9 @@ mod stt_wiring {
         /// Minimal in-memory `SttSession` test double for exercising
         /// `send_gated_remote_chunk` without a real provider connection — records
         /// every `send_audio` call's `(start_sample, pcm)` so a test can assert
-        /// what was actually sent, and returns a caller-configured
-        /// `KeepAliveEffect` from `keep_alive` (defaulting to the trait's own
-        /// `Noop` default is not exercised here since these tests only cover
-        /// `send_gated_remote_chunk`, not the keepalive timer branch itself).
+        /// what was actually sent. Relies on `SttSession::keep_alive`'s default
+        /// no-op implementation — these tests only cover `RemoteGateState::send_gated`,
+        /// not the keepalive timer branch itself.
         struct MockSttSession {
             sent: Vec<(u64, Vec<f32>)>,
         }
@@ -749,63 +778,51 @@ mod stt_wiring {
             }
         }
 
+        fn test_remote_gate_state(session: Option<Box<dyn SttSession>>, samples_sent: u64, total_injected: u64, net_offset: i64, last_active: Instant) -> RemoteGateState {
+            RemoteGateState { session, gate: None, mapper: Some(TimestampMapper::new(100)), samples_sent, total_injected, net_offset, last_active }
+        }
+
         #[tokio::test]
-        async fn send_gated_remote_chunk_sends_advances_and_checkpoints() {
-            let mut remote_session: Option<Box<dyn SttSession>> = Some(Box::new(MockSttSession::new()));
-            let mut remote_samples_sent: u64 = 10;
-            let mut remote_timestamp_mapper = Some(TimestampMapper::new(100));
-            let mut remote_last_active = Instant::now() - Duration::from_secs(10);
-            let before_call = remote_last_active;
+        async fn remote_gate_state_send_gated_advances_and_checkpoints() {
+            let mut remote = test_remote_gate_state(Some(Box::new(MockSttSession::new())), 10, 0, 0, Instant::now() - Duration::from_secs(10));
+            let before_call = remote.last_active;
 
             let pcm = vec![0.5f32; 5];
-            send_gated_remote_chunk(&mut remote_session, &pcm, &mut remote_samples_sent, 0, 0, remote_timestamp_mapper.as_mut(), &mut remote_last_active).await;
+            remote.send_gated(&pcm).await;
 
-            assert_eq!(remote_samples_sent, 15, "samples_sent must advance by the chunk length");
-            assert!(remote_last_active > before_call, "a real send must refresh the idle-keepalive clock");
+            assert_eq!(remote.samples_sent, 15, "samples_sent must advance by the chunk length");
+            assert!(remote.last_active > before_call, "a real send must refresh the idle-keepalive clock");
 
             // The checkpoint recorded after this send should apply a net offset of
             // 0 (no drop/heartbeat yet) from this point on.
-            let mapper = remote_timestamp_mapper.unwrap();
+            let mapper = remote.mapper.unwrap();
             assert_eq!(mapper.to_wallclock_ms(150), 150);
         }
 
         #[tokio::test]
-        async fn send_gated_remote_chunk_checkpoints_at_the_provider_clock_including_injected_samples() {
-            // Regression test for a Codex review finding: `send_gated_remote_chunk`
-            // used to checkpoint at `remote_samples_sent` alone, ignoring how many
-            // samples `keep_alive`'s `KeepAliveEffect::InjectedAudio` had already
-            // pushed into the provider's own audio clock. That under-counts the
+        async fn remote_gate_state_send_gated_checkpoints_at_the_provider_clock_including_injected_samples() {
+            // Regression test for a Codex review finding: `send_gated` used to
+            // checkpoint at `samples_sent` alone, ignoring how many samples
+            // `keep_alive`'s `KeepAliveEffect::InjectedAudio` had already pushed
+            // into the provider's own audio clock. That under-counts the
             // checkpoint's key, so a later timestamp lookup can wrongly treat a
             // checkpoint as already in effect before the provider's real position
             // ever reached it.
-            let mut remote_session: Option<Box<dyn SttSession>> = Some(Box::new(MockSttSession::new()));
-            let mut remote_samples_sent: u64 = 0;
-            let mut remote_timestamp_mapper = Some(TimestampMapper::new(100));
-            let mut remote_last_active = Instant::now();
-
+            //
             // 200 samples (2s) worth of heartbeat already injected before this send
             // — e.g. several keepalives fired during a long leading silence — plus
             // a non-zero net offset, so the bug's effect on `to_wallclock_ms` is
             // observable (an offset of 0 would look identical either way).
-            let remote_total_injected: u64 = 200;
-            let remote_net_offset: i64 = -50;
+            let mut remote = test_remote_gate_state(Some(Box::new(MockSttSession::new())), 0, 200, -50, Instant::now());
+
             let pcm = vec![0.5f32; 10];
-            send_gated_remote_chunk(
-                &mut remote_session,
-                &pcm,
-                &mut remote_samples_sent,
-                remote_total_injected,
-                remote_net_offset,
-                remote_timestamp_mapper.as_mut(),
-                &mut remote_last_active,
-            )
-            .await;
+            remote.send_gated(&pcm).await;
 
-            // `remote_samples_sent` itself must still track only real `send_audio`
-            // bytes (used for `AudioChunk::start_sample`), not the injected ones.
-            assert_eq!(remote_samples_sent, 10);
+            // `samples_sent` itself must still track only real `send_audio` bytes
+            // (used for `AudioChunk::start_sample`), not the injected ones.
+            assert_eq!(remote.samples_sent, 10);
 
-            let mapper = remote_timestamp_mapper.unwrap();
+            let mapper = remote.mapper.unwrap();
             // A provider timestamp of 1000ms (100 samples @ 100Hz) predates the
             // checkpoint's *correct* key of sent(10) + injected(200) = 210 samples,
             // so it must NOT pick up this checkpoint's -50-sample offset — the
