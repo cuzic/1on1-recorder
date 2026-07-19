@@ -113,7 +113,7 @@ mod tests {
     use recorder_domain::TrackKind;
 
     fn seg(track: Option<TrackKind>, speaker: Option<u32>, text: &str, start_ms: Option<u64>, end_ms: Option<u64>, is_final: bool) -> TranscriptSegment {
-        TranscriptSegment { session_id: SessionId::new(), track, speaker, text: text.to_string(), start_ms, end_ms, is_final }
+        TranscriptSegment { session_id: SessionId::new(), track, speaker, text: text.to_string(), start_ms, end_ms, is_final, is_retranscribed: false }
     }
 
     fn sample_started_at() -> DateTime<Utc> {

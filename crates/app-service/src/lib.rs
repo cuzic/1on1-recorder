@@ -12,6 +12,13 @@ mod normalize;
 mod pipeline;
 #[cfg(feature = "live-transcription")]
 mod resample;
+// Task #91: needs `stt-api`'s `BatchSttProvider` and `stt-deepgram`'s batch
+// adapter, both optional deps only pulled in by `live-transcription` (see this
+// crate's `Cargo.toml`) — unlike `live_transcription` itself, there is no
+// feature-disabled stub, so the module doesn't exist at all without it (see
+// `retranscribe`'s own doc comment).
+#[cfg(feature = "live-transcription")]
+mod retranscribe;
 mod segmenter;
 mod session_lifecycle;
 mod silence_gate;
@@ -54,6 +61,8 @@ pub use windows_session::run_windows_capture_session;
 // the same `not(feature = "macos-supervisor")` guard.
 #[cfg(feature = "windows-supervisor")]
 pub use live_transcription::{TrackTranscriptionStatus, TranscriptionStatus};
+#[cfg(feature = "live-transcription")]
+pub use retranscribe::{retranscribe_gap, supports_batch_retranscription, RetranscribeError};
 
 #[cfg(feature = "macos-supervisor")]
 pub mod macos_frame_collector;

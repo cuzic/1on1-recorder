@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use recorder_domain::TrackKind;
-use session_store::TranscriptSegment;
+use session_store::{TranscriptSegment, TranscriptionGap};
 use summarize::TranscriptTurn;
 
 /// Base label for a segment's track — the app's own primary speaker axis (see
@@ -61,9 +61,46 @@ pub fn visible_segments(segments: &[TranscriptSegment]) -> Vec<&TranscriptSegmen
     segments.iter().enumerate().filter(|(i, seg)| seg.is_final || keep_interim.contains(i)).map(|(_, seg)| seg).collect()
 }
 
+/// One row of the transcript panel's merged timeline (task #92): either a
+/// transcript bubble or a `transcription_gaps` marker (task #90), interleaved
+/// by position rather than shown as two separate lists — see
+/// [`timeline_items`]'s doc comment for how position is derived.
+#[derive(Debug, Clone, Copy)]
+pub enum TimelineItem<'a> {
+    Segment(&'a TranscriptSegment),
+    Gap(&'a TranscriptionGap),
+}
+
+/// Merges [`visible_segments`] with every gap in `gaps` into one chronological
+/// list for the transcript panel (task #92), ordered by each item's own start
+/// time: a segment's `start_ms` (pushed to the end when unset — the provider
+/// never sent one, so there's no better position to guess at than "last"), or
+/// a gap's `start_ms` (always present). This can't just be "render segments,
+/// then gaps" or rely on `list_transcript_segments`' own insertion order the
+/// way [`visible_segments`] does: a re-transcribed segment (task #91) is
+/// persisted well after the live rows around it, so it needs to be sorted back
+/// into its actual chronological spot rather than trailing at the end where it
+/// was inserted. `sort_by_key` is stable, so items that tie on position (most
+/// commonly two rows with no `start_ms` at all) keep `visible_segments`'/
+/// `gaps`' own relative order instead of shuffling.
+pub fn timeline_items<'a>(segments: &'a [TranscriptSegment], gaps: &'a [TranscriptionGap]) -> Vec<TimelineItem<'a>> {
+    let mut items: Vec<TimelineItem<'a>> = visible_segments(segments).into_iter().map(TimelineItem::Segment).collect();
+    items.extend(gaps.iter().map(TimelineItem::Gap));
+    items.sort_by_key(|item| match item {
+        TimelineItem::Segment(s) => s.start_ms.unwrap_or(u64::MAX),
+        TimelineItem::Gap(g) => g.start_ms,
+    });
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use recorder_domain::SessionId;
+
+    fn gap(id: i64, track: TrackKind, start_ms: u64, end_ms: Option<u64>) -> TranscriptionGap {
+        TranscriptionGap { id, session_id: SessionId::new(), track, start_ms, end_ms }
+    }
 
     fn seg(track: Option<TrackKind>, text: &str, is_final: bool) -> TranscriptSegment {
         TranscriptSegment {
@@ -74,6 +111,7 @@ mod tests {
             start_ms: None,
             end_ms: None,
             is_final,
+            is_retranscribed: false,
         }
     }
 
@@ -130,5 +168,73 @@ mod tests {
     fn empty_input_yields_empty_output() {
         let segments: Vec<TranscriptSegment> = vec![];
         assert!(visible_segments(&segments).is_empty());
+    }
+
+    /// Like `seg`, but with an explicit `start_ms` — `timeline_items` sorts on
+    /// it, unlike `visible_segments`, so its tests need real values instead of
+    /// `seg`'s hardcoded `None`.
+    fn seg_at(track: Option<TrackKind>, text: &str, start_ms: u64) -> TranscriptSegment {
+        TranscriptSegment {
+            session_id: SessionId::new(),
+            track,
+            speaker: None,
+            text: text.to_string(),
+            start_ms: Some(start_ms),
+            end_ms: Some(start_ms + 100),
+            is_final: true,
+            is_retranscribed: false,
+        }
+    }
+
+    fn timeline_labels(items: &[TimelineItem<'_>]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match item {
+                TimelineItem::Segment(s) => s.text.clone(),
+                TimelineItem::Gap(g) => format!("gap#{}", g.id),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn timeline_items_interleaves_a_gap_between_segments_by_start_ms() {
+        let segments = vec![seg_at(Some(TrackKind::SelfMic), "before", 0), seg_at(Some(TrackKind::SelfMic), "after", 5_000)];
+        let gaps = vec![gap(1, TrackKind::RemoteAudio, 1_000, Some(3_000))];
+
+        let items = timeline_items(&segments, &gaps);
+        assert_eq!(timeline_labels(&items), vec!["before", "gap#1", "after"]);
+    }
+
+    #[test]
+    fn timeline_items_places_a_retranscribed_segment_back_in_chronological_order() {
+        // Mirrors `retranscribe_gap`'s real effect: a gap closes, its
+        // `TranscriptSegment`s are `insert_transcript_segment`-ed (so they're
+        // last in `list_transcript_segments`' insertion order), but their
+        // `start_ms` sits *before* segments that were live-transcribed earlier
+        // in wall-clock time. `list_transcript_segments` would put the
+        // re-transcribed row last; `timeline_items` must not.
+        let live_early = seg_at(Some(TrackKind::SelfMic), "live early", 0);
+        let live_late = seg_at(Some(TrackKind::SelfMic), "live late", 10_000);
+        // Inserted after both live rows (as `retranscribe_gap` would), but its
+        // own start_ms falls between them.
+        let retranscribed = seg_at(Some(TrackKind::RemoteAudio), "retranscribed", 5_000);
+        let segments = vec![live_early, live_late, retranscribed];
+
+        let items = timeline_items(&segments, &[]);
+        assert_eq!(timeline_labels(&items), vec!["live early", "retranscribed", "live late"]);
+    }
+
+    #[test]
+    fn timeline_items_keeps_stable_order_for_ties() {
+        let segments = vec![seg_at(Some(TrackKind::SelfMic), "one", 100), seg_at(Some(TrackKind::RemoteAudio), "two", 100)];
+        let items = timeline_items(&segments, &[]);
+        assert_eq!(timeline_labels(&items), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn timeline_items_with_no_gaps_matches_visible_segments() {
+        let segments = vec![seg(Some(TrackKind::SelfMic), "final one", true), seg(Some(TrackKind::SelfMic), "in prog", false)];
+        let items = timeline_items(&segments, &[]);
+        assert_eq!(timeline_labels(&items), vec!["final one", "in prog"]);
     }
 }

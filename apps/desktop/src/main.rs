@@ -3,6 +3,7 @@ mod app_settings;
 mod app_state;
 mod config;
 mod export;
+mod gap_retranscription;
 mod history;
 mod level;
 mod recording;

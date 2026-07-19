@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,15 +9,16 @@ use dioxus::desktop::{use_tray_icon_event_handler, use_tray_menu_event_handler, 
 use dioxus::html::geometry::PixelsVector2D;
 use dioxus::prelude::*;
 use recorder_domain::{SessionId, TrackKind};
-use session_store::{Summary, TranscriptSegment};
+use session_store::{Summary, TranscriptSegment, TranscriptionGap};
 
 use crate::actions;
 use crate::app_state::AppState;
 use crate::export;
+use crate::gap_retranscription::{self, GapRetranscribeState};
 use crate::history;
 use crate::settings::{self, Screen, SummaryProvider};
 use crate::status::Status;
-use crate::transcript;
+use crate::transcript::{self, TimelineItem};
 use crate::transcription_status;
 
 const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
@@ -200,6 +202,38 @@ button.gear {
   margin: 0;
   white-space: pre-wrap;
 }
+.gap-row {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.3em;
+  padding: 0.5em 0.8em;
+  border: 1px dashed #f1c40f88;
+  border-radius: 8px;
+  background: #f1c40f11;
+  text-align: center;
+}
+.gap-label {
+  margin: 0;
+  font-size: 0.8em;
+  opacity: 0.85;
+}
+.gap-hint {
+  margin: 0;
+  font-size: 0.75em;
+  opacity: 0.6;
+}
+.gap-error {
+  margin: 0;
+  font-size: 0.75em;
+  color: #e74c3c;
+}
+button.gap-retranscribe {
+  padding: 0.35em 0.9em;
+  font-size: 0.85em;
+  background: #f1c40f;
+  color: #2a2000;
+}
 .summary-text {
   width: 100%;
   box-sizing: border-box;
@@ -262,6 +296,112 @@ fn setup_tray() {
     });
 }
 
+/// Task #92: one `transcription_gaps` (#90) marker in the transcript panel's
+/// timeline (`transcript::timeline_items`) — "この区間は文字起こしできません
+/// でした", plus a "この区間を再文字起こしする" button (#91) when both
+/// `can_retranscribe` (the selected STT provider has a `BatchSttProvider`
+/// adapter — see `gap_retranscription::supports_batch_retranscription`) and the
+/// gap is closed (`gap.end_ms.is_some()`) hold; an explanatory line instead of
+/// a button otherwise (requirement #2: no dead button, just a reason).
+///
+/// A standalone `#[component]` (rather than a plain fn spliced into `App`'s
+/// `for` loop) so its own `use_context::<Arc<AppState>>()` and the click
+/// handler's `spawn`ed future are scoped to just this one gap — clicking one
+/// gap's button doesn't need to know or care about any other gap on screen.
+#[component]
+fn GapMarker(
+    gap: TranscriptionGap,
+    can_retranscribe: bool,
+    provider_kind: app_service::SttProviderKind,
+    selected_session_id: Signal<Option<SessionId>>,
+    mut transcript_segments: Signal<Vec<TranscriptSegment>>,
+    mut gaps: Signal<Vec<TranscriptionGap>>,
+    mut gap_retranscribe_state: Signal<HashMap<i64, GapRetranscribeState>>,
+) -> Element {
+    let state = use_context::<Arc<AppState>>();
+    let gap_id = gap.id;
+    let gap_closed = gap.end_ms.is_some();
+    let track_label = transcript::track_label(Some(gap.track));
+    let label = match gap.end_ms {
+        Some(end_ms) => format!("⚠ {track_label}: この区間({})は文字起こしできませんでした", format_elapsed(end_ms.saturating_sub(gap.start_ms))),
+        None => format!("⚠ {track_label}: この区間は文字起こしできませんでした"),
+    };
+
+    let current_state = gap_retranscribe_state().get(&gap_id).cloned();
+    let is_loading = matches!(current_state, Some(GapRetranscribeState::Loading));
+    let error_text = match current_state {
+        Some(GapRetranscribeState::Error(msg)) => Some(msg),
+        _ => None,
+    };
+
+    let on_retranscribe = move |_| {
+        let state = state.clone();
+        async move {
+            gap_retranscribe_state.with_mut(|m| {
+                m.insert(gap_id, GapRetranscribeState::Loading);
+            });
+            match gap_retranscription::retranscribe(gap, provider_kind, &state.store, state.credential_store.as_ref()).await {
+                Ok(new_segments) => {
+                    // The gap is resolved server-side too (`retranscribe_gap`
+                    // already called `SessionStore::discard_gap` — see task #91's
+                    // doc comment), so drop it from both the local `gaps` list and
+                    // any leftover loading/error entry, and fold the newly
+                    // persisted rows straight into `transcript_segments` —
+                    // `transcript::timeline_items` re-sorts by `start_ms` on every
+                    // render, so appending here still lands them in the right
+                    // chronological spot without waiting for the next poll tick.
+                    gap_retranscribe_state.with_mut(|m| {
+                        m.remove(&gap_id);
+                    });
+                    // Guard against a session switch that happened while this
+                    // request was in flight: `transcript_segments`/`gaps` are
+                    // shared, session-agnostic signals (`ui::App` reloads them
+                    // wholesale on every `selected_session_id` change), not scoped
+                    // to `gap.session_id`. Without this check, retranscribing a gap
+                    // in session A and then picking a different session B from
+                    // `history::History` before the request finishes would splice
+                    // session A's newly persisted rows into session B's on-screen
+                    // transcript. The DB write already happened either way, so
+                    // skipping the local update here just means session A's panel
+                    // picks it up from `SessionStore` the next time it's selected
+                    // (selection-reload effect / poll loop), rather than seeing it
+                    // update live right now.
+                    if selected_session_id() == Some(gap.session_id) {
+                        transcript_segments.with_mut(|segs| segs.extend(new_segments));
+                        gaps.with_mut(|g| g.retain(|existing| existing.id != gap_id));
+                    }
+                }
+                Err(err) => {
+                    gap_retranscribe_state.with_mut(|m| {
+                        m.insert(gap_id, GapRetranscribeState::Error(err));
+                    });
+                }
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "gap-row",
+            p { class: "gap-label", "{label}" }
+            if !gap_closed {
+                p { class: "gap-hint", "(まだ接続が回復していません)" }
+            } else if can_retranscribe {
+                button {
+                    class: "gap-retranscribe",
+                    disabled: is_loading,
+                    onclick: on_retranscribe,
+                    if is_loading { "再文字起こし中..." } else { "この区間を再文字起こしする" }
+                }
+            } else {
+                p { class: "gap-hint", "選択中のSTTプロバイダは再文字起こしに未対応です" }
+            }
+            if let Some(msg) = error_text {
+                p { class: "gap-error", "{msg}" }
+            }
+        }
+    }
+}
+
 #[component]
 pub fn App() -> Element {
     setup_tray();
@@ -287,6 +427,15 @@ pub fn App() -> Element {
     // tracked as a plain loop-local `Option<String>` (not a signal) since nothing
     // outside this future reads it.
     let mut transcript_segments = use_signal(Vec::<TranscriptSegment>::new);
+    // Task #92: gaps (task #90) for whichever session `transcript_segments` above
+    // is currently showing, and per-gap client-side state for the "この区間を
+    // 再文字起こしする" button (#91) each renders — a gap missing from the map
+    // reads as idle (see `gap_retranscription::GapRetranscribeState`'s doc
+    // comment). Loaded/cleared alongside `transcript_segments` throughout this
+    // component (poll loop and the selection-change effect below), so the two
+    // never point at different sessions.
+    let mut gaps = use_signal(Vec::<TranscriptionGap>::new);
+    let mut gap_retranscribe_state = use_signal(HashMap::<i64, GapRetranscribeState>::new);
     let mut summary_text = use_signal(|| None::<String>);
     let mut summary_message = use_signal(|| None::<String>);
     let mut summary_busy = use_signal(|| false);
@@ -360,14 +509,21 @@ pub fn App() -> Element {
                     }
                 }
 
-                // Only the recording_active view renders the panel (#33's scope), so
-                // there's no need to poll `list_transcript_segments` once recording
-                // stops.
-                if new_status.recording {
-                    if let Some(id) = last_session_id.as_ref().and_then(|s| s.parse::<SessionId>().ok()) {
-                        if let Ok(segments) = state.store.list_transcript_segments(id) {
-                            transcript_segments.set(segments);
-                        }
+                // Task #92: the transcript panel (with gap markers) is now shown
+                // for whichever session is *selected*, not just a live recording
+                // (#33's original scope) — a `history::History` pick can point
+                // `selected_session_id` at a session other than the one
+                // `last_session_id`/`new_status.recording` describes, so this polls
+                // off `selected_session_id` directly rather than `last_session_id`.
+                // The selection-change effect below also loads both once
+                // immediately on every selection change, so a picked-but-not-yet-
+                // polled session doesn't show a stale flash of the previous one.
+                if let Some(id) = selected_session_id() {
+                    if let Ok(segments) = state.store.list_transcript_segments(id) {
+                        transcript_segments.set(segments);
+                    }
+                    if let Ok(session_gaps) = state.store.gaps_for_session(id) {
+                        gaps.set(session_gaps);
                     }
                 }
 
@@ -382,13 +538,28 @@ pub fn App() -> Element {
     // and clear any stale success/error messages from a previous selection —
     // mirrors what the polling future used to do inline for `last_session_id`
     // before `selected_session_id` existed.
-    let summary_reload_state = state.clone();
+    //
+    // Task #92: also reloads the transcript + gaps immediately here, rather than
+    // waiting up to 250ms for the poll loop's next tick — otherwise switching to
+    // a different session in `history::History` would briefly show whichever
+    // session's bubbles/gap markers were on screen before, since the poll loop
+    // only overwrites `transcript_segments`/`gaps` once its own tick fires. Also
+    // clears `gap_retranscribe_state`: a gap id is only unique within its own
+    // session's rows, so a stale loading/error entry from a previous selection
+    // could otherwise mislabel an unrelated gap that happens to reuse the id.
+    let selection_reload_state = state.clone();
     use_effect(move || {
         let session_id = selected_session_id();
         summary_message.set(None);
         export_message.set(None);
-        let latest = session_id.and_then(|id| summary_reload_state.store.get_latest_summary(id).ok().flatten());
+        let latest = session_id.and_then(|id| selection_reload_state.store.get_latest_summary(id).ok().flatten());
         summary_text.set(latest.map(|s| s.text));
+
+        let segments = session_id.and_then(|id| selection_reload_state.store.list_transcript_segments(id).ok()).unwrap_or_default();
+        transcript_segments.set(segments);
+        let session_gaps = session_id.and_then(|id| selection_reload_state.store.gaps_for_session(id).ok()).unwrap_or_default();
+        gaps.set(session_gaps);
+        gap_retranscribe_state.set(HashMap::new());
     });
 
     // design.md's force-quit recovery (task #11): resume any session a previous
@@ -642,10 +813,20 @@ pub fn App() -> Element {
     let is_busy = busy();
     let is_summary_busy = summary_busy();
 
-    // #51: collapse Deepgram's Partial/Final row stream into one bubble per
-    // in-flight utterance — see `transcript::visible_segments`'s doc comment.
+    // #51/#92: collapse Deepgram's Partial/Final row stream into one bubble per
+    // in-flight utterance, then interleave `transcription_gaps` markers into
+    // their correct chronological spot — see `transcript::timeline_items`'s doc
+    // comment.
     let raw_segments = transcript_segments();
-    let visible_segments = transcript::visible_segments(&raw_segments);
+    let gap_list = gaps();
+    let timeline = transcript::timeline_items(&raw_segments, &gap_list);
+    // Task #92: whether to show a "この区間を再文字起こしする" button at all
+    // (vs. an explanatory line) — the currently *selected* STT provider (not
+    // necessarily the one that was connected when the gap itself was recorded;
+    // see `retranscribe_gap`'s own doc comment) needs a `BatchSttProvider`
+    // adapter (#91) for that to make sense.
+    let selected_provider_kind = gap_retranscription::selected_provider_kind(state.credential_store.as_ref());
+    let can_retranscribe = gap_retranscription::supports_batch_retranscription(selected_provider_kind);
 
     if screen() == Screen::Settings {
         return rsx! {
@@ -721,21 +902,43 @@ pub fn App() -> Element {
                     if let Some(msg) = transcription_status_line {
                         p { class: "hint", "{msg}" }
                     }
+                }
+            }
 
-                    // #33/#34: live transcript, grouped into chat-style bubbles by
-                    // track (Self/Remote — this app's primary speaker axis; see
-                    // `transcript::track_label`'s doc comment) with an optional
-                    // Deepgram diarization index appended.
+            // #33/#34/#92: transcript panel — bubbles grouped by track
+            // (Self/Remote — this app's primary speaker axis; see
+            // `transcript::track_label`'s doc comment) with an optional Deepgram
+            // diarization index appended, interleaved with `transcription_gaps`
+            // markers (#90) in their chronological spot. Shown whenever a session
+            // is selected (not just while recording, unlike #33's original
+            // scope): a gap is most often actionable right after the session
+            // that had it stops (see `close_open_gap`), so restricting this to
+            // `recording_active` would hide it right when it becomes useful.
+            if has_session {
+                section { class: "panel transcript-section",
                     div {
                         class: "transcript-panel",
                         onmounted: move |e| transcript_panel_mounted.set(Some(e.data())),
-                        for seg in visible_segments {
-                            div {
-                                class: if seg.track == Some(TrackKind::SelfMic) { "bubble-row bubble-self" } else if seg.track == Some(TrackKind::RemoteAudio) { "bubble-row bubble-remote" } else { "bubble-row bubble-unknown" },
+                        for item in timeline {
+                            if let TimelineItem::Segment(seg) = item {
                                 div {
-                                    class: if seg.is_final { "bubble bubble-final" } else { "bubble bubble-interim" },
-                                    span { class: "bubble-label", "{transcript::speaker_label(seg.track, seg.speaker)}" }
-                                    p { class: "bubble-text", "{seg.text}" }
+                                    class: if seg.track == Some(TrackKind::SelfMic) { "bubble-row bubble-self" } else if seg.track == Some(TrackKind::RemoteAudio) { "bubble-row bubble-remote" } else { "bubble-row bubble-unknown" },
+                                    div {
+                                        class: if seg.is_final { "bubble bubble-final" } else { "bubble bubble-interim" },
+                                        span { class: "bubble-label", "{transcript::speaker_label(seg.track, seg.speaker)}" }
+                                        p { class: "bubble-text", "{seg.text}" }
+                                    }
+                                }
+                            }
+                            if let TimelineItem::Gap(gap) = item {
+                                GapMarker {
+                                    gap: *gap,
+                                    can_retranscribe,
+                                    provider_kind: selected_provider_kind,
+                                    selected_session_id,
+                                    transcript_segments,
+                                    gaps,
+                                    gap_retranscribe_state,
                                 }
                             }
                         }

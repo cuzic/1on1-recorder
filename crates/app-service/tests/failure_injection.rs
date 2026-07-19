@@ -3,8 +3,16 @@
 //! end of a session, and resuming/idempotently re-sending after a restart. Builds
 //! directly on stage 3's `session_lifecycle`/`upload_worker` (task #11).
 
+// Only used by `disk_write_failure_during_recording_leaves_a_recoverable_session`
+// below, which is itself `#[cfg(unix)]` (it relies on Unix file permission bits to
+// simulate a disk-write failure — see that test's own comment) — gated the same way
+// here so a non-unix `--tests` type-check (e.g. this crate's Windows cross-compile
+// check) doesn't flag these as unused imports.
+#[cfg(unix)]
 use app_service::pseudo_source::{generate_frames, nominal_frame_interval_ns, PseudoSourceConfig};
-use app_service::{begin_session, end_session, recover_incomplete_sessions, run_pipeline};
+#[cfg(unix)]
+use app_service::run_pipeline;
+use app_service::{begin_session, end_session, recover_incomplete_sessions};
 use chrono::Utc;
 use recorder_domain::{
     AudioManifest, CaptureManifest, CaptureState, ConsentManifest, RemoteSourceKind, SessionId,

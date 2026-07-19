@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use credential_store::CredentialStore;
 use recorder_domain::{SessionId, TrackKind};
 use session_store::SessionStore;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 /// Per-track Deepgram connection status (task #52): the desktop UI can't otherwise
 /// tell "nobody has spoken yet" from "STT is broken" when the transcript panel is
@@ -103,12 +103,34 @@ mod stt_wiring {
     use crate::silence_gate::{GateAction, GateConfig, SilenceGate};
     use crate::timestamp_mapper::TimestampMapper;
     use session_store::TranscriptSegment;
-    use stt_api::{AudioChunk, KeepAliveEffect, SttEvent, SttProvider, SttSession, SttSessionConfig};
+    use stt_api::{AudioChunk, KeepAliveEffect, SttError, SttEvent, SttProvider, SttSession, SttSessionConfig};
     use stt_assemblyai::AssemblyAIProvider;
     use stt_deepgram::DeepgramProvider;
     use stt_google::{GoogleProvider, GoogleSttCredentials};
     use stt_openai::OpenAiProvider;
+    // `Receiver<(TrackKind, Vec<f32>, u32)>` (the `audio_rx` side channel) comes
+    // from `super::*` above; `UnboundedReceiver` is only needed in here, for each
+    // provider's per-track `SttEvent` stream (`SttProvider::start_session`'s
+    // return type) — kept local rather than added to the outer `use` so a
+    // `windows-supervisor`-only build (this module doesn't exist without
+    // `live-transcription`) doesn't warn about an unused import.
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::task::{JoinError, JoinHandle};
     use tokio::time::{Duration, Instant};
+
+    /// Shortest STT outage worth persisting to `transcription_gaps` (task
+    /// #90). Every disconnect opens a gap row immediately (see
+    /// `open_gap`/`ReconnectState::open_gap_id`) since its eventual length
+    /// isn't known up front, but a track that reconnects (or a keepalive
+    /// that succeeds again) within about one `reconnect_backoff` attempt of
+    /// going down hasn't actually lost any transcript worth flagging for
+    /// task #91/#92's manual re-transcription UI — recording every one of
+    /// those would make the gap list mostly noise instead of the handful of
+    /// outages that genuinely dropped speech. 1s is comfortably above
+    /// `reconnect_backoff`'s 500ms floor (so a same-attempt reconnect never
+    /// counts) while still well under what a real network/provider outage
+    /// worth re-transcribing looks like in practice.
+    const MIN_RECORDED_GAP_MS: u64 = 1_000;
 
     /// How long the Remote track's STT session may go without any real (Send/
     /// SendStitched) audio before [`run_live_transcription`]'s keepalive timer
@@ -117,6 +139,28 @@ mod stt_wiring {
     /// than any known provider's idle timeout, with headroom for the 1s timer
     /// granularity below.
     const REMOTE_KEEPALIVE_IDLE_THRESHOLD: Duration = Duration::from_secs(5);
+
+    /// Bound on [`SttProvider::start_session`] (task #85): without this, a
+    /// black-holed network (connect sent, nothing ever comes back) hangs
+    /// `run_live_transcription` forever, which — via `windows_session`'s
+    /// `tokio::join!(capture_fut, live_transcription_fut)` — takes the whole
+    /// recording-stop/save/upload path down with it. 10s is comfortably above how
+    /// long opening a WebSocket/gRPC connection and any auth handshake takes on a
+    /// healthy network (sub-second in practice), while still bounding the worst
+    /// case to something a user waiting to stop a recording will tolerate. A
+    /// timeout here is treated exactly like a `start_session` `Err`: that track
+    /// just runs without live transcription for the rest of the session.
+    const START_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Bound on [`SttSession::finalize`] (task #81): `finalize` waits for the
+    /// provider to drain and acknowledge whatever audio is still in flight
+    /// server-side, so it can legitimately take longer than opening the
+    /// connection did — but it must not be unbounded, since it runs on recording
+    /// stop, ahead of the audio-save/upload path (see `START_SESSION_TIMEOUT`'s
+    /// doc comment for why an unbounded await here is a problem). 8s gives the
+    /// provider room to drain a few seconds of buffered audio without making the
+    /// user wait indefinitely for a black-holed connection to time out on its own.
+    const FINALIZE_TIMEOUT: Duration = Duration::from_secs(8);
 
     /// Errors from [`build_stt_provider`] — distinct from `stt_api::SttError`, which
     /// covers failures *within* an already-constructed provider's session, not
@@ -196,6 +240,385 @@ mod stt_wiring {
         }
     }
 
+    /// Opens one `provider` session bounded by [`START_SESSION_TIMEOUT`] and
+    /// updates `status_sink` for `track_kind` accordingly (task #85). A timeout is
+    /// reported the same way a `start_session` `Err` already was — `Error` status
+    /// carrying `SttError::Timeout`'s message, `None` returned — so callers (i.e.
+    /// [`run_live_transcription`]) don't need a third case: that track simply runs
+    /// without live transcription for the rest of the session either way.
+    async fn start_session_with_timeout(
+        provider: &dyn SttProvider,
+        config: SttSessionConfig,
+        track: &'static str,
+        track_kind: TrackKind,
+        status_sink: &Option<Arc<Mutex<TranscriptionStatus>>>,
+    ) -> Option<(Box<dyn SttSession>, UnboundedReceiver<SttEvent>)> {
+        match tokio::time::timeout(START_SESSION_TIMEOUT, provider.start_session(config)).await {
+            Ok(Ok((session, events))) => {
+                set_status(status_sink, track_kind, TrackTranscriptionStatus::Connected);
+                Some((session, events))
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(%err, track, "live transcription: failed to start STT session");
+                set_status(status_sink, track_kind, TrackTranscriptionStatus::Error(err.to_string()));
+                None
+            }
+            Err(_) => {
+                tracing::warn!(track, timeout_secs = START_SESSION_TIMEOUT.as_secs(), "live transcription: start_session timed out");
+                set_status(status_sink, track_kind, TrackTranscriptionStatus::Error(stt_api::SttError::Timeout.to_string()));
+                None
+            }
+        }
+    }
+
+    /// Backoff between STT reconnect attempts (task #82): same doubling-with-cap
+    /// shape as `windows_supervisor::backoff_for_attempt` (500ms base, doubling,
+    /// capped at 30s) — kept as its own local function rather than shared, since
+    /// that one lives in a module this crate's `live-transcription` code has no
+    /// other reason to depend on, and the two backoffs govern unrelated
+    /// subsystems (capture device rebinding vs. STT session reconnects) that
+    /// happen to want the same curve.
+    fn reconnect_backoff(attempt: u32) -> Duration {
+        let base_ms = 500u64;
+        let max_ms = 30_000u64;
+        Duration::from_millis(base_ms.saturating_mul(1u64 << attempt.min(6)).min(max_ms))
+    }
+
+    /// The pair [`SttProvider::start_session`] (fresh connect or reconnect)
+    /// resolves to on success — named so [`ReconnectState::in_flight`] and
+    /// [`attempt_reconnect`]'s return type don't have to spell it out twice.
+    type ReconnectSessionPair = (Box<dyn SttSession>, UnboundedReceiver<SttEvent>);
+
+    /// Per-track backoff state for reconnecting a disconnected STT session (task
+    /// #82) — shared by the Self track (a loose local in
+    /// [`run_live_transcription`]) and the Remote track (a field on
+    /// [`RemoteGateState`]). Kept as its own small struct, consulted from a
+    /// `select!` arm via `tokio::time::sleep_until`, rather than a direct
+    /// `tokio::time::sleep(...).await` at the point a disconnect is detected —
+    /// the latter would block every other branch of the loop (`audio_rx`, the
+    /// other track's events, the keepalive timer) for the whole backoff
+    /// duration, which is exactly the bug this task exists to avoid.
+    ///
+    /// Task #87 went a step further: even the backoff-armed retry itself used
+    /// to run as a synchronous `.await` right inside the `select!` arm that
+    /// fired it, blocking the loop for up to [`START_SESSION_TIMEOUT`] on a
+    /// black-holed reconnect attempt — same class of bug, just moved from "the
+    /// backoff sleep" to "the connect attempt after it". `in_flight` below is
+    /// what fixes that: the attempt itself now runs as a detached
+    /// `tokio::spawn`ed task (see [`attempt_reconnect`]), and this field is the
+    /// handle the `select!` loop awaits *without* blocking any other branch
+    /// while it does.
+    struct ReconnectState {
+        /// Consecutive failed reconnect attempts since the track last had a
+        /// healthy session — feeds `reconnect_backoff`, and resets to 0 once a
+        /// reconnect succeeds (or the disconnect turns out non-retryable, so
+        /// there's nothing to back off from anymore).
+        attempt: u32,
+        /// `Some(instant)` while a retry is armed and pending; `None` when the
+        /// track is healthy, or has given up until the recording ends (a
+        /// non-retryable disconnect — see `SttError::is_retryable`).
+        retry_at: Option<Instant>,
+        /// When the track was first detected as disconnected in the *current*
+        /// outage. Set once by the first `note_disconnect` and left unchanged
+        /// across any failed retries in between (`note_disconnect` only fills
+        /// this in if it's empty), so a reconnect that finally succeeds after
+        /// several failed attempts sizes its timestamp-continuity correction
+        /// (Remote only — see `RemoteGateState::apply_reconnect_offset`) off the
+        /// whole outage, not just the time since the last failed attempt.
+        disconnected_at: Option<Instant>,
+        /// `Some(handle)` while a `tokio::spawn`ed [`attempt_reconnect`] call for
+        /// this track is running (task #87) — mutually exclusive with `retry_at`
+        /// being armed: `retry_at` is cleared the moment the backoff fires and a
+        /// task is spawned, and only re-armed (by the `select!` loop, via
+        /// `note_disconnect`) once that task's outcome comes back. Guards against
+        /// spawning a second attempt for the same track while one is already in
+        /// flight — see `note_disconnect_and_maybe_reconnect`'s guard.
+        in_flight: Option<JoinHandle<Option<ReconnectSessionPair>>>,
+        /// The `transcription_gaps` row id opened for the *current* outage
+        /// (task #90), if any — `Some` from the moment `open_gap` first
+        /// writes it until `close_open_gap` closes it (successful reconnect,
+        /// or the recording ending with the track still down). Unlike every
+        /// other field on this struct, deliberately **not** cleared by
+        /// `reset()`: a non-retryable disconnect calls `reset()` to give up
+        /// on reconnecting, but the gap it opened must stay open until the
+        /// recording actually ends (see the `audio_rx.recv()` `None` arm in
+        /// `run_live_transcription`, the only other place that closes it).
+        open_gap_id: Option<i64>,
+        /// `open_gap_id`'s row's `start_ms`, kept alongside it (rather than
+        /// re-derived from `disconnected_at`, which *is* cleared by `reset()`)
+        /// so `close_open_gap` can size the outage even after a give-up
+        /// `reset()` has already cleared everything else.
+        open_gap_start_ms: Option<u64>,
+    }
+
+    impl ReconnectState {
+        fn new() -> Self {
+            Self { attempt: 0, retry_at: None, disconnected_at: None, in_flight: None, open_gap_id: None, open_gap_start_ms: None }
+        }
+
+        /// Arms (or re-arms, after another failed attempt) a retry.
+        fn note_disconnect(&mut self) {
+            self.disconnected_at.get_or_insert_with(Instant::now);
+            self.retry_at = Some(Instant::now() + reconnect_backoff(self.attempt));
+            self.attempt = self.attempt.saturating_add(1);
+        }
+
+        /// A reconnect succeeded, or the disconnect was non-retryable so there's
+        /// nothing left to retry: back to the healthy/gave-up baseline.
+        /// `open_gap_id`/`open_gap_start_ms` (task #90) are the one exception —
+        /// see their own doc comments for why a give-up `reset()` must not
+        /// clear them.
+        fn reset(&mut self) {
+            let open_gap_id = self.open_gap_id;
+            let open_gap_start_ms = self.open_gap_start_ms;
+            *self = Self::new();
+            self.open_gap_id = open_gap_id;
+            self.open_gap_start_ms = open_gap_start_ms;
+        }
+
+        /// Aborts (rather than waits out) an in-flight reconnect task once the
+        /// recording has ended (`audio_rx` closed) — called from the
+        /// `audio_rx.recv()` arm's `None` branch in [`run_live_transcription`].
+        /// A session that hasn't finished connecting yet has nothing left to
+        /// receive once there's no more audio to send it, so letting it run out
+        /// the rest of `START_SESSION_TIMEOUT` in the background would only
+        /// delay this function's return past the audio-save/upload path it
+        /// precedes for no benefit (see `START_SESSION_TIMEOUT`'s own doc
+        /// comment for why an unbounded wait in that position is a problem) —
+        /// and without this, the task would otherwise be silently detached
+        /// (dropping a `JoinHandle` does not cancel the task it came from) and
+        /// keep running past `run_live_transcription`'s return.
+        fn abort_in_flight(&mut self) {
+            if let Some(handle) = self.in_flight.take() {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Whether a disconnect signal (task #82: an `SttEvent::Error`, a
+    /// `send_audio`/`keep_alive` call returning `Err`, or the track's events
+    /// channel closing with no explicit error at all) should be retried with
+    /// backoff, versus left in `Error` status for the rest of the recording.
+    /// Delegates to [`SttError::is_retryable`] when an error is available;
+    /// `None` (the events-channel-closed case) has no error to classify and is
+    /// treated as retryable — a provider force-closing an otherwise healthy
+    /// session with no `SttEvent::Error` at all is exactly what reconnecting is
+    /// for (e.g. AssemblyAI's 3-hour hard cap, which closes the socket with no
+    /// error event — see `stt_assemblyai`'s `AssemblyAISession::keep_alive` doc
+    /// comment).
+    fn is_disconnect_retryable(err: Option<&SttError>) -> bool {
+        err.is_none_or(|err| err.is_retryable())
+    }
+
+    /// `recording_started.elapsed()` in whole milliseconds — the clock every
+    /// `transcription_gaps` row's `start_ms`/`end_ms` (task #90) is measured
+    /// against: wall-clock time since `run_live_transcription` began, not
+    /// either track's own STT-provider-relative clock (which resets on every
+    /// reconnect — see `RemoteGateState::apply_reconnect_offset`'s doc
+    /// comment, and `note_self_disconnect`'s on why Self has no equivalent
+    /// correction at all). Deliberately coarser than
+    /// `TranscriptSegment.start_ms`/`end_ms` (sub-second, `TimestampMapper`-
+    /// corrected on the Remote track): a gap only needs to point task #91's
+    /// re-transcription pass at roughly the right stretch of `segments`, not
+    /// pin an exact millisecond.
+    fn ms_since_start(recording_started: Instant) -> u64 {
+        recording_started.elapsed().as_millis() as u64
+    }
+
+    /// Opens a new `transcription_gaps` row for `track_kind` (task #90),
+    /// called once per outage from the "genuinely new disconnect" branch of
+    /// [`note_disconnect_and_maybe_reconnect`] — see that function's doc
+    /// comment for the guard that keeps this from firing twice for the same
+    /// outage. Written immediately, before it's known whether (or how soon)
+    /// a reconnect will succeed, so a long outage still shows up even if the
+    /// process crashes mid-outage; [`close_open_gap`] discards it later
+    /// instead if it turns out shorter than [`MIN_RECORDED_GAP_MS`]. A
+    /// failure to write the row is logged and simply means this outage won't
+    /// be offered for later manual re-transcription — no different in spirit
+    /// from any other best-effort persistence call in this module (e.g.
+    /// `persist_event`'s `store.insert_transcript_segment` callers).
+    fn open_gap(store: &SessionStore, session_id: SessionId, recording_started: Instant, track_kind: TrackKind, reconnect: &mut ReconnectState) {
+        let start_ms = ms_since_start(recording_started);
+        match store.record_gap_start(session_id, track_kind, start_ms) {
+            Ok(id) => {
+                reconnect.open_gap_id = Some(id);
+                reconnect.open_gap_start_ms = Some(start_ms);
+            }
+            Err(err) => tracing::warn!(%err, ?track_kind, "live transcription: failed to record gap start"),
+        }
+    }
+
+    /// Closes whichever gap `open_gap` opened on `reconnect` (task #90), if
+    /// any — called once `track_kind`'s outage is over, whether because it
+    /// reconnected successfully (the two reconnect-completion `select!` arms
+    /// in `run_live_transcription`, and `RemoteGateState::apply_reconnect_offset`)
+    /// or because the recording itself ended while the track was still down
+    /// (the `audio_rx.recv()` `None` arm). A no-op if there's no open gap —
+    /// the track was never disconnected, or `open_gap` failed to write one
+    /// and already logged why. Discards the row instead of recording its
+    /// `end_ms` if the outage turned out shorter than
+    /// [`MIN_RECORDED_GAP_MS`] — see that constant's doc comment.
+    fn close_open_gap(store: &SessionStore, session_id: SessionId, recording_started: Instant, track_kind: TrackKind, reconnect: &mut ReconnectState) {
+        let (Some(gap_id), Some(start_ms)) = (reconnect.open_gap_id.take(), reconnect.open_gap_start_ms.take()) else {
+            return;
+        };
+        let end_ms = ms_since_start(recording_started);
+        let result = if end_ms.saturating_sub(start_ms) < MIN_RECORDED_GAP_MS {
+            store.discard_gap(gap_id)
+        } else {
+            store.record_gap_end(gap_id, end_ms)
+        };
+        if let Err(err) = result {
+            tracing::warn!(%err, ?track_kind, %session_id, "live transcription: failed to close transcription gap");
+        }
+    }
+
+    /// Shared "what happens when a track disconnects" policy (task #82),
+    /// mirroring `upload_worker::upload_pending_once`'s `retryable`
+    /// classification pattern: reports `err` (if any) on `status_sink`, then
+    /// arms a backoff-guarded reconnect if the disconnect is retryable
+    /// ([`is_disconnect_retryable`]), or gives up until the recording ends
+    /// otherwise. Does not touch the session slot itself — callers (the Self
+    /// track's own disconnect sites, and `RemoteGateState::note_disconnect`)
+    /// clear that immediately before calling this, since its shape differs
+    /// between the two tracks.
+    ///
+    /// Task #90: also opens a `transcription_gaps` row via [`open_gap`] for
+    /// a genuinely new outage (same guard as the reconnect-arming logic
+    /// below) — a permanent (non-retryable) disconnect opens one too, even
+    /// though `reconnect.reset()` immediately follows, since `reset()`
+    /// deliberately leaves `open_gap_id`/`open_gap_start_ms` alone (see
+    /// their own doc comments) and the recording-end arm in
+    /// `run_live_transcription` is what eventually closes it.
+    fn note_disconnect_and_maybe_reconnect(
+        store: &SessionStore,
+        session_id: SessionId,
+        recording_started: Instant,
+        track_kind: TrackKind,
+        err: Option<&SttError>,
+        status_sink: &Option<Arc<Mutex<TranscriptionStatus>>>,
+        reconnect: &mut ReconnectState,
+    ) {
+        if let Some(err) = err {
+            set_status(status_sink, track_kind, TrackTranscriptionStatus::Error(err.to_string()));
+        }
+        if reconnect.retry_at.is_some() || reconnect.in_flight.is_some() {
+            // Already armed (or already reconnecting) for this outage: the
+            // session slot was cleared by an earlier call to this function, so a
+            // second disconnect signal here (e.g. a stale receiver delivering
+            // another `SttEvent::Error` before it finally closes) reports the
+            // same outage again, not a new one — restacking the backoff on top
+            // of itself, or spawning a second concurrent reconnect attempt for
+            // the same track (task #87), would just waste a connection for no
+            // reason. A `transcription_gaps` row for this outage was already
+            // opened (or attempted) by the call that armed it, so this must not
+            // open a second one too (task #90).
+            return;
+        }
+        open_gap(store, session_id, recording_started, track_kind, reconnect);
+        if is_disconnect_retryable(err) {
+            reconnect.note_disconnect();
+        } else {
+            reconnect.reset();
+        }
+    }
+
+    /// Clears `self_session` and applies [`note_disconnect_and_maybe_reconnect`]
+    /// for the Self track — the Self-track counterpart of
+    /// `RemoteGateState::note_disconnect`, kept as a free function since the
+    /// Self track's session isn't wrapped in a struct of its own.
+    fn note_self_disconnect(
+        self_session: &mut Option<Box<dyn SttSession>>,
+        reconnect: &mut ReconnectState,
+        status_sink: &Option<Arc<Mutex<TranscriptionStatus>>>,
+        err: Option<&SttError>,
+        store: &SessionStore,
+        session_id: SessionId,
+        recording_started: Instant,
+    ) {
+        *self_session = None;
+        note_disconnect_and_maybe_reconnect(store, session_id, recording_started, TrackKind::SelfMic, err, status_sink, reconnect);
+    }
+
+    /// Attempts one reconnect for `track_kind` once its backoff timer fires (see
+    /// the `select!` arms in [`run_live_transcription`]) — shared by Self and
+    /// Remote, which otherwise differ only in where the resulting
+    /// session/events pair gets stored and (Remote only) how the timestamp
+    /// baseline is corrected afterward. Bounded by `start_session_with_timeout`
+    /// exactly like an initial connect attempt, so a black-holed network during
+    /// a reconnect is bounded the same way the first connect was.
+    ///
+    /// Task #87: run via `tokio::spawn` from the `select!` loop rather than
+    /// awaited directly in the arm that fires it — a synchronous await here used
+    /// to block the whole loop (so `audio_rx`, the other track's events, and the
+    /// keepalive timer all went unpolled) for up to `START_SESSION_TIMEOUT`
+    /// while one track reconnected, silently dropping audio queued behind the
+    /// bounded `stt_tx` channel (task #86) in the meantime. Being spawned means
+    /// this function must be entirely self-contained — no `&mut ReconnectState`
+    /// parameter, unlike a prior version — since a spawned task can't borrow
+    /// state that lives in `run_live_transcription`'s stack frame. `provider` is
+    /// therefore `Arc<dyn SttProvider>` rather than `&dyn SttProvider`: the
+    /// spawned task needs to own (or share ownership of) everything it touches,
+    /// and an `Arc` clone is cheap enough to pay per reconnect attempt.
+    ///
+    /// **Does not touch `ReconnectState` at all**, on success or failure — the
+    /// caller (the `select!` arm that awaits this task's `JoinHandle` once it
+    /// completes) is entirely responsible for that, via `ReconnectState::note_disconnect`
+    /// on failure or `ReconnectState::reset`/`RemoteGateState::apply_reconnect_offset`
+    /// on success. This mirrors the prior version's "does not reset on success"
+    /// contract (see its own history: `RemoteGateState::apply_reconnect_offset`
+    /// needs `reconnect.disconnected_at` to still be the *original* disconnect
+    /// time when it runs, right after this task's outcome is applied, to size
+    /// its timestamp-continuity correction off the whole outage) — just taken
+    /// one step further, since there is no `&mut ReconnectState` in here to
+    /// touch even on failure now.
+    async fn attempt_reconnect(
+        provider: Arc<dyn SttProvider>,
+        config: SttSessionConfig,
+        track: &'static str,
+        track_kind: TrackKind,
+        status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
+    ) -> Option<ReconnectSessionPair> {
+        set_status(&status_sink, track_kind, TrackTranscriptionStatus::Connecting);
+        start_session_with_timeout(provider.as_ref(), config, track, track_kind, &status_sink).await
+    }
+
+    /// Awaits the outcome of an in-flight [`attempt_reconnect`] task (task #87),
+    /// or never resolves if there isn't one — the reconnect-completion
+    /// counterpart of [`recv_track_event`] (see that function's doc comment for
+    /// why a `select!` branch needs this shape rather than an `unwrap()` behind
+    /// an `if` guard).
+    async fn recv_reconnect_result(in_flight: &mut Option<JoinHandle<Option<ReconnectSessionPair>>>) -> Result<Option<ReconnectSessionPair>, JoinError> {
+        match in_flight {
+            Some(handle) => handle.await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Applies a failed [`attempt_reconnect`] task's outcome to `reconnect`'s
+    /// backoff bookkeeping (task #87) — shared by the two failure cases a
+    /// `select!` reconnect-completion arm can see once `attempt_reconnect`'s
+    /// `JoinHandle` resolves:
+    /// - `Ok(None)`: `start_session_with_timeout` already reported `Error`
+    ///   status itself (an `Err`/timeout from `start_session`), so this only
+    ///   needs to arm the next backoff.
+    /// - `Err(join_err)`: the task panicked or was cancelled before it could
+    ///   report anything — unlike the above, nothing has set `Error` status yet,
+    ///   so this does that too before arming the next backoff, the same way a
+    ///   `start_session` failure already does.
+    ///
+    /// Does not handle the success case (`Ok(Some(pair))`) — callers install the
+    /// new session/events themselves and call `reconnect.reset()` (Self) or
+    /// `RemoteGateState::apply_reconnect_offset` (Remote), which differ enough
+    /// between the two tracks that there's nothing to share there.
+    fn note_reconnect_failure(track_kind: TrackKind, join_err: Option<&JoinError>, status_sink: &Option<Arc<Mutex<TranscriptionStatus>>>, reconnect: &mut ReconnectState) {
+        if let Some(join_err) = join_err {
+            tracing::warn!(%join_err, ?track_kind, "live transcription: reconnect task panicked or was cancelled");
+            set_status(status_sink, track_kind, TrackTranscriptionStatus::Error(join_err.to_string()));
+        }
+        reconnect.note_disconnect();
+    }
+
     /// Runs for the lifetime of one recording session, ending when `audio_rx` closes
     /// (i.e. `windows_session::run_capture_blocking`'s collector thread — and the
     /// `stt_tx` it owns — has finished, meaning capture is fully done). Failing to
@@ -215,15 +638,61 @@ mod stt_wiring {
     /// correction it requires. `false` preserves this function's pre-gate
     /// behavior exactly (unconditional send on both tracks, no keepalive timer,
     /// no timestamp correction).
+    ///
+    /// A **mid-session disconnect** (task #82: an `SttEvent::Error`, a
+    /// `send_audio`/`keep_alive` call returning `Err`, or a track's events
+    /// channel closing unexpectedly — e.g. AssemblyAI's 3-hour hard cap, see
+    /// `stt_assemblyai::AssemblyAISession::keep_alive`'s doc comment) is
+    /// distinct from a failed *initial* connect above: the dead session is
+    /// dropped immediately (so nothing keeps calling `send_audio`/`keep_alive`
+    /// against it — that used to be this task's core bug), and if
+    /// `SttError::is_retryable()` says the cause is transient, a fresh
+    /// `provider.start_session()` is retried with backoff (see
+    /// `reconnect_backoff`/`ReconnectState`) without blocking this function's
+    /// main `select!` loop. A non-retryable cause (e.g.
+    /// `AuthenticationFailed`) behaves like today: `Error` status, no more
+    /// attempts for the rest of the recording. **Known caveat**: a successful
+    /// Remote reconnect corrects persisted timestamps across the gap (see
+    /// `RemoteGateState::apply_reconnect_offset`), but the Self track has no
+    /// `TimestampMapper` (it never silence-gates, so it never needed one before
+    /// this task) — a Self reconnect is logged, but that track's persisted
+    /// timestamps after the reconnect point restart from the new session's own
+    /// clock and are not corrected back to wall-clock. Self-track reconnects
+    /// are expected to be rare (unlike Remote, nothing routinely disconnects
+    /// it), so this is treated as an acceptable known limitation rather than
+    /// justifying a second `TimestampMapper` instance for a track that has no
+    /// other use for one.
+    ///
+    /// Task #87: the reconnect *attempt* itself (bounded by
+    /// `START_SESSION_TIMEOUT`, same as an initial connect) also no longer
+    /// blocks this `select!` loop — it runs as a `tokio::spawn`ed
+    /// [`attempt_reconnect`] task, and a dedicated `select!` arm per track
+    /// awaits its `JoinHandle` alongside every other branch. A prior version
+    /// awaited it synchronously right inside the backoff-timer arm that fired
+    /// it, which reintroduced the same class of bug task #82 otherwise fixed:
+    /// while one track's reconnect attempt was in flight, `audio_rx`, the other
+    /// track's events, and the keepalive timer all went unpolled for up to
+    /// `START_SESSION_TIMEOUT`, and — concretely, with both tracks disconnected
+    /// at once (a realistic scenario, e.g. a shared network blip) — the other
+    /// track's own disconnect detection and reconnect were delayed by however
+    /// long the first one's attempt took.
     pub async fn run_live_transcription(
         session_id: SessionId,
         sample_rate_hz: u32,
         credential_store: Option<Arc<dyn CredentialStore + Send + Sync>>,
-        mut audio_rx: UnboundedReceiver<(TrackKind, Vec<f32>, u32)>,
+        mut audio_rx: Receiver<(TrackKind, Vec<f32>, u32)>,
         store: &SessionStore,
         status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
         silence_gate_enabled: bool,
     ) {
+        // Task #90: the clock every `transcription_gaps` row's `start_ms`/
+        // `end_ms` is measured against (see `ms_since_start`) — captured as
+        // close to this function's start as possible, since that's as close
+        // as this module gets to "when the recording's audio timeline began"
+        // (see this function's own doc comment: it runs for the recording's
+        // full lifetime, fed by the same side channel capture is fed from).
+        let recording_started = Instant::now();
+
         let Some(credential_store) = credential_store else {
             tracing::debug!("live transcription: no credential store configured, skipping");
             set_both_status(&status_sink, TrackTranscriptionStatus::NotConfigured);
@@ -246,6 +715,13 @@ mod stt_wiring {
                 return;
             }
         };
+        // `Arc` rather than `Box` (task #87): a mid-session reconnect attempt
+        // now runs as a `tokio::spawn`ed task (see `attempt_reconnect`), which
+        // needs to own the provider it connects through rather than borrow it
+        // from this function's stack frame — an `Arc` clone per spawned attempt
+        // is cheap, and `SttProvider: Send + Sync` (see `stt-api`) already makes
+        // `dyn SttProvider` shareable across tasks like this.
+        let provider: Arc<dyn SttProvider> = Arc::from(provider);
         // Phase 1A capture is a fixed format (design.md; see
         // `windows_frame_collector`'s "falls back to 48kHz mono" comment) — the
         // session is opened once, up front, at the target rate rather than
@@ -273,28 +749,23 @@ mod stt_wiring {
 
         set_both_status(&status_sink, TrackTranscriptionStatus::Connecting);
 
-        let self_sess = match provider.start_session(config.clone()).await {
-            Ok((session, events)) => {
-                set_status(&status_sink, TrackKind::SelfMic, TrackTranscriptionStatus::Connected);
-                Some((session, events))
-            }
-            Err(err) => {
-                tracing::warn!(%err, track = "self", "live transcription: failed to start STT session");
-                set_status(&status_sink, TrackKind::SelfMic, TrackTranscriptionStatus::Error(err.to_string()));
-                None
-            }
-        };
-        let remote_sess = match provider.start_session(config).await {
-            Ok((session, events)) => {
-                set_status(&status_sink, TrackKind::RemoteAudio, TrackTranscriptionStatus::Connected);
-                Some((session, events))
-            }
-            Err(err) => {
-                tracing::warn!(%err, track = "remote", "live transcription: failed to start STT session");
-                set_status(&status_sink, TrackKind::RemoteAudio, TrackTranscriptionStatus::Error(err.to_string()));
-                None
-            }
-        };
+        // Self and Remote connect concurrently, for the same reason `finalize`
+        // below does (task #81's doc comment): sequential awaits would stack up to
+        // two `START_SESSION_TIMEOUT`s back to back on a slow/black-holed network,
+        // doubling how long the `audio_rx.recv()` loop below is delayed from
+        // starting — and every chunk that arrives on `stt_tx` before that loop
+        // starts draining it just sits in the bounded (task #86) channel, which
+        // means a slow-but-not-timed-out connection could burn through that
+        // channel's buffering and start silently dropping audio before live
+        // transcription even begins.
+        // `config` is cloned for both, rather than moved into the second call,
+        // since a mid-session reconnect (task #82) needs to open a fresh session
+        // with this same config again, arbitrarily many times, for the rest of
+        // this function's lifetime.
+        let (self_sess, remote_sess) = tokio::join!(
+            start_session_with_timeout(provider.as_ref(), config.clone(), "self", TrackKind::SelfMic, &status_sink),
+            start_session_with_timeout(provider.as_ref(), config.clone(), "remote", TrackKind::RemoteAudio, &status_sink)
+        );
 
         if self_sess.is_none() && remote_sess.is_none() {
             drain(&mut audio_rx).await;
@@ -305,13 +776,15 @@ mod stt_wiring {
         let (remote_session, mut remote_events) = remote_sess.unzip();
 
         let mut self_samples_sent: u64 = 0;
+        let mut self_reconnect = ReconnectState::new();
         let mut audio_open = true;
 
         // Bundles every piece of Remote-track-only state the VAD gate, keepalive
-        // timer, and timestamp correction share (v1 scope, see this function's doc
-        // comment) — see `RemoteGateState`'s own doc comment for why this replaced
-        // half a dozen loose `remote_*` locals that always changed together.
-        let mut remote = RemoteGateState::new(remote_session, silence_gate_enabled, target_rate_hz);
+        // timer, timestamp correction, and reconnect backoff (task #82) share
+        // (v1 scope, see this function's doc comment) — see `RemoteGateState`'s
+        // own doc comment for why this replaced half a dozen loose `remote_*`
+        // locals that always changed together.
+        let mut remote = RemoteGateState::new(remote_session, silence_gate_enabled, target_rate_hz, status_sink.clone(), store, session_id, recording_started);
         let mut remote_keepalive_timer = tokio::time::interval(Duration::from_secs(1));
 
         // #56: the last still-unconfirmed `PartialTranscript` seen per track, cleared
@@ -343,6 +816,7 @@ mod stt_wiring {
                                         self_samples_sent += resampled.len() as u64;
                                         if let Err(err) = session.send_audio(chunk).await {
                                             tracing::warn!(%err, ?track, "live transcription: send_audio failed");
+                                            note_self_disconnect(&mut self_session, &mut self_reconnect, &status_sink, Some(&err), store, session_id, recording_started);
                                         }
                                     }
                                 }
@@ -362,30 +836,148 @@ mod stt_wiring {
                         }
                         None => {
                             audio_open = false;
-                            if let Some(session) = self_session.take() {
-                                if let Err(err) = session.finalize().await {
-                                    tracing::warn!(%err, track = "self", "live transcription: failed to finalize STT session");
+                            // Any reconnect attempt still in flight has nothing
+                            // left to serve now that there's no more audio to
+                            // send it — abort it instead of leaking a detached
+                            // background task past this function's return (task
+                            // #87; see `ReconnectState::abort_in_flight`'s doc
+                            // comment).
+                            self_reconnect.abort_in_flight();
+                            remote.reconnect.abort_in_flight();
+                            // Task #90: the recording is ending, so any gap
+                            // still open on either track (a disconnect that
+                            // never reconnected, or a reconnect attempt just
+                            // aborted above) closes here, with the recording's
+                            // end time as `end_ms` — no later event will ever
+                            // close it otherwise (see `close_open_gap`'s doc
+                            // comment).
+                            close_open_gap(store, session_id, recording_started, TrackKind::SelfMic, &mut self_reconnect);
+                            close_open_gap(store, session_id, recording_started, TrackKind::RemoteAudio, &mut remote.reconnect);
+                            // Self and Remote finalize concurrently (task #81):
+                            // sequential awaits would stack up to two
+                            // `FINALIZE_TIMEOUT`s back to back on a black-holed
+                            // network, doubling how long recording stop blocks the
+                            // audio-save/upload path behind this function (see
+                            // `windows_session`'s `tokio::join!(capture_fut,
+                            // live_transcription_fut)`).
+                            let self_finalize = async {
+                                if let Some(session) = self_session.take() {
+                                    finalize_with_timeout(session, "self").await;
                                 }
-                            }
-                            remote.finalize().await;
+                            };
+                            tokio::join!(self_finalize, remote.finalize());
                         }
                     }
                 }
                 _ = remote_keepalive_timer.tick(), if remote.is_active() && remote.gate_enabled() => {
                     remote.keep_alive_if_idle().await;
                 }
+                // Reconnect timers (task #82): armed only while `audio_open` —
+                // once recording has ended there's no more audio to send, so a
+                // reconnect that fired after that point would open a session
+                // this function would never finalize (the `audio_rx.recv()`
+                // arm's `None` branch above, which drives `finalize`, only ever
+                // runs once). `Instant::now()` as the disabled-branch fallback
+                // is never actually awaited — see `recv_track_event`'s doc
+                // comment on why a disabled `select!` branch's expression must
+                // still evaluate without panicking. `in_flight.is_none()`
+                // guards against arming a second attempt while one is already
+                // running (task #87) — `retry_at`/`in_flight` are otherwise
+                // mutually exclusive (see `ReconnectState::in_flight`'s doc
+                // comment), so this is defensive rather than expected to ever
+                // matter, but cheap to keep true regardless.
+                //
+                // Firing this arm only *spawns* the attempt (task #87) —
+                // completion is awaited by the dedicated arms below, so this
+                // returns to polling `audio_rx`/the other track/the keepalive
+                // timer immediately rather than blocking on it.
+                _ = tokio::time::sleep_until(self_reconnect.retry_at.unwrap_or_else(Instant::now)), if audio_open && self_reconnect.retry_at.is_some() && self_reconnect.in_flight.is_none() => {
+                    self_reconnect.retry_at = None;
+                    self_reconnect.in_flight = Some(tokio::spawn(attempt_reconnect(provider.clone(), config.clone(), "self", TrackKind::SelfMic, status_sink.clone())));
+                }
+                _ = tokio::time::sleep_until(remote.reconnect.retry_at.unwrap_or_else(Instant::now)), if audio_open && remote.reconnect.retry_at.is_some() && remote.reconnect.in_flight.is_none() => {
+                    remote.reconnect.retry_at = None;
+                    remote.reconnect.in_flight = Some(tokio::spawn(attempt_reconnect(provider.clone(), config.clone(), "remote", TrackKind::RemoteAudio, status_sink.clone())));
+                }
+                // Reconnect completions (task #87): awaits whichever spawned
+                // `attempt_reconnect` task the arms above started, without
+                // blocking any other branch of this loop while it's in flight.
+                result = recv_reconnect_result(&mut self_reconnect.in_flight), if self_reconnect.in_flight.is_some() => {
+                    self_reconnect.in_flight = None;
+                    match result {
+                        Ok(Some((session, events))) => {
+                            self_session = Some(session);
+                            self_events = Some(events);
+                            self_samples_sent = 0;
+                            // Task #90: the outage this track's `open_gap` opened
+                            // is over now that a fresh session is in hand — close
+                            // it before `reset()` below, which deliberately leaves
+                            // `open_gap_id`/`open_gap_start_ms` untouched (see
+                            // `ReconnectState::reset`'s doc comment).
+                            close_open_gap(store, session_id, recording_started, TrackKind::SelfMic, &mut self_reconnect);
+                            // `attempt_reconnect` no longer touches `reconnect`
+                            // itself (see its doc comment) — the Self track has
+                            // no `apply_reconnect_offset` counterpart that needs
+                            // `disconnected_at` afterward, so it's safe to reset
+                            // right here.
+                            self_reconnect.reset();
+                            tracing::warn!(track = "self", "live transcription: reconnected after disconnect; this track has no TimestampMapper, so persisted timestamps for it restart from the new session's clock (see run_live_transcription's doc comment)");
+                        }
+                        Ok(None) => note_reconnect_failure(TrackKind::SelfMic, None, &status_sink, &mut self_reconnect),
+                        Err(join_err) => note_reconnect_failure(TrackKind::SelfMic, Some(&join_err), &status_sink, &mut self_reconnect),
+                    }
+                }
+                result = recv_reconnect_result(&mut remote.reconnect.in_flight), if remote.reconnect.in_flight.is_some() => {
+                    remote.reconnect.in_flight = None;
+                    match result {
+                        Ok(Some((session, events))) => {
+                            remote.session = Some(session);
+                            remote_events = Some(events);
+                            remote.apply_reconnect_offset(target_rate_hz);
+                        }
+                        Ok(None) => note_reconnect_failure(TrackKind::RemoteAudio, None, &status_sink, &mut remote.reconnect),
+                        Err(join_err) => note_reconnect_failure(TrackKind::RemoteAudio, Some(&join_err), &status_sink, &mut remote.reconnect),
+                    }
+                }
                 maybe = recv_track_event(&mut self_events) => {
                     match maybe {
                         Some(event) => {
                             note_event(&mut self_last_interim, &event);
                             if let SttEvent::Error(err) = &event {
-                                set_status(&status_sink, TrackKind::SelfMic, TrackTranscriptionStatus::Error(err.to_string()));
+                                // Guarded by `self_session.is_some()` for the same
+                                // reason the channel-close arm below is (task #90):
+                                // once a disconnect has already been noted for this
+                                // outage, `self_session` is `None` for its whole
+                                // duration (including a permanent give-up, which
+                                // leaves `self_events` pointed at the now-dead
+                                // channel for the rest of the recording — see
+                                // `is_disconnect_retryable`'s doc comment). Without
+                                // this guard, a provider that emits more than one
+                                // `SttEvent::Error` for the same underlying failure
+                                // would re-enter `note_disconnect_and_maybe_reconnect`
+                                // after `reset()` already cleared `retry_at`/
+                                // `in_flight`, which reopens a second
+                                // `transcription_gaps` row for an outage that was
+                                // never actually two outages.
+                                if self_session.is_some() {
+                                    note_self_disconnect(&mut self_session, &mut self_reconnect, &status_sink, Some(err), store, session_id, recording_started);
+                                }
                             }
                             persist_event(store, session_id, Some(TrackKind::SelfMic), event, None);
                         }
                         None => {
                             self_events = None;
                             persist_pending_interim(store, session_id, TrackKind::SelfMic, self_last_interim.take(), None);
+                            if self_session.is_some() {
+                                // The channel closed with `self_session` still
+                                // set, i.e. without us having cleared it via a
+                                // prior `SttEvent::Error`/`send_audio` failure or
+                                // `finalize` — an unexpected provider-side close
+                                // (task #82; e.g. AssemblyAI's 3-hour hard cap,
+                                // which has no `SttEvent::Error` at all).
+                                tracing::warn!(track = "self", "live transcription: events channel closed unexpectedly");
+                                note_self_disconnect(&mut self_session, &mut self_reconnect, &status_sink, None, store, session_id, recording_started);
+                            }
                         }
                     }
                 }
@@ -394,13 +986,21 @@ mod stt_wiring {
                         Some(event) => {
                             note_event(&mut remote_last_interim, &event);
                             if let SttEvent::Error(err) = &event {
-                                set_status(&status_sink, TrackKind::RemoteAudio, TrackTranscriptionStatus::Error(err.to_string()));
+                                // See the Self-track arm above for why this guard matters (task #90).
+                                if remote.is_active() {
+                                    remote.note_disconnect(Some(err));
+                                }
                             }
                             persist_event(store, session_id, Some(TrackKind::RemoteAudio), event, remote.timestamp_mapper());
                         }
                         None => {
                             remote_events = None;
                             persist_pending_interim(store, session_id, TrackKind::RemoteAudio, remote_last_interim.take(), remote.timestamp_mapper());
+                            if remote.is_active() {
+                                // See the Self-track arm above for why this guard matters.
+                                tracing::warn!(track = "remote", "live transcription: events channel closed unexpectedly");
+                                remote.note_disconnect(None);
+                            }
                         }
                     }
                 }
@@ -416,7 +1016,7 @@ mod stt_wiring {
     /// fixed a real bug caught in code review: `total_injected` used to be a
     /// separate argument callers could (and once did) forget to fold into a
     /// checkpoint's key.
-    struct RemoteGateState {
+    struct RemoteGateState<'a> {
         session: Option<Box<dyn SttSession>>,
         /// Only `Some` when `silence_gate_enabled` — see `new`.
         gate: Option<SilenceGate>,
@@ -445,10 +1045,35 @@ mod stt_wiring {
         /// provider, for `keep_alive_if_idle`. Only consulted while `gate.is_some()`
         /// and `session.is_some()`, so its initial value is otherwise irrelevant.
         last_active: Instant,
+        /// Reconnect backoff state (task #82) — see `ReconnectState`'s doc
+        /// comment.
+        reconnect: ReconnectState,
+        /// Cloned once at construction so `note_disconnect` can report status
+        /// without every caller threading it through — same shape as
+        /// `RemoteGateState` bundling everything else this track's `select!`
+        /// branches need (see this struct's doc comment).
+        status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
+        /// `SessionStore`/`SessionId`/recording-start clock needed to open and
+        /// close `transcription_gaps` rows (task #90) from `note_disconnect`/
+        /// `apply_reconnect_offset` — bundled here for the same reason as
+        /// everything else on this struct (see its own doc comment): those
+        /// two methods would otherwise need all three threaded through as
+        /// parameters on every call.
+        store: &'a SessionStore,
+        session_id: SessionId,
+        recording_started: Instant,
     }
 
-    impl RemoteGateState {
-        fn new(session: Option<Box<dyn SttSession>>, silence_gate_enabled: bool, target_rate_hz: u32) -> Self {
+    impl<'a> RemoteGateState<'a> {
+        fn new(
+            session: Option<Box<dyn SttSession>>,
+            silence_gate_enabled: bool,
+            target_rate_hz: u32,
+            status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
+            store: &'a SessionStore,
+            session_id: SessionId,
+            recording_started: Instant,
+        ) -> Self {
             Self {
                 session,
                 gate: silence_gate_enabled.then(|| SilenceGate::new(GateConfig { sample_rate_hz: target_rate_hz, ..GateConfig::default() })),
@@ -457,6 +1082,11 @@ mod stt_wiring {
                 total_injected: 0,
                 net_offset: 0,
                 last_active: Instant::now(),
+                reconnect: ReconnectState::new(),
+                store,
+                session_id,
+                recording_started,
+                status_sink,
             }
         }
 
@@ -513,6 +1143,7 @@ mod stt_wiring {
             self.samples_sent += pcm.len() as u64;
             if let Err(err) = session.send_audio(chunk).await {
                 tracing::warn!(%err, track = ?TrackKind::RemoteAudio, "live transcription: send_audio failed");
+                self.note_disconnect(Some(&err));
             }
         }
 
@@ -566,6 +1197,8 @@ mod stt_wiring {
                 Ok(KeepAliveEffect::ControlMessage | KeepAliveEffect::Noop) => {}
                 Err(err) => {
                     tracing::warn!(%err, track = "remote", "live transcription: keep_alive failed");
+                    self.note_disconnect(Some(&err));
+                    return;
                 }
             }
             self.last_active = Instant::now();
@@ -573,10 +1206,92 @@ mod stt_wiring {
 
         async fn finalize(&mut self) {
             if let Some(session) = self.session.take() {
-                if let Err(err) = session.finalize().await {
-                    tracing::warn!(%err, track = "remote", "live transcription: failed to finalize STT session");
-                }
+                finalize_with_timeout(session, "remote").await;
             }
+        }
+
+        /// Marks the Remote session as disconnected (task #82: any of
+        /// `SttEvent::Error`, `send_audio`/`keep_alive` returning `Err`, or the
+        /// events channel closing — see `is_disconnect_retryable`'s doc comment)
+        /// — drops `session` immediately so nothing keeps calling
+        /// `send_audio`/`keep_alive` against a dead session (that used to be
+        /// this task's core bug: those calls kept failing with `SessionClosed`
+        /// for the rest of the recording), and arms a reconnect via
+        /// `note_disconnect_and_maybe_reconnect` if `err` is retryable (or
+        /// `None`, the events-channel-closed case).
+        fn note_disconnect(&mut self, err: Option<&SttError>) {
+            self.session = None;
+            note_disconnect_and_maybe_reconnect(self.store, self.session_id, self.recording_started, TrackKind::RemoteAudio, err, &self.status_sink, &mut self.reconnect);
+        }
+
+        /// Applied once a Remote reconnect succeeds, before any audio flows on
+        /// the new session: preserves timestamp continuity across the outage by
+        /// giving the fresh (empty) `TimestampMapper` a single checkpoint at
+        /// local position 0 whose offset already accounts for (a) how far the
+        /// old session's provider clock had reached
+        /// (`samples_sent + total_injected`) plus whatever `net_offset` already
+        /// applied there, and (b) the outage itself — every incoming Remote
+        /// chunk was dropped outright while `session` was `None` (see the
+        /// `select!` loop's `TrackKind::RemoteAudio if !remote.is_active()` arm),
+        /// so that real time is *not* reflected in either of the old session's
+        /// counters and has to be estimated from wall-clock elapsed since
+        /// `reconnect.disconnected_at` instead.
+        ///
+        /// A *fresh* mapper (rather than continuing to append to the old one) is
+        /// required, not just convenient: `TimestampMapper::record_checkpoint`
+        /// requires a non-decreasing position across calls, but the new
+        /// session's own clock (what live `SttEvent::audio_start_ms`/
+        /// `audio_end_ms` are relative to, and therefore what future checkpoints
+        /// must be keyed on — see `send_gated`/`record_drop`) restarts at 0,
+        /// which is smaller than whatever position the old session's checkpoints
+        /// ended at.
+        ///
+        /// Must run — and read `self.reconnect.disconnected_at` — before
+        /// `self.reconnect` is reset back to its healthy baseline, which is why
+        /// this is what resets it (via `ReconnectState::reset` at the end,
+        /// rather than `attempt_reconnect` itself doing so on success): the
+        /// caller only invokes this once it already has the new session in
+        /// hand, right after `attempt_reconnect` returns, so `disconnected_at`
+        /// is still whatever `note_disconnect` originally recorded for this
+        /// outage.
+        ///
+        /// Task #90: also closes whichever `transcription_gaps` row
+        /// `note_disconnect` opened for this outage, via `close_open_gap` —
+        /// like the timestamp correction above, this must run before
+        /// `self.reconnect.reset()` at the end (which does *not* clear
+        /// `open_gap_id`/`open_gap_start_ms` itself — see `ReconnectState::reset`'s
+        /// doc comment — so something has to).
+        fn apply_reconnect_offset(&mut self, target_rate_hz: u32) {
+            close_open_gap(self.store, self.session_id, self.recording_started, TrackKind::RemoteAudio, &mut self.reconnect);
+            if self.mapper.is_some() {
+                let outage_samples = self
+                    .reconnect
+                    .disconnected_at
+                    .map(|at| (at.elapsed().as_secs_f64() * target_rate_hz as f64).round() as u64)
+                    .unwrap_or(0);
+                let carry_over_samples = (self.samples_sent + self.total_injected) as i64 + self.net_offset + outage_samples as i64;
+                let mut fresh_mapper = TimestampMapper::new(target_rate_hz);
+                fresh_mapper.record_checkpoint(0, carry_over_samples);
+                self.mapper = Some(fresh_mapper);
+                self.net_offset = carry_over_samples;
+            }
+            self.samples_sent = 0;
+            self.total_injected = 0;
+            self.last_active = Instant::now();
+            self.reconnect.reset();
+        }
+    }
+
+    /// Bounds `session.finalize()` by [`FINALIZE_TIMEOUT`] (task #81) so a
+    /// black-holed connection's server-side drain can't hang recording stop
+    /// indefinitely. A timeout is logged and otherwise treated like any other
+    /// finalize failure — the audio-save/upload path this runs ahead of
+    /// (`windows_session`'s `tokio::join!`) must not be blocked by it.
+    async fn finalize_with_timeout(session: Box<dyn SttSession>, track: &'static str) {
+        match tokio::time::timeout(FINALIZE_TIMEOUT, session.finalize()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(%err, track, "live transcription: failed to finalize STT session"),
+            Err(_) => tracing::warn!(track, timeout_secs = FINALIZE_TIMEOUT.as_secs(), "live transcription: finalize timed out"),
         }
     }
 
@@ -652,6 +1367,7 @@ mod stt_wiring {
             start_ms: corrected_ms(pending.audio_start_ms, timestamp_mapper),
             end_ms: corrected_ms(pending.audio_end_ms, timestamp_mapper),
             is_final: true,
+            is_retranscribed: false,
         };
         if let Err(err) = store.insert_transcript_segment(&segment) {
             tracing::warn!(%err, ?track, "live transcription: failed to persist fallback-final transcript");
@@ -666,7 +1382,7 @@ mod stt_wiring {
             SttEvent::PartialTranscript { text, audio_start_ms, audio_end_ms, .. } => {
                 let start_ms = corrected_ms(audio_start_ms, timestamp_mapper);
                 let end_ms = corrected_ms(audio_end_ms, timestamp_mapper);
-                let segment = TranscriptSegment { session_id, track, speaker: None, text, start_ms, end_ms, is_final: false };
+                let segment = TranscriptSegment { session_id, track, speaker: None, text, start_ms, end_ms, is_final: false, is_retranscribed: false };
                 if let Err(err) = store.insert_transcript_segment(&segment) {
                     tracing::warn!(%err, ?track, "live transcription: failed to persist partial transcript");
                 }
@@ -675,7 +1391,7 @@ mod stt_wiring {
                 let speaker = words.as_ref().and_then(|words| words.first()).and_then(|word| word.speaker);
                 let start_ms = corrected_ms(audio_start_ms, timestamp_mapper);
                 let end_ms = corrected_ms(audio_end_ms, timestamp_mapper);
-                let segment = TranscriptSegment { session_id, track, speaker, text, start_ms, end_ms, is_final: true };
+                let segment = TranscriptSegment { session_id, track, speaker, text, start_ms, end_ms, is_final: true, is_retranscribed: false };
                 if let Err(err) = store.insert_transcript_segment(&segment) {
                     tracing::warn!(%err, ?track, "live transcription: failed to persist final transcript");
                 }
@@ -701,7 +1417,12 @@ mod stt_wiring {
     /// live transcription can't start at all (no credential store, no key, both
     /// sessions failed to open), so the sender side
     /// (`windows_frame_collector::collect_frames`) never blocks on a full channel.
-    async fn drain(audio_rx: &mut UnboundedReceiver<(TrackKind, Vec<f32>, u32)>) {
+    /// `collect_frames`'s `try_send` never blocks regardless (see its doc comment,
+    /// task #86), but without this the channel would just sit full and every chunk
+    /// after the first `stt_tx`-capacity's worth would silently log as dropped —
+    /// keeping it drained instead means no live transcription still means no
+    /// spurious "channel full" warnings.
+    async fn drain(audio_rx: &mut Receiver<(TrackKind, Vec<f32>, u32)>) {
         while audio_rx.recv().await.is_some() {}
     }
 
@@ -778,13 +1499,109 @@ mod stt_wiring {
             }
         }
 
-        fn test_remote_gate_state(session: Option<Box<dyn SttSession>>, samples_sent: u64, total_injected: u64, net_offset: i64, last_active: Instant) -> RemoteGateState {
-            RemoteGateState { session, gate: None, mapper: Some(TimestampMapper::new(100)), samples_sent, total_injected, net_offset, last_active }
+        /// `SttSession` test double whose `finalize` never resolves — stands in for
+        /// a black-holed network connection so `finalize_with_timeout`'s timeout
+        /// branch (task #81) can be exercised without an actual multi-second wait
+        /// (see the `start_paused = true` tests below, which fast-forward virtual
+        /// time instead).
+        struct HangingFinalizeSession;
+
+        #[async_trait::async_trait]
+        impl SttSession for HangingFinalizeSession {
+            async fn send_audio(&mut self, _chunk: AudioChunk<'_>) -> Result<(), stt_api::SttError> {
+                Ok(())
+            }
+
+            async fn finalize(self: Box<Self>) -> Result<(), stt_api::SttError> {
+                std::future::pending().await
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn finalize_with_timeout_gives_up_instead_of_hanging_forever() {
+            // With time paused, tokio auto-advances the virtual clock once nothing
+            // else can make progress (the only other pending future here is
+            // `HangingFinalizeSession::finalize`'s `pending()`, which never wakes
+            // anything) — so this resolves once `FINALIZE_TIMEOUT` elapses in
+            // virtual time, not real time.
+            finalize_with_timeout(Box::new(HangingFinalizeSession), "self").await;
+        }
+
+        /// `SttProvider` test double whose `start_session` never resolves — the
+        /// provider-level analogue of `HangingFinalizeSession`, for exercising
+        /// `start_session_with_timeout`'s timeout branch (task #85).
+        struct HangingStartSessionProvider;
+
+        #[async_trait::async_trait]
+        impl SttProvider for HangingStartSessionProvider {
+            async fn start_session(&self, _config: SttSessionConfig) -> Result<(Box<dyn SttSession>, UnboundedReceiver<SttEvent>), stt_api::SttError> {
+                std::future::pending().await
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn start_session_with_timeout_reports_error_status_instead_of_hanging_forever() {
+            let sink = Arc::new(Mutex::new(TranscriptionStatus::default()));
+            let result = start_session_with_timeout(
+                &HangingStartSessionProvider,
+                SttSessionConfig::new(16_000),
+                "self",
+                TrackKind::SelfMic,
+                &Some(sink.clone()),
+            )
+            .await;
+
+            assert!(result.is_none());
+            let status = sink.lock().unwrap().clone();
+            assert!(
+                matches!(status.self_status, TrackTranscriptionStatus::Error(_)),
+                "a timed-out start_session must report Error, not leave the track stuck on Connecting: {:?}",
+                status.self_status
+            );
+            assert_eq!(status.remote_status, TrackTranscriptionStatus::NotConfigured, "only the named track's status is touched");
+        }
+
+        /// A fresh in-memory store with one session already created — just
+        /// enough plumbing for `test_remote_gate_state` (task #90's
+        /// `open_gap`/`close_open_gap` need a real `SessionStore` and a
+        /// `session_id` that satisfies `transcript_segments`'/`transcription_gaps`'
+        /// foreign key) without every test hand-rolling the same three lines.
+        fn test_store_and_session() -> (SessionStore, SessionId) {
+            let store = SessionStore::open_in_memory().unwrap();
+            let manifest = test_manifest();
+            store.create_session(&manifest).unwrap();
+            (store, manifest.session_id)
+        }
+
+        fn test_remote_gate_state(
+            store: &SessionStore,
+            session_id: SessionId,
+            session: Option<Box<dyn SttSession>>,
+            samples_sent: u64,
+            total_injected: u64,
+            net_offset: i64,
+            last_active: Instant,
+        ) -> RemoteGateState<'_> {
+            RemoteGateState {
+                session,
+                gate: None,
+                mapper: Some(TimestampMapper::new(100)),
+                samples_sent,
+                total_injected,
+                net_offset,
+                last_active,
+                reconnect: ReconnectState::new(),
+                status_sink: None,
+                store,
+                session_id,
+                recording_started: Instant::now(),
+            }
         }
 
         #[tokio::test]
         async fn remote_gate_state_send_gated_advances_and_checkpoints() {
-            let mut remote = test_remote_gate_state(Some(Box::new(MockSttSession::new())), 10, 0, 0, Instant::now() - Duration::from_secs(10));
+            let (store, session_id) = test_store_and_session();
+            let mut remote = test_remote_gate_state(&store, session_id, Some(Box::new(MockSttSession::new())), 10, 0, 0, Instant::now() - Duration::from_secs(10));
             let before_call = remote.last_active;
 
             let pcm = vec![0.5f32; 5];
@@ -813,7 +1630,8 @@ mod stt_wiring {
             // — e.g. several keepalives fired during a long leading silence — plus
             // a non-zero net offset, so the bug's effect on `to_wallclock_ms` is
             // observable (an offset of 0 would look identical either way).
-            let mut remote = test_remote_gate_state(Some(Box::new(MockSttSession::new())), 0, 200, -50, Instant::now());
+            let (store, session_id) = test_store_and_session();
+            let mut remote = test_remote_gate_state(&store, session_id, Some(Box::new(MockSttSession::new())), 0, 200, -50, Instant::now());
 
             let pcm = vec![0.5f32; 10];
             remote.send_gated(&pcm).await;
@@ -837,6 +1655,286 @@ mod stt_wiring {
             // A provider timestamp at or past 2100ms (210 samples) does fall after
             // the checkpoint and must pick up its -500ms offset.
             assert_eq!(mapper.to_wallclock_ms(2_100), 2_100 - 500);
+        }
+
+        #[test]
+        fn reconnect_backoff_doubles_then_caps_at_30s() {
+            assert_eq!(reconnect_backoff(0), Duration::from_millis(500));
+            assert_eq!(reconnect_backoff(1), Duration::from_millis(1_000));
+            assert_eq!(reconnect_backoff(2), Duration::from_millis(2_000));
+            // 500ms * 2^6 = 32s, already past the 30s cap.
+            assert_eq!(reconnect_backoff(6), Duration::from_millis(30_000));
+            assert_eq!(reconnect_backoff(20), Duration::from_millis(30_000), "later attempts stay capped, not overflow");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn reconnect_state_note_disconnect_grows_backoff_and_keeps_the_original_outage_start() {
+            let mut reconnect = ReconnectState::new();
+            assert!(reconnect.retry_at.is_none());
+
+            reconnect.note_disconnect();
+            let first_disconnect = reconnect.disconnected_at.expect("the first note_disconnect must record when the outage started");
+            assert_eq!(reconnect.attempt, 1);
+            let first_retry_at = reconnect.retry_at.expect("armed after a disconnect");
+
+            // A failed retry attempt re-arms with a longer backoff, but must not
+            // move the outage's original start — `RemoteGateState::apply_reconnect_offset`
+            // needs the *whole* outage's duration once a later attempt finally
+            // succeeds, not just the time since the last failed attempt.
+            tokio::time::advance(Duration::from_millis(500)).await;
+            reconnect.note_disconnect();
+            assert_eq!(reconnect.attempt, 2);
+            assert_eq!(reconnect.disconnected_at, Some(first_disconnect));
+            assert!(reconnect.retry_at.unwrap() > first_retry_at, "backoff must grow after another failed attempt");
+
+            reconnect.reset();
+            assert!(reconnect.retry_at.is_none());
+            assert!(reconnect.disconnected_at.is_none());
+            assert_eq!(reconnect.attempt, 0);
+        }
+
+        #[test]
+        fn is_disconnect_retryable_matches_stt_error_and_defaults_true_for_a_silent_channel_close() {
+            assert!(is_disconnect_retryable(None), "a channel close with no explicit error (e.g. AssemblyAI's hard cap) must default to retryable");
+            assert!(is_disconnect_retryable(Some(&SttError::Transport("boom".to_string()))));
+            assert!(is_disconnect_retryable(Some(&SttError::Timeout)));
+            assert!(is_disconnect_retryable(Some(&SttError::RateLimited)));
+            assert!(!is_disconnect_retryable(Some(&SttError::AuthenticationFailed("bad key".to_string()))));
+            assert!(!is_disconnect_retryable(Some(&SttError::PermanentError("rejected".to_string()))));
+            assert!(!is_disconnect_retryable(Some(&SttError::SessionClosed)));
+        }
+
+        #[test]
+        fn note_disconnect_and_maybe_reconnect_arms_for_retryable_and_gives_up_for_permanent_errors() {
+            let sink = Arc::new(Mutex::new(TranscriptionStatus::default()));
+            let (store, session_id) = test_store_and_session();
+
+            let mut retryable = ReconnectState::new();
+            note_disconnect_and_maybe_reconnect(&store, session_id, Instant::now(), TrackKind::SelfMic, Some(&SttError::Timeout), &Some(sink.clone()), &mut retryable);
+            assert!(retryable.retry_at.is_some(), "a retryable error must arm a reconnect");
+            assert!(matches!(sink.lock().unwrap().self_status, TrackTranscriptionStatus::Error(_)));
+            assert!(retryable.open_gap_id.is_some(), "a genuinely new outage must open a transcription_gaps row");
+
+            let mut permanent = ReconnectState::new();
+            note_disconnect_and_maybe_reconnect(&store, session_id, Instant::now(), TrackKind::SelfMic, Some(&SttError::AuthenticationFailed("bad key".to_string())), &Some(sink.clone()), &mut permanent);
+            assert!(permanent.retry_at.is_none(), "a non-retryable error must not arm a reconnect");
+            assert!(permanent.open_gap_id.is_some(), "a non-retryable give-up must still open a gap — it's closed at recording end, not here");
+        }
+
+        #[test]
+        fn note_self_disconnect_clears_the_session_and_classifies_retryability() {
+            let (store, session_id) = test_store_and_session();
+            let mut self_session: Option<Box<dyn SttSession>> = Some(Box::new(MockSttSession::new()));
+            let mut reconnect = ReconnectState::new();
+            note_self_disconnect(&mut self_session, &mut reconnect, &None, Some(&SttError::RateLimited), &store, session_id, Instant::now());
+            assert!(self_session.is_none(), "the dead session must be cleared immediately");
+            assert!(reconnect.retry_at.is_some());
+
+            let mut self_session = Some(Box::new(MockSttSession::new()) as Box<dyn SttSession>);
+            let mut reconnect = ReconnectState::new();
+            note_self_disconnect(&mut self_session, &mut reconnect, &None, Some(&SttError::PermanentError("nope".to_string())), &store, session_id, Instant::now());
+            assert!(self_session.is_none());
+            assert!(reconnect.retry_at.is_none(), "a non-retryable error must not arm a reconnect");
+        }
+
+        #[tokio::test]
+        async fn remote_gate_state_note_disconnect_clears_session_and_arms_reconnect_when_retryable() {
+            let (store, session_id) = test_store_and_session();
+            let mut remote = test_remote_gate_state(&store, session_id, Some(Box::new(MockSttSession::new())), 0, 0, 0, Instant::now());
+            remote.note_disconnect(Some(&SttError::Transport("dropped".to_string())));
+            assert!(remote.session.is_none(), "a dead session must be cleared immediately so send_audio/keep_alive stop being called against it");
+            assert!(remote.reconnect.retry_at.is_some());
+        }
+
+        #[tokio::test]
+        async fn remote_gate_state_note_disconnect_gives_up_on_a_permanent_error() {
+            let (store, session_id) = test_store_and_session();
+            let mut remote = test_remote_gate_state(&store, session_id, Some(Box::new(MockSttSession::new())), 0, 0, 0, Instant::now());
+            remote.note_disconnect(Some(&SttError::AuthenticationFailed("bad key".to_string())));
+            assert!(remote.session.is_none());
+            assert!(remote.reconnect.retry_at.is_none(), "a non-retryable disconnect must not arm a reconnect");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn remote_gate_state_apply_reconnect_offset_preserves_timestamp_continuity_across_a_reconnect() {
+            // Old session: 1_000 samples (10s @ 100Hz) sent with no drops/injects,
+            // then disconnects.
+            let (store, session_id) = test_store_and_session();
+            let mut remote = test_remote_gate_state(&store, session_id, Some(Box::new(MockSttSession::new())), 1_000, 0, 0, Instant::now());
+            remote.note_disconnect(Some(&SttError::Transport("dropped".to_string())));
+            assert!(remote.session.is_none());
+
+            // The outage (session gone, backoff, reconnect) lasts 5s of real time
+            // before a fresh session opens.
+            tokio::time::advance(Duration::from_secs(5)).await;
+            remote.session = Some(Box::new(MockSttSession::new()));
+            remote.apply_reconnect_offset(100);
+
+            assert_eq!(remote.samples_sent, 0, "the new session's own send counter must restart at 0");
+            assert_eq!(remote.total_injected, 0);
+
+            // The new session's own clock restarts at 0, but its very first event
+            // must still map back to roughly 10s (the old session's 1_000 samples)
+            // + 5s (the outage) = 15s of true wall-clock-since-track-start —
+            // otherwise persisted timestamps would jump backward on reconnect.
+            let mapper = remote.mapper.as_ref().unwrap();
+            assert_eq!(mapper.to_wallclock_ms(0), 15_000);
+            // A later local event (1s further into the new session) keeps the same
+            // baseline offset applied on top.
+            assert_eq!(mapper.to_wallclock_ms(1_000), 16_000);
+        }
+
+        /// `SttProvider` test double whose `start_session` always succeeds
+        /// immediately — the success-path counterpart of `HangingStartSessionProvider`,
+        /// for exercising `attempt_reconnect`'s success branch.
+        struct ImmediateSttProvider;
+
+        #[async_trait::async_trait]
+        impl SttProvider for ImmediateSttProvider {
+            async fn start_session(&self, _config: SttSessionConfig) -> Result<(Box<dyn SttSession>, UnboundedReceiver<SttEvent>), stt_api::SttError> {
+                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                Ok((Box::new(MockSttSession::new()), rx))
+            }
+        }
+
+        #[tokio::test]
+        async fn attempt_reconnect_reports_connected_status_and_returns_the_session_on_success() {
+            // Task #87: `attempt_reconnect` no longer takes `&mut ReconnectState`
+            // at all (it must be spawnable via `tokio::spawn`, which needs an
+            // entirely owned/`'static` future) — the caller applies every
+            // `ReconnectState` effect itself once the `JoinHandle` resolves (see
+            // `run_live_transcription`'s reconnect-completion `select!` arms and
+            // `note_reconnect_failure`). This just checks the function's own
+            // direct contract: on success it returns the new session/events pair
+            // and reports `Connected` status.
+            let sink = Arc::new(Mutex::new(TranscriptionStatus::default()));
+            let provider: Arc<dyn SttProvider> = Arc::new(ImmediateSttProvider);
+
+            let result = attempt_reconnect(provider, SttSessionConfig::new(16_000), "self", TrackKind::SelfMic, Some(sink.clone())).await;
+
+            assert!(result.is_some());
+            assert_eq!(sink.lock().unwrap().self_status, TrackTranscriptionStatus::Connected);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn remote_reconnect_flow_uses_the_full_outage_duration_for_timestamp_continuity() {
+            // Regression test for a real bug: `attempt_reconnect` used to call
+            // `reconnect.reset()` on success, clearing `disconnected_at` before
+            // `apply_reconnect_offset` (invoked right after, at the real
+            // `select!` call site in `run_live_transcription`) could read it —
+            // silently making every Remote reconnect estimate a zero-length
+            // outage no matter how long the provider was actually unreachable.
+            // Unlike `remote_gate_state_apply_reconnect_offset_preserves_timestamp_continuity_across_a_reconnect`
+            // above (which sets `remote.session` directly, bypassing
+            // `attempt_reconnect` entirely and so never exercised this), this
+            // test drives the exact same two calls the `select!` arm makes.
+            let (store, session_id) = test_store_and_session();
+            let mut remote = test_remote_gate_state(&store, session_id, Some(Box::new(MockSttSession::new())), 1_000, 0, 0, Instant::now());
+            remote.note_disconnect(Some(&SttError::Transport("dropped".to_string())));
+            assert!(remote.session.is_none());
+
+            tokio::time::advance(Duration::from_secs(5)).await;
+            let provider: Arc<dyn SttProvider> = Arc::new(ImmediateSttProvider);
+            let result = attempt_reconnect(provider, SttSessionConfig::new(100), "remote", TrackKind::RemoteAudio, None).await;
+            let (session, _events) = result.expect("ImmediateSttProvider always succeeds");
+            remote.session = Some(session);
+            remote.apply_reconnect_offset(100);
+
+            // 10s (the old session's 1_000 samples @ 100Hz) + 5s (the outage) =
+            // 15s of true wall-clock-since-track-start. The pre-fix behavior
+            // returned 10_000 here, having lost the outage entirely.
+            let mapper = remote.mapper.as_ref().unwrap();
+            assert_eq!(mapper.to_wallclock_ms(0), 15_000);
+            assert!(remote.reconnect.retry_at.is_none(), "apply_reconnect_offset must reset reconnect back to a healthy baseline once it has used disconnected_at");
+            assert!(remote.reconnect.disconnected_at.is_none());
+        }
+
+        #[tokio::test]
+        async fn recv_reconnect_result_resolves_once_the_spawned_task_completes() {
+            let mut in_flight: Option<JoinHandle<Option<ReconnectSessionPair>>> = Some(tokio::spawn(async { None }));
+            let result = recv_reconnect_result(&mut in_flight).await;
+            assert!(matches!(result, Ok(None)));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn recv_reconnect_result_never_resolves_when_nothing_is_in_flight() {
+            // Mirrors `recv_track_event`'s `None` branch (see its doc comment):
+            // a `select!` branch guarded by `in_flight.is_some()` must never see
+            // this future spuriously ready when there is no task to await.
+            let mut in_flight: Option<JoinHandle<Option<ReconnectSessionPair>>> = None;
+            let timed_out = tokio::time::timeout(Duration::from_secs(60), recv_reconnect_result(&mut in_flight)).await;
+            assert!(timed_out.is_err(), "recv_reconnect_result(&mut None) must never resolve");
+        }
+
+        #[test]
+        fn note_reconnect_failure_from_an_already_reported_start_session_error_only_arms_backoff() {
+            // The `Ok(None)` case (see `note_reconnect_failure`'s doc comment):
+            // `start_session_with_timeout` already reported `Error` status
+            // itself, so this must not overwrite it — just arm the next backoff.
+            let sink = Arc::new(Mutex::new(TranscriptionStatus::default()));
+            set_status(&Some(sink.clone()), TrackKind::SelfMic, TrackTranscriptionStatus::Error("original".to_string()));
+            let mut reconnect = ReconnectState::new();
+
+            note_reconnect_failure(TrackKind::SelfMic, None, &Some(sink.clone()), &mut reconnect);
+
+            assert!(reconnect.retry_at.is_some(), "a failed attempt must arm another backoff");
+            assert_eq!(sink.lock().unwrap().self_status, TrackTranscriptionStatus::Error("original".to_string()), "must not overwrite a status start_session_with_timeout already reported");
+        }
+
+        #[tokio::test]
+        async fn note_reconnect_failure_from_a_panicked_task_reports_error_status_and_arms_backoff() {
+            // The `Err(join_err)` case: unlike a plain `Ok(None)`, nothing has
+            // reported `Error` status yet (the task never got to
+            // `start_session_with_timeout`'s own reporting), so this must do so
+            // itself before arming the backoff.
+            let handle: JoinHandle<Option<ReconnectSessionPair>> = tokio::spawn(async { panic!("simulated reconnect task panic") });
+            // `Result::expect_err` needs `T: Debug`, but `ReconnectSessionPair`
+            // contains `Box<dyn SttSession>` which isn't — match instead.
+            let join_err = match handle.await {
+                Err(join_err) => join_err,
+                Ok(_) => panic!("a panicking task must produce a JoinError"),
+            };
+
+            let sink = Arc::new(Mutex::new(TranscriptionStatus::default()));
+            let mut reconnect = ReconnectState::new();
+            note_reconnect_failure(TrackKind::RemoteAudio, Some(&join_err), &Some(sink.clone()), &mut reconnect);
+
+            assert!(reconnect.retry_at.is_some());
+            assert!(matches!(sink.lock().unwrap().remote_status, TrackTranscriptionStatus::Error(_)), "a panicked task has nothing else to report Error status, so this must");
+        }
+
+        #[tokio::test]
+        async fn note_disconnect_and_maybe_reconnect_does_not_rearm_while_a_reconnect_is_already_in_flight() {
+            // Task #87's multi-reconnect guard: a stray disconnect signal
+            // arriving while a reconnect task is already running for this track
+            // (see this function's doc comment) must not stack a second backoff
+            // on top, mirroring the existing `retry_at.is_some()` guard.
+            let (store, session_id) = test_store_and_session();
+            let mut reconnect = ReconnectState::new();
+            reconnect.in_flight = Some(tokio::spawn(std::future::pending::<Option<ReconnectSessionPair>>()));
+
+            note_disconnect_and_maybe_reconnect(&store, session_id, Instant::now(), TrackKind::SelfMic, Some(&SttError::Timeout), &None, &mut reconnect);
+
+            assert!(reconnect.retry_at.is_none(), "must not arm a new backoff while a reconnect task is already in flight");
+            assert!(reconnect.open_gap_id.is_none(), "an already-armed outage must not open a second gap either");
+            reconnect.abort_in_flight();
+        }
+
+        #[tokio::test]
+        async fn abort_in_flight_clears_the_handle() {
+            let mut reconnect = ReconnectState::new();
+            reconnect.in_flight = Some(tokio::spawn(std::future::pending::<Option<ReconnectSessionPair>>()));
+
+            reconnect.abort_in_flight();
+
+            assert!(reconnect.in_flight.is_none());
+        }
+
+        #[test]
+        fn abort_in_flight_is_a_no_op_when_nothing_is_in_flight() {
+            let mut reconnect = ReconnectState::new();
+            reconnect.abort_in_flight();
+            assert!(reconnect.in_flight.is_none());
         }
 
         #[test]
@@ -1052,7 +2150,7 @@ pub async fn run_live_transcription(
     _session_id: SessionId,
     _sample_rate_hz: u32,
     _credential_store: Option<Arc<dyn CredentialStore + Send + Sync>>,
-    mut audio_rx: UnboundedReceiver<(TrackKind, Vec<f32>, u32)>,
+    mut audio_rx: Receiver<(TrackKind, Vec<f32>, u32)>,
     _store: &SessionStore,
     status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
     _silence_gate_enabled: bool,

@@ -44,7 +44,12 @@ windows = { version = "0.58", features = ["Win32_Media_Audio", "Win32_System_Com
 # methods, so implementing the trait needs the same macro `stt-api` itself uses.
 async-trait = "0.1"
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+# "test-util" (not part of "full" — it's opt-in on purpose, see tokio's own
+# Cargo.toml) for `#[tokio::test(start_paused = true)]` in
+# `live_transcription`'s `start_session_with_timeout`/`finalize_with_timeout`
+# tests: it lets a timeout fire in virtual time instead of actually sleeping for
+# real seconds per test run.
+tokio = { version = "1", features = ["full", "test-util"] }
 upload-client = { path = "../upload-client", features = ["mock-server"] }
 
 [features]

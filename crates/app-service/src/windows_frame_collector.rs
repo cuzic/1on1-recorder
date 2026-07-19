@@ -11,7 +11,8 @@ use capture_api::rebinding::BindingKind;
 use capture_windows::CapturedFrameRecord;
 use crossbeam_channel::Receiver;
 use recorder_domain::{CapturedFrame, TrackKind};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::Sender;
 
 use crate::windows_supervisor::FrameSinkEvent;
 
@@ -95,9 +96,18 @@ pub struct CollectedFrames {
 /// `stt_sink`, if given, is a second side channel of the same shape: every
 /// frame's raw PCM (plus its track and sample rate) is forwarded there too, so
 /// `live_transcription` can stream audio into an STT provider as capture
-/// happens, without this function itself knowing anything about STT. A `send`
-/// failure (the receiving end was dropped, e.g. no STT session ever started)
-/// is silently ignored — same "best-effort side channel" spirit as `level_sink`.
+/// happens, without this function itself knowing anything about STT. This
+/// function runs synchronously on its own `collector` thread (see
+/// `windows_session::run_capture_blocking`), draining `rx` as fast as
+/// `WindowsSupervisor` produces `FrameSinkEvent`s — an `.await` here isn't even
+/// possible, and blocking on `stt_sink` (an async mpsc `Sender`) would stall that
+/// drain, backing up `rx` behind it and delaying capture itself (task #86). So a
+/// slow/stalled STT consumer (reconnect backoff, a full provider send queue, task
+/// #82/#83) must never be able to block this loop: `stt_sink` is a *bounded*
+/// channel and this uses `try_send`, not `send` — a full channel just drops that
+/// chunk (see `try_send`'s `Full` arm below) rather than blocking. A `Closed`
+/// error (the receiving end was dropped, e.g. no STT session ever started) is
+/// silently ignored — same "best-effort side channel" spirit as `level_sink`.
 ///
 /// Buffers an entire session's samples in memory — acceptable for proving real
 /// `capture-windows` audio flows through the exact pipeline stage 1 validated with
@@ -108,12 +118,16 @@ pub struct CollectedFrames {
 pub fn collect_frames(
     rx: &Receiver<FrameSinkEvent>,
     level_sink: Option<&Mutex<LevelSnapshot>>,
-    stt_sink: Option<&UnboundedSender<(TrackKind, Vec<f32>, u32)>>,
+    stt_sink: Option<&Sender<(TrackKind, Vec<f32>, u32)>>,
 ) -> CollectedFrames {
     let mut self_frames = Vec::new();
     let mut remote_frames = Vec::new();
     let mut formats: HashMap<BindingKind, (u32, u16)> = HashMap::new();
     let mut intervals: HashMap<BindingKind, u64> = HashMap::new();
+    // Counts `stt_sink` drops so the warning below can be rate-limited (logging
+    // every single drop would itself be a log-spam source once the STT side is
+    // stuck for more than an instant — see `stt_sink`'s doc comment above).
+    let mut stt_sink_drops: u64 = 0;
 
     while let Ok(event) = rx.recv() {
         match event {
@@ -140,7 +154,20 @@ pub fn collect_frames(
                 }
 
                 if let Some(sink) = stt_sink {
-                    let _ = sink.send((track, frame.samples.clone(), sample_rate));
+                    match sink.try_send((track, frame.samples.clone(), sample_rate)) {
+                        Ok(()) => {}
+                        Err(TrySendError::Closed(_)) => {}
+                        Err(TrySendError::Full(_)) => {
+                            stt_sink_drops += 1;
+                            // First drop logs immediately (so a stuck STT side shows up
+                            // right away), then every 100th after that — frequent enough
+                            // to see the problem is ongoing, not so frequent it becomes
+                            // its own log-spam problem on a long stall.
+                            if stt_sink_drops == 1 || stt_sink_drops.is_multiple_of(100) {
+                                tracing::warn!(stt_sink_drops, ?track, "live transcription channel full, dropping PCM chunk (STT falling behind capture)");
+                            }
+                        }
+                    }
                 }
 
                 match track {
@@ -199,5 +226,64 @@ mod tests {
     #[test]
     fn rms_and_peak_of_empty_samples_is_zero() {
         assert_eq!(rms_and_peak(&[]), (0.0, 0.0));
+    }
+
+    fn frame_event(binding: BindingKind, packet_seq: u64) -> FrameSinkEvent {
+        let record = CapturedFrameRecord::from_raw(binding, packet_seq, packet_seq, 0, 0, packet_seq * 1_000, 960, 0, 0, None);
+        FrameSinkEvent::Frame { record, samples: vec![0.0; 960] }
+    }
+
+    /// task #86: a full `stt_sink` must drop the overflowing chunk via `try_send`
+    /// rather than block `collect_frames` — otherwise a stalled STT consumer would
+    /// delay draining `rx`, i.e. delay capture itself (see `collect_frames`'s doc
+    /// comment).
+    #[test]
+    fn collect_frames_drops_stt_sink_overflow_without_blocking_collection() {
+        let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
+        let (stt_tx, mut stt_rx) = tokio::sync::mpsc::channel(1);
+
+        frame_tx
+            .send(FrameSinkEvent::StreamStarted { binding: BindingKind::Microphone, sample_rate: 48_000, channels: 1, nominal_frame_interval_ns: 10_000_000 })
+            .unwrap();
+        for packet_seq in 0..3 {
+            frame_tx.send(frame_event(BindingKind::Microphone, packet_seq)).unwrap();
+        }
+        drop(frame_tx); // lets collect_frames' `while let Ok(event) = rx.recv()` end
+
+        let collected = collect_frames(&frame_rx, None, Some(&stt_tx));
+
+        // All three frames are still in the batch collection — dropping from
+        // `stt_sink` must not lose anything from `self_frames`/`remote_frames`.
+        assert_eq!(collected.self_frames.len(), 3);
+
+        // Capacity 1 and nothing was reading concurrently while collect_frames ran,
+        // so only the first of the three chunks made it through; the other two hit
+        // `try_send`'s `Full` arm and were dropped instead of blocking.
+        assert!(stt_rx.try_recv().is_ok());
+        assert!(stt_rx.try_recv().is_err());
+    }
+
+    /// Companion to the overflow test above: with a channel that's never full,
+    /// every chunk reaches `stt_sink` unchanged (no regression from switching
+    /// `send` to `try_send`).
+    #[test]
+    fn collect_frames_forwards_every_chunk_when_stt_sink_has_room() {
+        let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
+        let (stt_tx, mut stt_rx) = tokio::sync::mpsc::channel(8);
+
+        frame_tx
+            .send(FrameSinkEvent::StreamStarted { binding: BindingKind::Microphone, sample_rate: 48_000, channels: 1, nominal_frame_interval_ns: 10_000_000 })
+            .unwrap();
+        for packet_seq in 0..3 {
+            frame_tx.send(frame_event(BindingKind::Microphone, packet_seq)).unwrap();
+        }
+        drop(frame_tx);
+
+        collect_frames(&frame_rx, None, Some(&stt_tx));
+
+        for _ in 0..3 {
+            assert!(stt_rx.try_recv().is_ok());
+        }
+        assert!(stt_rx.try_recv().is_err());
     }
 }

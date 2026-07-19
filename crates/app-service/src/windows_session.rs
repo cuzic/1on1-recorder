@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use capture_windows::device_watch::DeviceWatch;
 use recorder_domain::{SessionManifest, SessionSummary, TrackKind, UploadAdapter};
 use session_store::SessionStore;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use crate::error::AppServiceError;
 use crate::live_transcription::{run_live_transcription, TranscriptionStatus};
@@ -71,7 +71,21 @@ pub async fn run_windows_capture_session(
     // collector thread are fully done, which is what lets `run_live_transcription`'s
     // `audio_rx.recv()` loop end (and finalize both STT sessions) at the right time
     // without a separate shutdown signal.
-    let (stt_tx, stt_rx) = tokio::sync::mpsc::unbounded_channel();
+    //
+    // Bounded (task #86), not `unbounded_channel`: `stt_tx.try_send` runs on
+    // `collect_frames`'s synchronous thread (see `run_capture_blocking` below), so
+    // an unbounded channel would let a stalled STT consumer (reconnect backoff, a
+    // full provider send queue — task #82/#83) grow this queue's `Vec<f32>` chunks
+    // without limit, unlike everything downstream of it (the provider adapter's own
+    // bounded queue). Capacity 500 is sized off the WASAPI shared-mode nominal device
+    // period, typically ~10ms (`capture_windows::CaptureEvent::StreamStarted`'s
+    // `nominal_frame_interval_ns` doc comment) — i.e. ~100 chunks/sec per track, and
+    // both Self and Remote share this one channel, so ~200 chunks/sec combined. 500
+    // is therefore roughly 2.5s of combined buffering: enough to ride out a brief STT
+    // hiccup without dropping audio, but bounded so a sustained stall degrades to
+    // dropped chunks (see `collect_frames`'s `try_send` handling) instead of unbounded
+    // memory growth.
+    let (stt_tx, stt_rx) = tokio::sync::mpsc::channel(500);
     let live_transcription_fut = run_live_transcription(
         manifest.session_id,
         manifest.audio.sample_rate,
@@ -119,7 +133,7 @@ fn run_capture_blocking(
     callback_timeout_ms: u32,
     shutdown_rx: crossbeam_channel::Receiver<()>,
     level_sink: Option<Arc<Mutex<LevelSnapshot>>>,
-    stt_tx: UnboundedSender<(TrackKind, Vec<f32>, u32)>,
+    stt_tx: Sender<(TrackKind, Vec<f32>, u32)>,
 ) -> Result<CollectedFrames, capture_windows::CaptureError> {
     let mut supervisor = WindowsSupervisor::new(callback_timeout_ms);
     let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
