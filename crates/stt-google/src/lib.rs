@@ -41,7 +41,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use stt_api::{
-    AudioChunk, SttError, SttEvent, SttExtraResult, SttProvider, SttSession, SttSessionConfig, Word,
+    AudioChunk, KeepAliveEffect, SttError, SttEvent, SttExtraResult, SttProvider, SttSession,
+    SttSessionConfig, Word,
 };
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
@@ -68,6 +69,11 @@ const MAX_AUDIO_CHUNK_BYTES: usize = 12_000;
 /// bias recognition toward `vocabulary_boost` words without the false-positive risk
 /// the proto comment attributes to values near the top of that range.
 const VOCABULARY_BOOST_VALUE: f32 = 10.0;
+/// Duration of the silent PCM heartbeat `GoogleSession::keep_alive` sends. Well
+/// under the ~10s `StreamingRecognize` idle timeout this crate's doc comment
+/// describes, so a caller polling this on any reasonable cadence keeps the stream
+/// alive with room to spare.
+const KEEP_ALIVE_SILENCE_MS: u32 = 100;
 
 /// Where to find the service-account key used to mint OAuth tokens, if not relying
 /// on Application Default Credentials.
@@ -183,6 +189,7 @@ impl SttProvider for GoogleProvider {
             Box::new(GoogleSession {
                 commands: cmd_tx,
                 drained: Some(drained_rx),
+                sample_rate_hz: config.sample_rate_hz,
             }),
             event_rx,
         ))
@@ -202,6 +209,10 @@ enum Command {
 struct GoogleSession {
     commands: mpsc::UnboundedSender<Command>,
     drained: Option<oneshot::Receiver<Result<(), SttError>>>,
+    /// Needed to size the silent PCM16LE buffer `keep_alive` sends (see its doc
+    /// comment on why Google's `StreamingRecognize` needs a real audio heartbeat
+    /// rather than a protocol-level ping).
+    sample_rate_hz: u32,
 }
 
 #[async_trait]
@@ -227,6 +238,28 @@ impl SttSession for GoogleSession {
             None => Ok(()),
         }
     }
+
+    /// `StreamingRecognize` has no protocol-level keep-alive (see crate root doc
+    /// comment) — the only way to stop the ~10s idle timeout from firing during a
+    /// silence-skipping gap is to actually advance the audio timeline. This sends
+    /// `KEEP_ALIVE_SILENCE_MS` of all-zero PCM16LE through the same
+    /// `Command::Audio` path `send_audio` uses, so it's indistinguishable to the
+    /// gRPC stream from real (silent) audio.
+    async fn keep_alive(&mut self) -> Result<KeepAliveEffect, SttError> {
+        let samples = keep_alive_silence_samples(self.sample_rate_hz);
+        let bytes = vec![0u8; samples as usize * 2];
+        self.commands
+            .send(Command::Audio(bytes))
+            .map_err(|_| SttError::SessionClosed)?;
+        Ok(KeepAliveEffect::InjectedAudio { samples })
+    }
+}
+
+/// Number of mono samples in `KEEP_ALIVE_SILENCE_MS` at `sample_rate_hz`, i.e. how
+/// many silent samples `GoogleSession::keep_alive` sends and reports back via
+/// `KeepAliveEffect::InjectedAudio`.
+fn keep_alive_silence_samples(sample_rate_hz: u32) -> u64 {
+    (sample_rate_hz as u64 * KEEP_ALIVE_SILENCE_MS as u64) / 1000
 }
 
 /// Builds the outbound request stream: one `streaming_config` message, then
@@ -762,6 +795,35 @@ mod tests {
         assert_eq!(parse_speaker_label(""), None);
         assert_eq!(parse_speaker_label("3"), Some(3));
         assert_eq!(parse_speaker_label("not-a-number"), None);
+    }
+
+    #[test]
+    fn keep_alive_silence_samples_computes_100ms_at_sample_rate() {
+        assert_eq!(keep_alive_silence_samples(16_000), 1_600);
+        assert_eq!(keep_alive_silence_samples(8_000), 800);
+        assert_eq!(keep_alive_silence_samples(48_000), 4_800);
+    }
+
+    #[tokio::test]
+    async fn keep_alive_sends_silent_pcm_audio_command_and_reports_samples() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
+        let mut session = GoogleSession {
+            commands: cmd_tx,
+            drained: None,
+            sample_rate_hz: 16_000,
+        };
+
+        let effect = session.keep_alive().await.expect("keep_alive succeeds");
+        assert_eq!(effect, KeepAliveEffect::InjectedAudio { samples: 1_600 });
+
+        match cmd_rx.try_recv().expect("a command was sent") {
+            Command::Audio(bytes) => {
+                // PCM16LE, mono: 2 bytes per sample, all zero (silence).
+                assert_eq!(bytes.len(), 1_600 * 2);
+                assert!(bytes.iter().all(|&b| b == 0));
+            }
+            Command::Close => panic!("expected Command::Audio, got Command::Close"),
+        }
     }
 
     #[test]
