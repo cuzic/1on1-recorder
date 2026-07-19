@@ -44,6 +44,7 @@ use stt_api::{
     AudioChunk, KeepAliveEffect, SttError, SttEvent, SttExtraResult, SttProvider, SttSession,
     SttSessionConfig, Word,
 };
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
@@ -74,6 +75,17 @@ const VOCABULARY_BOOST_VALUE: f32 = 10.0;
 /// describes, so a caller polling this on any reasonable cadence keeps the stream
 /// alive with room to spare.
 const KEEP_ALIVE_SILENCE_MS: u32 = 100;
+/// Bounds how many `Command`s (audio or keep-alive) can queue in
+/// `GoogleSession::commands` ahead of `build_outbound_stream` actually writing
+/// them to the gRPC connection. This project's only real producer,
+/// `app-service`'s WASAPI capture pipeline, calls `send_audio` roughly once per
+/// ~10ms capture callback, so 500 slots hold a few seconds of audio — enough to
+/// absorb a brief stall in the TCP write path, but small and finite enough that a
+/// genuinely stuck connection (`try_send` returning `Full`) is reported back as a
+/// retryable error well before Google's own ~10s `StreamingRecognize` idle
+/// timeout would have killed the session anyway, instead of growing this queue
+/// without limit.
+const COMMAND_CHANNEL_CAPACITY: usize = 500;
 
 /// Where to find the service-account key used to mint OAuth tokens, if not relying
 /// on Application Default Credentials.
@@ -161,7 +173,7 @@ impl SttProvider for GoogleProvider {
         let recognizer = recognizer_path(&self.credentials.project_id, &self.credentials.location);
         let streaming_config = build_streaming_config(&self.model, &config);
 
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL_CAPACITY);
         let outbound = build_outbound_stream(recognizer, streaming_config, cmd_rx);
 
         let mut request = tonic::Request::new(outbound);
@@ -207,7 +219,7 @@ enum Command {
 /// `async_stream::stream!` generator built by `build_outbound_stream`, driven by
 /// tonic; the response stream lives in `reader_task`.
 struct GoogleSession {
-    commands: mpsc::UnboundedSender<Command>,
+    commands: mpsc::Sender<Command>,
     drained: Option<oneshot::Receiver<Result<(), SttError>>>,
     /// Needed to size the silent PCM16LE buffer `keep_alive` sends (see its doc
     /// comment on why Google's `StreamingRecognize` needs a real audio heartbeat
@@ -224,14 +236,17 @@ impl SttSession for GoogleSession {
             let pcm16 = (clamped * i16::MAX as f32).round() as i16;
             bytes.extend_from_slice(&pcm16.to_le_bytes());
         }
-        self.commands
-            .send(Command::Audio(bytes))
-            .map_err(|_| SttError::SessionClosed)
+        send_command(&self.commands, Command::Audio(bytes))
     }
 
     async fn finalize(mut self: Box<Self>) -> Result<(), SttError> {
+        // Unlike `send_audio`/`keep_alive`, this can afford to await instead of
+        // `try_send`ing: it runs once, after the caller is done producing audio,
+        // so blocking here until `build_outbound_stream` drains a full queue
+        // (rather than failing) is the correct way to make sure `Close` is seen.
         self.commands
             .send(Command::Close)
+            .await
             .map_err(|_| SttError::SessionClosed)?;
         match self.drained.take() {
             Some(rx) => rx.await.map_err(|_| SttError::SessionClosed)?,
@@ -248,11 +263,23 @@ impl SttSession for GoogleSession {
     async fn keep_alive(&mut self) -> Result<KeepAliveEffect, SttError> {
         let samples = keep_alive_silence_samples(self.sample_rate_hz);
         let bytes = vec![0u8; samples as usize * 2];
-        self.commands
-            .send(Command::Audio(bytes))
-            .map_err(|_| SttError::SessionClosed)?;
+        send_command(&self.commands, Command::Audio(bytes))?;
         Ok(KeepAliveEffect::InjectedAudio { samples })
     }
+}
+
+/// `send_audio`/`keep_alive`'s shared enqueue path: `try_send` rather than the
+/// awaiting `send` so a stalled outbound gRPC write (TCP backpressure) can't make
+/// either method hang the caller — instead `Full` surfaces immediately as a
+/// retryable `SttError::Transport` once `COMMAND_CHANNEL_CAPACITY` worth of audio
+/// is already queued.
+fn send_command(commands: &mpsc::Sender<Command>, command: Command) -> Result<(), SttError> {
+    commands.try_send(command).map_err(|err| match err {
+        TrySendError::Full(_) => {
+            SttError::Transport("stt-google: outbound audio queue is full".to_string())
+        }
+        TrySendError::Closed(_) => SttError::SessionClosed,
+    })
 }
 
 /// Number of mono samples in `KEEP_ALIVE_SILENCE_MS` at `sample_rate_hz`, i.e. how
@@ -269,7 +296,7 @@ fn keep_alive_silence_samples(sample_rate_hz: u32) -> u64 {
 fn build_outbound_stream(
     recognizer: String,
     streaming_config: pb::StreamingRecognitionConfig,
-    mut commands: mpsc::UnboundedReceiver<Command>,
+    mut commands: mpsc::Receiver<Command>,
 ) -> impl futures_core::Stream<Item = pb::StreamingRecognizeRequest> {
     async_stream::stream! {
         yield pb::StreamingRecognizeRequest {
@@ -826,7 +853,7 @@ mod tests {
 
     #[tokio::test]
     async fn keep_alive_sends_silent_pcm_audio_command_and_reports_samples() {
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Command>();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL_CAPACITY);
         let mut session = GoogleSession {
             commands: cmd_tx,
             drained: None,
@@ -844,6 +871,61 @@ mod tests {
             }
             Command::Close => panic!("expected Command::Audio, got Command::Close"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_audio_returns_retryable_transport_error_when_queue_is_full() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(1);
+        let mut session = GoogleSession {
+            commands: cmd_tx,
+            drained: None,
+            sample_rate_hz: 16_000,
+        };
+
+        // Fills the one available slot without anything draining it, mirroring a
+        // stalled `build_outbound_stream`/TCP write.
+        session
+            .send_audio(AudioChunk {
+                pcm: &[0.0],
+                start_sample: 0,
+            })
+            .await
+            .expect("first send_audio fills the only slot");
+
+        let err = session
+            .send_audio(AudioChunk {
+                pcm: &[0.0],
+                start_sample: 1,
+            })
+            .await
+            .expect_err("second send_audio must fail once the queue is full");
+        assert!(matches!(err, SttError::Transport(_)));
+        assert!(
+            err.is_retryable(),
+            "a full outbound queue must be retryable, not permanent"
+        );
+
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
+    async fn send_audio_returns_session_closed_when_receiver_dropped() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL_CAPACITY);
+        drop(cmd_rx);
+        let mut session = GoogleSession {
+            commands: cmd_tx,
+            drained: None,
+            sample_rate_hz: 16_000,
+        };
+
+        let err = session
+            .send_audio(AudioChunk {
+                pcm: &[0.0],
+                start_sample: 0,
+            })
+            .await
+            .expect_err("send_audio must fail once the receiver is gone");
+        assert!(matches!(err, SttError::SessionClosed));
     }
 
     #[test]

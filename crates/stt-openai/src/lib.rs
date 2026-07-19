@@ -77,6 +77,20 @@ const KEEP_ALIVE_SILENCE_MS: u32 = 100;
 /// [`KEEP_ALIVE_SILENCE_MS`] of silence at [`REQUIRED_SAMPLE_RATE_HZ`], in samples.
 const KEEP_ALIVE_SILENCE_SAMPLES: u32 = REQUIRED_SAMPLE_RATE_HZ / 1000 * KEEP_ALIVE_SILENCE_MS;
 
+/// Capacity of the `WsCommand` channel `send_audio`/`keep_alive` push onto and
+/// `writer_task` drains. Bounded (not `mpsc::unbounded_channel`) so that a TCP
+/// write that stalls without erroring — e.g. the peer stops reading but doesn't
+/// reset the connection — can't grow this queue's PCM backlog without limit; once
+/// `writer_task` falls this far behind, `send_audio`/`keep_alive` start returning
+/// `SttError::Transport` (see their `try_send` calls below) instead of continuing
+/// to buffer. Sized in *messages*, not bytes, since `WsCommand::Audio` chunks are
+/// caller-sized (capture-side chunks are on the order of a 10ms device period —
+/// see the capture crates); at that cadence 256 queued messages is on the order
+/// of a couple of seconds of audio, enough slack to absorb an ordinary scheduling
+/// stall without either running away in memory or rejecting audio on routine
+/// jitter.
+const AUDIO_COMMAND_CHANNEL_CAPACITY: usize = 256;
+
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// A configured OpenAI Realtime transcription provider. One instance can open many
@@ -132,14 +146,18 @@ impl SttProvider for OpenAiProvider {
         let (write, read) = ws_stream.split();
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(AUDIO_COMMAND_CHANNEL_CAPACITY);
         let (drained_tx, drained_rx) = oneshot::channel();
         let draining = Arc::new(AtomicBool::new(false));
 
         // Queued before returning the session to the caller, so `session.update`
         // is guaranteed to reach the server before any `send_audio` call's
-        // `input_audio_buffer.append`.
-        let _ = cmd_tx.send(WsCommand::Json(build_session_update(&self.model, &config)));
+        // `input_audio_buffer.append`. `.await` rather than `try_send`: the channel
+        // was just created and nothing else has queued onto it yet, so this never
+        // actually blocks.
+        let _ = cmd_tx
+            .send(WsCommand::Json(build_session_update(&self.model, &config)))
+            .await;
 
         tokio::spawn(writer_task(write, cmd_rx, draining.clone()));
         tokio::spawn(reader_task(
@@ -173,7 +191,7 @@ enum WsCommand {
 /// actual socket lives in `writer_task`/`reader_task` instead (same pattern as
 /// `stt-deepgram::DeepgramSession`).
 struct OpenAiSession {
-    commands: mpsc::UnboundedSender<WsCommand>,
+    commands: mpsc::Sender<WsCommand>,
     drained: Option<oneshot::Receiver<Result<(), SttError>>>,
 }
 
@@ -187,13 +205,23 @@ impl SttSession for OpenAiSession {
             bytes.extend_from_slice(&pcm16.to_le_bytes());
         }
         self.commands
-            .send(WsCommand::Audio(bytes))
-            .map_err(|_| SttError::SessionClosed)
+            .try_send(WsCommand::Audio(bytes))
+            .map_err(send_error_to_stt_error)
     }
 
     async fn finalize(mut self: Box<Self>) -> Result<(), SttError> {
+        // `.send(...).await` rather than `try_send`: a commit must reach
+        // `writer_task` strictly after every `WsCommand::Audio` already queued
+        // ahead of it (the reader task matches the commit's `completed` event by
+        // `item_id`, so if audio the commit was meant to flush got dropped instead
+        // the drain would hang or resolve on the wrong turn — see the module doc
+        // comment). Waiting for queue space here preserves that ordering instead
+        // of racing a retry loop against `writer_task`'s drain rate; `finalize()`
+        // is called at most once per session and #81 is adding a timeout around
+        // it, which bounds how long this can block.
         self.commands
             .send(WsCommand::Commit)
+            .await
             .map_err(|_| SttError::SessionClosed)?;
         match self.drained.take() {
             Some(rx) => rx.await.map_err(|_| SttError::SessionClosed)?,
@@ -210,17 +238,31 @@ impl SttSession for OpenAiSession {
     async fn keep_alive(&mut self) -> Result<KeepAliveEffect, SttError> {
         let silence = vec![0u8; KEEP_ALIVE_SILENCE_SAMPLES as usize * 2];
         self.commands
-            .send(WsCommand::Audio(silence))
-            .map_err(|_| SttError::SessionClosed)?;
+            .try_send(WsCommand::Audio(silence))
+            .map_err(send_error_to_stt_error)?;
         Ok(KeepAliveEffect::InjectedAudio {
             samples: KEEP_ALIVE_SILENCE_SAMPLES as u64,
         })
     }
 }
 
+/// Shared by `send_audio`/`keep_alive`'s `try_send` calls: `Full` means
+/// `writer_task` is backlogged (see [`AUDIO_COMMAND_CHANNEL_CAPACITY`]'s doc
+/// comment) rather than gone, so it's `Transport` — retryable via
+/// `SttError::is_retryable` — and not the permanent `SessionClosed`.
+fn send_error_to_stt_error(err: mpsc::error::TrySendError<WsCommand>) -> SttError {
+    match err {
+        mpsc::error::TrySendError::Full(_) => SttError::Transport(
+            "openai realtime writer task is backlogged: audio command queue is full"
+                .to_string(),
+        ),
+        mpsc::error::TrySendError::Closed(_) => SttError::SessionClosed,
+    }
+}
+
 async fn writer_task(
     mut write: SplitSink<WsStream, Message>,
-    mut commands: mpsc::UnboundedReceiver<WsCommand>,
+    mut commands: mpsc::Receiver<WsCommand>,
     draining: Arc<AtomicBool>,
 ) {
     while let Some(cmd) = commands.recv().await {
@@ -613,7 +655,7 @@ mod tests {
 
     #[test]
     fn keep_alive_sends_100ms_of_silence_and_reports_samples_sent() {
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(AUDIO_COMMAND_CHANNEL_CAPACITY);
         let mut session = OpenAiSession {
             commands: cmd_tx,
             drained: None,
@@ -639,6 +681,75 @@ mod tests {
             }
             other => panic!("expected WsCommand::Audio, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_audio_reports_retryable_transport_error_when_channel_is_full() {
+        // Capacity 1: the one slot is filled by the Json session-update queued at
+        // `start_session` time in real usage; here we fill it manually so the very
+        // next `send_audio` call observes `TrySendError::Full`.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        cmd_tx.try_send(WsCommand::Json(json!({}))).unwrap();
+        let mut session = OpenAiSession {
+            commands: cmd_tx,
+            drained: None,
+        };
+
+        let pcm = [0.0f32; 4];
+        let err = session
+            .send_audio(AudioChunk {
+                pcm: &pcm,
+                start_sample: 0,
+            })
+            .await
+            .expect_err("try_send should fail once the channel is full");
+
+        assert!(matches!(err, SttError::Transport(_)));
+        assert!(err.is_retryable(), "a full channel should be retryable");
+
+        // The one slot still holds the original Json command; the Audio command was
+        // rejected outright rather than silently queued or dropped-and-lost.
+        assert!(matches!(cmd_rx.try_recv(), Ok(WsCommand::Json(_))));
+    }
+
+    #[tokio::test]
+    async fn send_audio_reports_session_closed_when_receiver_dropped() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(AUDIO_COMMAND_CHANNEL_CAPACITY);
+        drop(cmd_rx);
+        let mut session = OpenAiSession {
+            commands: cmd_tx,
+            drained: None,
+        };
+
+        let pcm = [0.0f32; 4];
+        let err = session
+            .send_audio(AudioChunk {
+                pcm: &pcm,
+                start_sample: 0,
+            })
+            .await
+            .expect_err("send_audio should fail once the receiver is gone");
+
+        assert!(matches!(err, SttError::SessionClosed));
+    }
+
+    #[tokio::test]
+    async fn keep_alive_reports_retryable_transport_error_when_channel_is_full() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        cmd_tx.try_send(WsCommand::Commit).unwrap();
+        let mut session = OpenAiSession {
+            commands: cmd_tx,
+            drained: None,
+        };
+
+        let err = session
+            .keep_alive()
+            .await
+            .expect_err("try_send should fail once the channel is full");
+
+        assert!(matches!(err, SttError::Transport(_)));
+        assert!(err.is_retryable(), "a full channel should be retryable");
+        assert!(matches!(cmd_rx.try_recv(), Ok(WsCommand::Commit)));
     }
 
     #[test]

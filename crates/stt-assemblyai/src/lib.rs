@@ -44,6 +44,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use stt_api::{AudioChunk, SttError, SttEvent, SttProvider, SttSession, SttSessionConfig, Word};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -82,6 +83,16 @@ const TARGET_CHUNK_MS: u32 = 100;
 /// at [`AssemblyAISession::finalize`] time is dropped rather than sent, since sending
 /// it would just get the session closed instead of transcribed.
 const MIN_CHUNK_MS: u32 = 50;
+
+/// Capacity of the `WsCommand` channel between [`AssemblyAISession`] and
+/// `writer_task`. Bounded (not `unbounded_channel`) so a stalled TCP write — e.g. the
+/// socket's send buffer filling up because the peer stops reading — can't let queued
+/// `WsCommand::Audio` frames accumulate without limit. Each frame carries
+/// `TARGET_CHUNK_MS` (100ms) of audio, so 50 slots hold 5 seconds' worth: enough to
+/// absorb a brief stall without `send_audio` returning a retryable error, while still
+/// capping worst-case memory (50 frames * ~3.2KB/frame at 16kHz PCM16 is trivial) if
+/// the connection stays stuck.
+const CMD_CHANNEL_CAPACITY: usize = 50;
 
 fn chunk_bytes(ms: u32) -> usize {
     (SUPPORTED_SAMPLE_RATE_HZ as usize * ms as usize / 1000) * BYTES_PER_SAMPLE
@@ -134,7 +145,7 @@ impl SttProvider for AssemblyAIProvider {
         let (write, read) = ws_stream.split();
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAPACITY);
         let (drained_tx, drained_rx) = oneshot::channel();
 
         tokio::spawn(writer_task(write, cmd_rx));
@@ -160,7 +171,7 @@ enum WsCommand {
 /// stays trivially `Send` regardless of whether the underlying TLS stream is —
 /// the actual socket lives in `writer_task`/`reader_task` instead.
 struct AssemblyAISession {
-    commands: mpsc::UnboundedSender<WsCommand>,
+    commands: mpsc::Sender<WsCommand>,
     drained: Option<oneshot::Receiver<Result<(), SttError>>>,
     /// PCM16 bytes accumulated across `send_audio` calls, not yet flushed as a
     /// `WsCommand::Audio` frame — see `TARGET_CHUNK_MS`'s doc comment.
@@ -187,9 +198,32 @@ impl SttSession for AssemblyAISession {
         let target = chunk_bytes(TARGET_CHUNK_MS);
         while self.pending.len() >= target {
             let frame: Vec<u8> = self.pending.drain(..target).collect();
-            self.commands
-                .send(WsCommand::Audio(frame))
-                .map_err(|_| SttError::SessionClosed)?;
+            match self.commands.try_send(WsCommand::Audio(frame)) {
+                Ok(()) => {}
+                Err(TrySendError::Closed(_)) => return Err(SttError::SessionClosed),
+                Err(TrySendError::Full(cmd)) => {
+                    // The channel is full because `writer_task` can't keep up with TCP
+                    // writes (see `CMD_CHANNEL_CAPACITY`'s doc comment). Put the frame
+                    // that just failed back in front of whatever's still unflushed in
+                    // `pending`, in original order, and bail out rather than looping:
+                    // once `try_send` is failing, every subsequent iteration would fail
+                    // the same way, so there's no point spinning. Restoring (instead of
+                    // dropping) means no audio is lost — the caller sees a retryable
+                    // error and the next `send_audio` call picks up exactly where this
+                    // one left off.
+                    let WsCommand::Audio(frame) = cmd else {
+                        unreachable!("only WsCommand::Audio is try_sent in send_audio")
+                    };
+                    let mut restored = frame;
+                    restored.extend_from_slice(&self.pending);
+                    self.pending = restored;
+                    return Err(SttError::Transport(
+                        "assemblyai audio command channel is full; writer task is not \
+                         keeping up with the socket"
+                            .to_string(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -203,10 +237,18 @@ impl SttSession for AssemblyAISession {
             let frame = std::mem::take(&mut self.pending);
             self.commands
                 .send(WsCommand::Audio(frame))
+                .await
                 .map_err(|_| SttError::SessionClosed)?;
         }
+        // Plain (awaiting) `send`, not `try_send`, is fine here even though the
+        // channel is now bounded: `finalize` runs at most once per session, after the
+        // caller has stopped producing audio, so there's no unbounded producer that
+        // could pile up behind this call — at worst it awaits briefly for
+        // `writer_task` to drain whatever a prior burst left queued, which is exactly
+        // the backpressure `CMD_CHANNEL_CAPACITY` exists to apply.
         self.commands
             .send(WsCommand::Close)
+            .await
             .map_err(|_| SttError::SessionClosed)?;
         match self.drained.take() {
             Some(rx) => rx.await.map_err(|_| SttError::SessionClosed)?,
@@ -217,7 +259,7 @@ impl SttSession for AssemblyAISession {
 
 async fn writer_task(
     mut write: SplitSink<WsStream, Message>,
-    mut commands: mpsc::UnboundedReceiver<WsCommand>,
+    mut commands: mpsc::Receiver<WsCommand>,
 ) {
     while let Some(cmd) = commands.recv().await {
         let result = match cmd {
@@ -583,5 +625,72 @@ mod tests {
     fn unknown_message_type_does_not_error() {
         let msg: AssemblyAIMessage = serde_json::from_str(r#"{"type":"SpeakerRevision"}"#).unwrap();
         assert!(matches!(msg, AssemblyAIMessage::Unknown));
+    }
+
+    fn silent_chunk(target_bytes: usize) -> Vec<f32> {
+        // `target_bytes` bytes of PCM16 is `target_bytes / BYTES_PER_SAMPLE` samples;
+        // the actual sample value doesn't matter for these channel-backpressure tests.
+        vec![0.0_f32; target_bytes / BYTES_PER_SAMPLE]
+    }
+
+    #[tokio::test]
+    async fn send_audio_backs_off_and_restores_pending_when_channel_is_full() {
+        let target = chunk_bytes(TARGET_CHUNK_MS);
+        // Capacity 1, and nothing draining the receiver: the first flushed frame fills
+        // the channel, so the second flush must observe `TrySendError::Full`.
+        let (commands, mut cmd_rx) = mpsc::channel(1);
+        let mut session = AssemblyAISession {
+            commands,
+            drained: None,
+            pending: Vec::new(),
+        };
+
+        // Two full target-sized frames' worth of samples in one call, so `send_audio`
+        // loops twice: the first `try_send` succeeds (fills the capacity-1 channel),
+        // the second must fail with `Full`.
+        let samples = silent_chunk(target * 2);
+        let err = session
+            .send_audio(AudioChunk {
+                pcm: &samples,
+                start_sample: 0,
+            })
+            .await
+            .expect_err("second flush should fail once the channel is full");
+
+        assert!(matches!(err, SttError::Transport(_)));
+        assert!(err.is_retryable(), "channel-full should be retryable");
+
+        // The frame that failed to send must be restored to `pending` (not dropped),
+        // so no audio is lost.
+        assert_eq!(session.pending.len(), target);
+
+        // The one frame that did make it through the channel is still there, unaffected.
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(WsCommand::Audio(frame)) if frame.len() == target
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_audio_reports_session_closed_when_receiver_dropped() {
+        let target = chunk_bytes(TARGET_CHUNK_MS);
+        let (commands, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAPACITY);
+        drop(cmd_rx);
+        let mut session = AssemblyAISession {
+            commands,
+            drained: None,
+            pending: Vec::new(),
+        };
+
+        let samples = silent_chunk(target);
+        let err = session
+            .send_audio(AudioChunk {
+                pcm: &samples,
+                start_sample: 0,
+            })
+            .await
+            .expect_err("send_audio should fail once the receiver is gone");
+
+        assert!(matches!(err, SttError::SessionClosed));
     }
 }
