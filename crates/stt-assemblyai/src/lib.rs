@@ -167,6 +167,14 @@ struct AssemblyAISession {
     pending: Vec<u8>,
 }
 
+// `SttSession::keep_alive` is intentionally left at its default no-op here.
+// AssemblyAI v3's `inactivity_timeout` is opt-in (a query parameter this adapter
+// never sends) and defaults to disabled, so a session is not auto-disconnected
+// merely for going quiet — unlike providers that idle-timeout by default, there is
+// nothing for a keep-alive to prevent. Note this doesn't make sessions unbounded:
+// AssemblyAI still force-ends any session at the 3-hour mark regardless of activity,
+// and usage past that limit is still billed, but that's a hard cap `keep_alive`
+// cannot and should not try to work around.
 #[async_trait]
 impl SttSession for AssemblyAISession {
     async fn send_audio(&mut self, chunk: AudioChunk<'_>) -> Result<(), SttError> {

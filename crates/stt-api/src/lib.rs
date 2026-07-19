@@ -42,6 +42,35 @@ pub trait SttSession: Send {
     /// `CloseStream` -> `Metadata` drain) — no provider has been found where simply
     /// dropping the connection is sufficient.
     async fn finalize(self: Box<Self>) -> Result<(), SttError>;
+
+    /// Keeps the session alive during a stretch where the caller isn't sending real
+    /// audio (e.g. it's skipping silence rather than paying to stream/transcribe it).
+    /// Some streaming STT providers drop the connection on an idle timeout if no audio
+    /// arrives for a while; `app-service` is expected to call this periodically during
+    /// such gaps to prevent that.
+    ///
+    /// The default implementation is a no-op ([`KeepAliveEffect::Noop`]) — providers
+    /// that need this (Deepgram, Google, OpenAI) override it individually. This method
+    /// only adds the hook; provider-specific overrides are implemented separately.
+    async fn keep_alive(&mut self) -> Result<KeepAliveEffect, SttError> {
+        Ok(KeepAliveEffect::Noop)
+    }
+}
+
+/// What, if anything, [`SttSession::keep_alive`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepAliveEffect {
+    /// The provider needs no keep-alive traffic; nothing was sent.
+    Noop,
+    /// A protocol-level control/keep-alive message was sent (e.g. a WebSocket ping or
+    /// a provider-defined keep-alive frame). It carries no audio, so it does not
+    /// advance the provider's audio timeline.
+    ControlMessage,
+    /// Artificial audio (e.g. silence) was sent to the provider to keep the stream
+    /// open. Unlike `ControlMessage`, this *does* advance the provider's audio
+    /// timeline by `samples` samples, which callers correlating timestamps back to
+    /// the real recording need to account for.
+    InjectedAudio { samples: u64 },
 }
 
 /// A chunk of audio plus its absolute position within the session, so result events
