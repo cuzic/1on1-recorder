@@ -14,17 +14,10 @@ mod pipeline;
 mod resample;
 mod segmenter;
 mod session_lifecycle;
+mod silence_gate;
 mod stt_provider_kind;
 mod timeline_adapter;
 mod upload_worker;
-
-// `pub` (rather than a private `mod` re-exported piecemeal like the others above):
-// nothing in this crate wires `TimestampMapper` into `live_transcription` yet (a
-// separate task), so keeping it a private `mod` would make every item in it dead
-// code under `-D warnings`. Making the module `pub` marks it as public API instead,
-// which is also how callers will reach it once wiring lands:
-// `app_service::timestamp_mapper::TimestampMapper`.
-pub mod timestamp_mapper;
 
 pub mod pseudo_source;
 
@@ -69,6 +62,9 @@ pub use normalize::normalize_to_mono;
 pub use pipeline::run_pipeline;
 pub use segmenter::{segment_pcm, PendingSegment};
 pub use session_lifecycle::{begin_session, end_session, recover_incomplete_sessions};
+// Not yet wired into `live_transcription` (a separate task) — exported so it can be
+// used and tested independently in the meantime.
+pub use silence_gate::{GateAction, GateConfig, SilenceGate};
 // Unconditional (no `windows-supervisor`/`live-transcription` gate, unlike
 // `live_transcription`'s own re-export below): `apps/desktop`'s settings screen
 // (task #49) needs to save/load the user's selected STT provider on every
