@@ -38,7 +38,9 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use stt_api::{AudioChunk, SttError, SttEvent, SttProvider, SttSession, SttSessionConfig};
+use stt_api::{
+    AudioChunk, KeepAliveEffect, SttError, SttEvent, SttProvider, SttSession, SttSessionConfig,
+};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -66,6 +68,14 @@ const DEFAULT_MODEL: &str = "gpt-realtime-whisper";
 /// sample rate, single channel — not configurable per-session like Deepgram's
 /// `sample_rate` query param.
 const REQUIRED_SAMPLE_RATE_HZ: u32 = 24_000;
+/// Duration of the silent PCM buffer [`OpenAiSession::keep_alive`] injects per call.
+/// OpenAI's realtime idle-timeout behavior isn't documented precisely enough to rely
+/// on a no-cost keep-alive frame existing, so — same policy as `stt-google` — this
+/// sends a short burst of real (silent) audio often enough to keep the connection
+/// from going idle, rather than risking the session getting dropped.
+const KEEP_ALIVE_SILENCE_MS: u32 = 100;
+/// [`KEEP_ALIVE_SILENCE_MS`] of silence at [`REQUIRED_SAMPLE_RATE_HZ`], in samples.
+const KEEP_ALIVE_SILENCE_SAMPLES: u32 = REQUIRED_SAMPLE_RATE_HZ / 1000 * KEEP_ALIVE_SILENCE_MS;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -151,6 +161,7 @@ impl SttProvider for OpenAiProvider {
     }
 }
 
+#[derive(Debug)]
 enum WsCommand {
     Json(Value),
     Audio(Vec<u8>),
@@ -188,6 +199,22 @@ impl SttSession for OpenAiSession {
             Some(rx) => rx.await.map_err(|_| SttError::SessionClosed)?,
             None => Ok(()),
         }
+    }
+
+    /// OpenAI's realtime idle-timeout behavior isn't documented precisely enough to
+    /// trust an unpublished no-cost keep-alive frame, so — matching `stt-google`'s
+    /// policy — this sends a short burst of genuinely silent PCM16 audio through the
+    /// same `input_audio_buffer.append` path `send_audio` uses, rather than a
+    /// protocol-level ping. This does advance OpenAI's audio timeline, hence
+    /// `InjectedAudio` (not `ControlMessage`).
+    async fn keep_alive(&mut self) -> Result<KeepAliveEffect, SttError> {
+        let silence = vec![0u8; KEEP_ALIVE_SILENCE_SAMPLES as usize * 2];
+        self.commands
+            .send(WsCommand::Audio(silence))
+            .map_err(|_| SttError::SessionClosed)?;
+        Ok(KeepAliveEffect::InjectedAudio {
+            samples: KEEP_ALIVE_SILENCE_SAMPLES as u64,
+        })
     }
 }
 
@@ -582,6 +609,36 @@ mod tests {
             stopped,
             OpenAiServerEvent::InputAudioBufferSpeechStopped
         ));
+    }
+
+    #[test]
+    fn keep_alive_sends_100ms_of_silence_and_reports_samples_sent() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut session = OpenAiSession {
+            commands: cmd_tx,
+            drained: None,
+        };
+
+        let effect = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(session.keep_alive())
+            .unwrap();
+
+        assert_eq!(
+            effect,
+            KeepAliveEffect::InjectedAudio {
+                samples: KEEP_ALIVE_SILENCE_SAMPLES as u64,
+            }
+        );
+
+        match cmd_rx.try_recv() {
+            Ok(WsCommand::Audio(bytes)) => {
+                // PCM16LE, all-zero bytes: 2 bytes/sample, every byte silent.
+                assert_eq!(bytes.len(), KEEP_ALIVE_SILENCE_SAMPLES as usize * 2);
+                assert!(bytes.iter().all(|&b| b == 0));
+            }
+            other => panic!("expected WsCommand::Audio, got {other:?}"),
+        }
     }
 
     #[test]
