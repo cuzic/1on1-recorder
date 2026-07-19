@@ -56,6 +56,14 @@ pub struct AppSettings {
     /// Root directory session exports are written under, overriding whatever
     /// default the export feature would otherwise pick.
     pub exports_root: Option<PathBuf>,
+    /// Enables `app-service`'s silence gate (see `silence_gate::SilenceGate`)
+    /// for the Remote track only during live transcription — silent stretches
+    /// of remote audio are skipped rather than streamed to the STT provider,
+    /// cutting STT usage/cost. `None` (the default, same as `Some(false)`)
+    /// keeps the pre-existing behavior of streaming all remote audio
+    /// unconditionally; no settings-UI toggle exists yet for this field, so it
+    /// currently only takes effect via manual `settings.json` edits.
+    pub silence_gate_enabled: Option<bool>,
 }
 
 impl AppSettings {
@@ -124,6 +132,7 @@ mod tests {
             summary_template: Some("要約テンプレート\n複数行もOK".to_string()),
             whisper_model_path: Some(PathBuf::from("/models/ggml-large-v3.bin")),
             exports_root: Some(PathBuf::from("/exports")),
+            silence_gate_enabled: Some(true),
         };
 
         settings.save(dir.path()).expect("save");
@@ -156,6 +165,7 @@ mod tests {
         assert_eq!(loaded.summary_template, None);
         assert_eq!(loaded.whisper_model_path, None);
         assert_eq!(loaded.exports_root, None);
+        assert_eq!(loaded.silence_gate_enabled, None);
     }
 
     #[test]

@@ -55,6 +55,10 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
     // Deepgram key from it, if any was ever saved there. No key configured just
     // means no live transcription (see that module's doc comment), not a failure.
     let credential_store_for_task: Arc<dyn credential_store::CredentialStore + Send + Sync> = state.credential_store.clone();
+    // See `app_settings::AppSettings::silence_gate_enabled`'s doc comment —
+    // `None` (no settings-UI toggle yet, or never saved) means "off", matching
+    // the pre-existing always-send-everything behavior.
+    let silence_gate_enabled_for_task = state.app_settings.lock().unwrap().silence_gate_enabled.unwrap_or(false);
 
     // WASAPI's callback timeout — how long the capture loop waits for a device
     // callback before treating it as a stall (`capture_windows::capture_loop`).
@@ -73,6 +77,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
             Some(level_for_task),
             Some(credential_store_for_task),
             Some(transcription_status_for_task),
+            silence_gate_enabled_for_task,
         )
         .await
     });

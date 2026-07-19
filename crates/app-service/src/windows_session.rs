@@ -45,6 +45,12 @@ use crate::windows_supervisor::WindowsSupervisor;
 /// `transcription_status_sink`, if given, is `live_transcription`'s #52 side
 /// channel — kept up to date with each track's Deepgram connection state so the
 /// desktop UI can tell "STT not connected" apart from "nobody has spoken yet".
+///
+/// `silence_gate_enabled` is passed straight through to `run_live_transcription`
+/// (see that function's parameter doc comment) — this function doesn't interpret
+/// it itself, it just plumbs the caller's (`apps/desktop`'s) resolved
+/// `AppSettings::silence_gate_enabled` value down to where the gate actually
+/// lives.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_windows_capture_session(
     manifest: &SessionManifest,
@@ -57,6 +63,7 @@ pub async fn run_windows_capture_session(
     level_sink: Option<Arc<Mutex<LevelSnapshot>>>,
     credential_store: Option<Arc<dyn credential_store::CredentialStore + Send + Sync>>,
     transcription_status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
+    silence_gate_enabled: bool,
 ) -> Result<SessionSummary, AppServiceError> {
     // Same shape as `level_sink`'s side channel (see `windows_frame_collector`'s doc
     // comment), but for raw PCM instead of RMS/peak. `stt_tx` is moved into
@@ -65,11 +72,15 @@ pub async fn run_windows_capture_session(
     // `audio_rx.recv()` loop end (and finalize both STT sessions) at the right time
     // without a separate shutdown signal.
     let (stt_tx, stt_rx) = tokio::sync::mpsc::unbounded_channel();
-    // TODO(silence-gate wiring task): hardcoded `false` until a real settings value
-    // is threaded through from `apps/desktop` — see `live_transcription`'s
-    // `silence_gate_enabled` parameter doc comment.
-    let live_transcription_fut =
-        run_live_transcription(manifest.session_id, manifest.audio.sample_rate, credential_store, stt_rx, store, transcription_status_sink, false);
+    let live_transcription_fut = run_live_transcription(
+        manifest.session_id,
+        manifest.audio.sample_rate,
+        credential_store,
+        stt_rx,
+        store,
+        transcription_status_sink,
+        silence_gate_enabled,
+    );
 
     let capture_fut = tokio::task::spawn_blocking(move || run_capture_blocking(callback_timeout_ms, shutdown_rx, level_sink, stt_tx));
 
