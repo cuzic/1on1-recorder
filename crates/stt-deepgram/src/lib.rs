@@ -10,6 +10,8 @@
 //! `{"type":"Metadata", ...}` before closing — that Metadata message is this crate's
 //! signal that `finalize()` can return.
 
+mod batch;
+
 use async_trait::async_trait;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -19,11 +21,14 @@ use stt_api::{
     Word,
 };
 use tokio::net::TcpStream;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+pub use batch::DeepgramBatchProvider;
 
 /// `credential-store` service/account this crate's API key is expected under
 /// (design.md §12.4), matching `summarize::CREDENTIAL_SERVICE`/`*_ACCOUNT`'s pattern
@@ -37,6 +42,12 @@ const DEFAULT_MODEL: &str = "nova-3";
 /// Deepgram's own guidance: `utterance_end_ms` must be 1000ms or higher, since interim
 /// results arrive roughly every second.
 const UTTERANCE_END_MS: &str = "1000";
+/// Bound on `WsCommand`s (audio chunks + keep-alives + the final close) queued for
+/// `writer_task`. Capture callbacks hand off roughly one chunk per ~10ms of audio
+/// (see WASAPI's typical shared-mode device period), so this buffers on the order of
+/// a few seconds before `try_send` starts rejecting — enough slack for a brief TCP
+/// stall without letting a stuck write silently grow the queue without bound.
+const COMMAND_QUEUE_CAPACITY: usize = 300;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -82,7 +93,7 @@ impl SttProvider for DeepgramProvider {
         let (write, read) = ws_stream.split();
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let (drained_tx, drained_rx) = oneshot::channel();
 
         tokio::spawn(writer_task(write, cmd_rx));
@@ -111,27 +122,28 @@ enum WsCommand {
 /// stays trivially `Send` regardless of whether the underlying TLS stream is —
 /// the actual socket lives in `writer_task`/`reader_task` instead.
 struct DeepgramSession {
-    commands: mpsc::UnboundedSender<WsCommand>,
+    commands: mpsc::Sender<WsCommand>,
     drained: Option<oneshot::Receiver<Result<(), SttError>>>,
 }
 
 #[async_trait]
 impl SttSession for DeepgramSession {
     async fn send_audio(&mut self, chunk: AudioChunk<'_>) -> Result<(), SttError> {
-        let mut bytes = Vec::with_capacity(chunk.pcm.len() * 2);
-        for &sample in chunk.pcm {
-            let clamped = sample.clamp(-1.0, 1.0);
-            let pcm16 = (clamped * i16::MAX as f32).round() as i16;
-            bytes.extend_from_slice(&pcm16.to_le_bytes());
-        }
+        let bytes = pcm_f32_to_linear16_le(chunk.pcm);
         self.commands
-            .send(WsCommand::Audio(bytes))
-            .map_err(|_| SttError::SessionClosed)
+            .try_send(WsCommand::Audio(bytes))
+            .map_err(|err| match err {
+                TrySendError::Full(_) => SttError::Transport(
+                    "audio send queue is full; writer_task isn't keeping up".to_string(),
+                ),
+                TrySendError::Closed(_) => SttError::SessionClosed,
+            })
     }
 
     async fn finalize(mut self: Box<Self>) -> Result<(), SttError> {
         self.commands
             .send(WsCommand::Close)
+            .await
             .map_err(|_| SttError::SessionClosed)?;
         match self.drained.take() {
             Some(rx) => rx.await.map_err(|_| SttError::SessionClosed)?,
@@ -144,15 +156,20 @@ impl SttSession for DeepgramSession {
     /// Carries no audio, so it's `ControlMessage`, not `InjectedAudio`.
     async fn keep_alive(&mut self) -> Result<KeepAliveEffect, SttError> {
         self.commands
-            .send(WsCommand::KeepAlive)
-            .map_err(|_| SttError::SessionClosed)?;
+            .try_send(WsCommand::KeepAlive)
+            .map_err(|err| match err {
+                TrySendError::Full(_) => SttError::Transport(
+                    "audio send queue is full; writer_task isn't keeping up".to_string(),
+                ),
+                TrySendError::Closed(_) => SttError::SessionClosed,
+            })?;
         Ok(KeepAliveEffect::ControlMessage)
     }
 }
 
 async fn writer_task(
     mut write: SplitSink<WsStream, Message>,
-    mut commands: mpsc::UnboundedReceiver<WsCommand>,
+    mut commands: mpsc::Receiver<WsCommand>,
 ) {
     while let Some(cmd) = commands.recv().await {
         let result = match cmd {
@@ -237,35 +254,58 @@ async fn reader_task(
     }
 }
 
-fn build_url(model: &str, config: &SttSessionConfig) -> String {
+/// Query parameters shared by both the streaming (`build_url`) and batch
+/// (`batch::build_batch_url`) `/v1/listen` requests: model/language/punctuate are
+/// always sent, `diarize`/`keywords` only when the caller opted in. Streaming-only
+/// concerns (encoding/sample_rate/channels/interim_results/vad_events) are each
+/// caller's own responsibility since batch's audio isn't a live `AudioChunk` stream
+/// and doesn't carry a `SttSessionConfig::sample_rate_hz`.
+fn common_query_params(model: &str, config: &SttSessionConfig) -> Vec<(&'static str, String)> {
     let language = config.language.clone().unwrap_or_else(|| "ja".to_string());
-
-    let mut params: Vec<(&str, String)> = vec![
-        ("model", model.to_string()),
-        ("language", language),
-        ("encoding", "linear16".to_string()),
-        ("sample_rate", config.sample_rate_hz.to_string()),
-        ("channels", "1".to_string()),
-        ("interim_results", config.interim_results.to_string()),
-        ("punctuate", "true".to_string()),
-        ("vad_events", config.vad_events.to_string()),
-    ];
+    let mut params: Vec<(&'static str, String)> =
+        vec![("model", model.to_string()), ("language", language), ("punctuate", "true".to_string())];
     if config.diarization {
         params.push(("diarize", "true".to_string()));
-    }
-    if config.vad_events {
-        params.push(("utterance_end_ms", UTTERANCE_END_MS.to_string()));
     }
     if let Some(boost) = &config.extra.vocabulary_boost {
         for word in boost {
             params.push(("keywords", word.clone()));
         }
     }
+    params
+}
 
-    let query = url::form_urlencoded::Serializer::new(String::new())
+fn encode_query(params: &[(&str, String)]) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(params.iter().map(|(k, v)| (*k, v.as_str())))
-        .finish();
-    format!("{LISTEN_URL}?{query}")
+        .finish()
+}
+
+fn build_url(model: &str, config: &SttSessionConfig) -> String {
+    let mut params = common_query_params(model, config);
+    params.push(("encoding", "linear16".to_string()));
+    params.push(("sample_rate", config.sample_rate_hz.to_string()));
+    params.push(("channels", "1".to_string()));
+    params.push(("interim_results", config.interim_results.to_string()));
+    params.push(("vad_events", config.vad_events.to_string()));
+    if config.vad_events {
+        params.push(("utterance_end_ms", UTTERANCE_END_MS.to_string()));
+    }
+
+    format!("{LISTEN_URL}?{}", encode_query(&params))
+}
+
+/// Converts f32 PCM samples (expected in `[-1.0, 1.0]`) to little-endian PCM16 bytes —
+/// the wire format Deepgram expects for both the streaming (`Message::Binary` frames)
+/// and batch (request body) APIs.
+fn pcm_f32_to_linear16_le(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for &sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let pcm16 = (clamped * i16::MAX as f32).round() as i16;
+        bytes.extend_from_slice(&pcm16.to_le_bytes());
+    }
+    bytes
 }
 
 fn build_request(
@@ -516,7 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn keep_alive_sends_keep_alive_command_and_reports_control_message() {
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let mut session = DeepgramSession {
             commands: cmd_tx,
             drained: None,
@@ -527,5 +567,55 @@ mod tests {
 
         let sent = cmd_rx.try_recv().expect("expected a queued command");
         assert!(matches!(sent, WsCommand::KeepAlive));
+    }
+
+    #[tokio::test]
+    async fn send_audio_returns_retryable_transport_error_when_queue_is_full() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut session = DeepgramSession {
+            commands: cmd_tx,
+            drained: None,
+        };
+        // Fill the one queue slot without draining it, so the next send finds no room.
+        session
+            .send_audio(AudioChunk {
+                pcm: &[0.0],
+                start_sample: 0,
+            })
+            .await
+            .unwrap();
+
+        let err = session
+            .send_audio(AudioChunk {
+                pcm: &[0.0],
+                start_sample: 1,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SttError::Transport(_)));
+        assert!(err.is_retryable());
+
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
+    async fn send_audio_returns_session_closed_when_receiver_dropped() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        drop(cmd_rx);
+        let mut session = DeepgramSession {
+            commands: cmd_tx,
+            drained: None,
+        };
+
+        let err = session
+            .send_audio(AudioChunk {
+                pcm: &[0.0],
+                start_sample: 0,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SttError::SessionClosed));
     }
 }

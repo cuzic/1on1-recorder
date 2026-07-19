@@ -83,6 +83,77 @@ pub struct AudioChunk<'a> {
     pub start_sample: u64,
 }
 
+/// A provider that accepts one complete recording and returns one final transcript,
+/// as opposed to [`SttProvider`]'s incremental streaming session. Intended for
+/// re-transcribing audio that was already captured (e.g. a gap left by a dropped
+/// streaming connection), not for live capture.
+///
+/// Deliberately independent of [`SttProvider`]/[`SttSession`] rather than derived from
+/// them (e.g. "feed a whole file through a streaming session") — providers commonly
+/// expose batch transcription as a wholly separate REST endpoint with its own request
+/// shape (see `stt-deepgram`'s pre-recorded API), so modeling it as a distinct trait
+/// keeps that mapping direct instead of faking a fixed-size stream.
+#[async_trait]
+pub trait BatchSttProvider: Send + Sync {
+    async fn transcribe_batch(
+        &self,
+        audio: BatchAudioInput<'_>,
+        config: SttSessionConfig,
+    ) -> Result<BatchTranscript, SttError>;
+}
+
+/// One complete recording's raw PCM audio for [`BatchSttProvider::transcribe_batch`].
+///
+/// Carries its own `sample_rate_hz`/`channels` rather than relying on
+/// `SttSessionConfig::sample_rate_hz` (which describes a *streaming* connection's
+/// negotiated rate and has no meaning here) — a batch call has no prior session to
+/// inherit a rate from, so the audio must self-describe it.
+pub struct BatchAudioInput<'a> {
+    /// PCM samples, interleaved across `channels` if `channels > 1` (i.e. the same
+    /// layout `cpal`/WASAPI produce), covering the entire recording to transcribe.
+    pub pcm: &'a [f32],
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+}
+
+/// The result of a whole-recording batch transcription. Deliberately close in shape to
+/// [`SttEvent::FinalTranscript`] — same `text`/`words`/`extra` fields — but for the
+/// entire recording rather than one streaming segment, so there is no
+/// `audio_start_ms`/`audio_end_ms` (the caller already knows the recording's bounds).
+///
+/// `#[non_exhaustive]`: construct via [`BatchTranscript::new`] plus `with_*` builders,
+/// for the same reason as [`SttSessionConfig`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct BatchTranscript {
+    pub text: String,
+    /// Word-level timestamps/speaker labels, when the provider returns them.
+    /// `Word::speaker` is populated only if diarization was requested and the
+    /// provider supports it, matching `SttEvent::FinalTranscript`'s convention.
+    pub words: Option<Vec<Word>>,
+    pub extra: SttExtraResult,
+}
+
+impl BatchTranscript {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            words: None,
+            extra: SttExtraResult::default(),
+        }
+    }
+
+    pub fn with_words(mut self, words: Vec<Word>) -> Self {
+        self.words = Some(words);
+        self
+    }
+
+    pub fn with_extra(mut self, extra: SttExtraResult) -> Self {
+        self.extra = extra;
+        self
+    }
+}
+
 /// Per-session configuration. `#[non_exhaustive]` so new fields can be added without
 /// breaking callers; construct via [`SttSessionConfig::new`] plus `with_*` builders
 /// (a `#[non_exhaustive]` struct cannot be built with struct-literal syntax — including

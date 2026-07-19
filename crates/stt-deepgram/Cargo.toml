@@ -12,6 +12,7 @@ categories = ["multimedia::audio", "asynchronous"]
 [dependencies]
 async-trait = "0.1"
 futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 stt-api = { path = "../stt-api" }
@@ -22,4 +23,5 @@ tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
+axum = "0.7"
 tokio = { version = "1", features = ["full"] }
