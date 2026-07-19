@@ -96,6 +96,23 @@ jobs:
           cargo test -p capture-windows --target x86_64-pc-windows-msvc
           cargo test -p app-service --features live-transcription --target x86_64-pc-windows-msvc
 
+      - name: Test OS-independent crates (segment-store, session-store, stt-api, stt-deepgram)
+        # These are pure Rust, OS-independent crates with no Windows-specific
+        # dependencies — until now they were only ever compiled transitively as
+        # app-service's path dependencies (via the Check/Test steps above), never
+        # `cargo test`ed by any CI workflow (this repo has no general-purpose Linux
+        # CI job either). That silently meant their own `#[test]`s never ran
+        # anywhere, discovered when task #88-91 (gap-retranscription feature) added
+        # real coverage to them: segment-store's Opus encode/decode round-trip,
+        # stt-deepgram's batch-transcription mock-server tests, and session-store's
+        # transcription-gap tracking tests. Kept on windows-latest rather than a new
+        # Linux job, to avoid fragmenting CI into another runner/cache to maintain
+        # for four crates.
+        run: |
+          cargo check -p segment-store -p session-store -p stt-api -p stt-deepgram --target x86_64-pc-windows-msvc
+          cargo clippy -p segment-store -p session-store -p stt-api -p stt-deepgram --target x86_64-pc-windows-msvc --no-deps -- -D warnings
+          cargo test -p segment-store -p session-store -p stt-api -p stt-deepgram --target x86_64-pc-windows-msvc
+
   e2e-best-effort:
     runs-on: windows-latest
     needs: build
