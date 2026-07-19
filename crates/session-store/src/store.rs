@@ -28,6 +28,32 @@ pub struct TranscriptSegment {
     pub start_ms: Option<u64>,
     pub end_ms: Option<u64>,
     pub is_final: bool,
+    /// `true` for a row produced by `app-service`'s manual gap re-transcription
+    /// pass (task #91: `BatchSttProvider::transcribe_batch` over audio already
+    /// saved to `segments`), `false` for a row produced by
+    /// `live_transcription`'s streaming `SttEvent`s — the marking task #91's doc
+    /// comment asked for, so a UI (or `to_turns`) can tell the two apart, e.g. to
+    /// label a re-transcribed stretch differently from what was heard live. Not
+    /// `is_final`'s opposite or a replacement for it: a re-transcribed row is
+    /// always `is_final: true` too (batch transcription has no interim state).
+    pub is_retranscribed: bool,
+}
+
+/// One live-transcription outage on one track (task #90) — corresponds to a
+/// row in `transcription_gaps`. Distinct from a missing `TranscriptSegment`:
+/// the audio for `[start_ms, end_ms)` was still captured and saved to
+/// `segments` as normal, it just never reached the STT provider (a mid-session
+/// disconnect — see `app-service`'s `live_transcription` module), so a manual
+/// re-transcription pass (task #91) needs to know which stretches of audio to
+/// re-run rather than the whole recording. `end_ms` is `None` while the
+/// outage is still open (see `record_gap_start`/`record_gap_end`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptionGap {
+    pub id: i64,
+    pub session_id: SessionId,
+    pub track: TrackKind,
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
 }
 
 /// One generated summary of a session. Append-only like `transcript_segments` — a
@@ -469,8 +495,8 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO transcript_segments (
-                session_id, track, speaker, text, start_ms, end_ms, is_final, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                session_id, track, speaker, text, start_ms, end_ms, is_final, is_retranscribed, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 segment.session_id.to_string(),
                 segment.track.map(|t| t.as_manifest_str()),
@@ -479,6 +505,7 @@ impl SessionStore {
                 segment.start_ms,
                 segment.end_ms,
                 segment.is_final,
+                segment.is_retranscribed,
                 now,
             ],
         )?;
@@ -490,7 +517,7 @@ impl SessionStore {
         let session_id_str = session_id.to_string();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT track, speaker, text, start_ms, end_ms, is_final
+            "SELECT track, speaker, text, start_ms, end_ms, is_final, is_retranscribed
              FROM transcript_segments
              WHERE session_id = ?1
              ORDER BY id",
@@ -503,12 +530,13 @@ impl SessionStore {
                 row.get::<_, Option<u64>>(3)?,
                 row.get::<_, Option<u64>>(4)?,
                 row.get::<_, bool>(5)?,
+                row.get::<_, bool>(6)?,
             ))
         })?;
 
         let mut segments = Vec::new();
         for row in rows {
-            let (track_str, speaker, text, start_ms, end_ms, is_final) = row?;
+            let (track_str, speaker, text, start_ms, end_ms, is_final, is_retranscribed) = row?;
             segments.push(TranscriptSegment {
                 session_id,
                 track: track_str.map(|t| t.parse::<TrackKind>()).transpose()?,
@@ -517,9 +545,89 @@ impl SessionStore {
                 start_ms,
                 end_ms,
                 is_final,
+                is_retranscribed,
             });
         }
         Ok(segments)
+    }
+
+    /// Opens a new live-transcription gap on `track` (task #90), recorded the
+    /// moment `app-service`'s `live_transcription` reconnect flow detects a
+    /// disconnect — *before* it's known whether (or how long until) a
+    /// reconnect succeeds — and returns the new row's id, to be passed to
+    /// [`Self::record_gap_end`] once the outage is over. Writing the row
+    /// eagerly, rather than only once the outage's full extent is known,
+    /// means a long gap still shows up (with `end_ms = NULL`) even if the
+    /// process crashes mid-outage instead of only existing in memory.
+    pub fn record_gap_start(&self, session_id: SessionId, track: TrackKind, start_ms: u64) -> Result<i64, StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO transcription_gaps (session_id, track, start_ms, end_ms, created_at)
+             VALUES (?1, ?2, ?3, NULL, ?4)",
+            params![session_id.to_string(), track.as_manifest_str(), start_ms, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Closes a gap opened by [`Self::record_gap_start`] once its extent is
+    /// known — either a reconnect succeeded, or the recording ended with the
+    /// track still down (in which case `end_ms` is the recording's end time).
+    /// A still-open gap (`end_ms` still `NULL`) is expected to be rare in
+    /// practice — `live_transcription::run_live_transcription` always closes
+    /// every open gap by the time it returns, on every path (reconnect
+    /// success, non-retryable give-up, or `audio_rx` closing) — but nothing
+    /// here enforces that, so `gaps_for_session` may still surface one if a
+    /// future caller doesn't.
+    ///
+    /// `gap_id` is never accepted from outside this crate (only
+    /// `record_gap_start`'s return value flows into it), so unlike
+    /// `update_upload_state`/`update_capture_state` there is no
+    /// not-found error to report here: an id matching zero rows updates zero
+    /// rows and returns `Ok(())`, since that would already mean the caller
+    /// has a bug rather than something this API's caller needs to react to.
+    pub fn record_gap_end(&self, gap_id: i64, end_ms: u64) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE transcription_gaps SET end_ms = ?1 WHERE id = ?2", params![end_ms, gap_id])?;
+        Ok(())
+    }
+
+    /// Discards a gap opened by [`Self::record_gap_start`] without ever
+    /// recording an `end_ms` for it — used instead of `record_gap_end` when
+    /// the outage turned out shorter than
+    /// `live_transcription::MIN_RECORDED_GAP_MS` (see that constant's doc
+    /// comment): the row already exists (it was written eagerly, before the
+    /// outage's length was known), so once the length turns out too short to
+    /// be worth surfacing, this removes it rather than leaving a sub-second
+    /// row behind for `gaps_for_session` callers to filter out themselves.
+    pub fn discard_gap(&self, gap_id: i64) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM transcription_gaps WHERE id = ?1", params![gap_id])?;
+        Ok(())
+    }
+
+    /// Every recorded live-transcription gap for a session, oldest first —
+    /// task #91's manual re-transcription pass reads this to know which
+    /// `[start_ms, end_ms)` stretches (per track) to re-run rather than the
+    /// whole recording.
+    pub fn gaps_for_session(&self, session_id: SessionId) -> Result<Vec<TranscriptionGap>, StoreError> {
+        let session_id_str = session_id.to_string();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, track, start_ms, end_ms FROM transcription_gaps
+             WHERE session_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![session_id_str], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?, row.get::<_, Option<u64>>(3)?))
+        })?;
+
+        let mut gaps = Vec::new();
+        for row in rows {
+            let (id, track_str, start_ms, end_ms) = row?;
+            gaps.push(TranscriptionGap { id, session_id, track: track_str.parse::<TrackKind>()?, start_ms, end_ms });
+        }
+        Ok(gaps)
     }
 
     /// Records one summarization result.

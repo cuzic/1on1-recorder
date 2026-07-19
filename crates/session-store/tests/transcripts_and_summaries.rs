@@ -44,6 +44,7 @@ fn transcript_segments_round_trip_in_insertion_order() {
         start_ms: Some(0),
         end_ms: Some(500),
         is_final: false,
+        is_retranscribed: false,
     };
     let finalized = TranscriptSegment {
         session_id,
@@ -53,6 +54,7 @@ fn transcript_segments_round_trip_in_insertion_order() {
         start_ms: Some(0),
         end_ms: Some(900),
         is_final: true,
+        is_retranscribed: false,
     };
     // No diarization/track info at all, e.g. a provider without diarization support.
     let untracked = TranscriptSegment {
@@ -63,6 +65,7 @@ fn transcript_segments_round_trip_in_insertion_order() {
         start_ms: None,
         end_ms: None,
         is_final: true,
+        is_retranscribed: false,
     };
 
     store.insert_transcript_segment(&interim).unwrap();
@@ -71,6 +74,43 @@ fn transcript_segments_round_trip_in_insertion_order() {
 
     let segments = store.list_transcript_segments(session_id).unwrap();
     assert_eq!(segments, vec![interim, finalized, untracked]);
+}
+
+/// Task #91: a row from the manual gap re-transcription pass must round-trip
+/// `is_retranscribed: true` distinctly from ordinary live rows (`DEFAULT 0` in
+/// the schema covers the column's *default*, not this crate's own read path).
+#[test]
+fn transcript_segments_round_trip_the_is_retranscribed_marker() {
+    let store = SessionStore::open_in_memory().unwrap();
+    let session_id = SessionId::new();
+    store.create_session(&sample_manifest(session_id)).unwrap();
+
+    let live = TranscriptSegment {
+        session_id,
+        track: Some(TrackKind::SelfMic),
+        speaker: None,
+        text: "live utterance".to_string(),
+        start_ms: Some(0),
+        end_ms: Some(500),
+        is_final: true,
+        is_retranscribed: false,
+    };
+    let retranscribed = TranscriptSegment {
+        session_id,
+        track: Some(TrackKind::RemoteAudio),
+        speaker: Some(0),
+        text: "recovered utterance".to_string(),
+        start_ms: Some(500),
+        end_ms: Some(1_200),
+        is_final: true,
+        is_retranscribed: true,
+    };
+
+    store.insert_transcript_segment(&live).unwrap();
+    store.insert_transcript_segment(&retranscribed).unwrap();
+
+    let segments = store.list_transcript_segments(session_id).unwrap();
+    assert_eq!(segments, vec![live, retranscribed]);
 }
 
 #[test]
@@ -94,6 +134,7 @@ fn insert_transcript_segment_without_a_session_is_rejected_by_the_foreign_key() 
         start_ms: None,
         end_ms: None,
         is_final: true,
+        is_retranscribed: false,
     };
 
     let result = store.insert_transcript_segment(&segment);

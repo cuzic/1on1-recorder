@@ -88,7 +88,13 @@ CREATE TABLE IF NOT EXISTS events (
 -- One row per `stt-api` `SttEvent::PartialTranscript`/`FinalTranscript` (see
 -- `TranscriptSegment`). `track`/`speaker` are nullable: a provider without
 -- diarization support leaves `speaker` unset, and a transcript not scoped to a
--- single captured track leaves `track` unset.
+-- single captured track leaves `track` unset. `is_retranscribed` (task #91)
+-- marks a row produced by `app-service`'s manual gap re-transcription pass
+-- (`BatchSttProvider::transcribe_batch` over previously recorded `segments`, run
+-- after the fact) rather than `live_transcription`'s streaming `SttEvent`s —
+-- `DEFAULT 0` so every row inserted before this column existed, and every live
+-- row inserted after, reads as "not a re-transcription" without each caller
+-- having to say so explicitly.
 CREATE TABLE IF NOT EXISTS transcript_segments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -98,6 +104,7 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
     start_ms INTEGER,
     end_ms INTEGER,
     is_final INTEGER NOT NULL,
+    is_retranscribed INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
@@ -113,10 +120,33 @@ CREATE TABLE IF NOT EXISTS summaries (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
+-- One row per live-transcription outage on one track (task #90: `app-service`'s
+-- `live_transcription` reconnect flow, see `SessionStore::record_gap_start`/
+-- `record_gap_end`). The audio itself is never lost (`segments` keeps recording
+-- independently of the STT side channel), but nothing was sent to the STT
+-- provider for `[start_ms, end_ms)` on `track`, so a manual re-transcription
+-- pass (task #91) needs this to know which stretches to re-run rather than the
+-- whole recording. `end_ms` is nullable: a row is inserted the moment a
+-- disconnect is detected (so an outage survives a crash mid-outage instead of
+-- only existing in memory) and `end_ms` is filled in once the track recovers or
+-- the recording ends — see `record_gap_end`'s doc comment for why a
+-- still-open gap is expected to be rare in practice, not for why the column
+-- itself is nullable.
+CREATE TABLE IF NOT EXISTS transcription_gaps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    track TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_upload_status_state ON upload_status(state_tag);
 CREATE INDEX IF NOT EXISTS idx_transcript_segments_session ON transcript_segments(session_id);
 CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
+CREATE INDEX IF NOT EXISTS idx_transcription_gaps_session ON transcription_gaps(session_id);
 "#;
 
 pub fn open_with_pragmas(path: &std::path::Path) -> Result<Connection, StoreError> {
