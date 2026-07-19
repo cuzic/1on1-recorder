@@ -18,6 +18,14 @@ mod stt_provider_kind;
 mod timeline_adapter;
 mod upload_worker;
 
+// `pub` (rather than a private `mod` re-exported piecemeal like the others above):
+// nothing in this crate wires `TimestampMapper` into `live_transcription` yet (a
+// separate task), so keeping it a private `mod` would make every item in it dead
+// code under `-D warnings`. Making the module `pub` marks it as public API instead,
+// which is also how callers will reach it once wiring lands:
+// `app_service::timestamp_mapper::TimestampMapper`.
+pub mod timestamp_mapper;
+
 pub mod pseudo_source;
 
 #[cfg(feature = "windows-supervisor")]
