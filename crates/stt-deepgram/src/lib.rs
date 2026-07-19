@@ -14,7 +14,10 @@ use async_trait::async_trait;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use stt_api::{AudioChunk, SttError, SttEvent, SttProvider, SttSession, SttSessionConfig, Word};
+use stt_api::{
+    AudioChunk, KeepAliveEffect, SttError, SttEvent, SttProvider, SttSession, SttSessionConfig,
+    Word,
+};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -97,6 +100,10 @@ impl SttProvider for DeepgramProvider {
 
 enum WsCommand {
     Audio(Vec<u8>),
+    /// Deepgram's `{"type":"KeepAlive"}` control frame. It carries no audio, so
+    /// unlike `Audio` it never advances the provider's audio timeline, and
+    /// Deepgram does not bill for it (per Deepgram's docs).
+    KeepAlive,
     Close,
 }
 
@@ -131,6 +138,16 @@ impl SttSession for DeepgramSession {
             None => Ok(()),
         }
     }
+
+    /// Sends Deepgram's `{"type":"KeepAlive"}` control frame so the connection
+    /// survives stretches where silence is being skipped rather than streamed.
+    /// Carries no audio, so it's `ControlMessage`, not `InjectedAudio`.
+    async fn keep_alive(&mut self) -> Result<KeepAliveEffect, SttError> {
+        self.commands
+            .send(WsCommand::KeepAlive)
+            .map_err(|_| SttError::SessionClosed)?;
+        Ok(KeepAliveEffect::ControlMessage)
+    }
 }
 
 async fn writer_task(
@@ -140,6 +157,11 @@ async fn writer_task(
     while let Some(cmd) = commands.recv().await {
         let result = match cmd {
             WsCommand::Audio(bytes) => write.send(Message::Binary(bytes)).await,
+            WsCommand::KeepAlive => {
+                write
+                    .send(Message::Text(r#"{"type":"KeepAlive"}"#.to_string()))
+                    .await
+            }
             WsCommand::Close => {
                 write
                     .send(Message::Text(r#"{"type":"CloseStream"}"#.to_string()))
@@ -490,5 +512,20 @@ mod tests {
     fn unknown_message_type_does_not_error() {
         let msg: DeepgramMessage = serde_json::from_str(r#"{"type":"SomethingNew"}"#).unwrap();
         assert!(matches!(msg, DeepgramMessage::Unknown));
+    }
+
+    #[tokio::test]
+    async fn keep_alive_sends_keep_alive_command_and_reports_control_message() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut session = DeepgramSession {
+            commands: cmd_tx,
+            drained: None,
+        };
+
+        let effect = session.keep_alive().await.unwrap();
+        assert_eq!(effect, KeepAliveEffect::ControlMessage);
+
+        let sent = cmd_rx.try_recv().expect("expected a queued command");
+        assert!(matches!(sent, WsCommand::KeepAlive));
     }
 }
