@@ -7,11 +7,13 @@
 mod error;
 mod granule;
 mod hash;
+mod opus_decode;
 mod opus_ogg;
 mod recovery;
 mod segment_writer;
 
 pub use error::SegmentStoreError;
+pub use opus_decode::{decode_segment_to_pcm, decode_segments_to_pcm};
 pub use opus_ogg::{encode_segment_to_ogg_opus, FRAME_SAMPLES, SAMPLE_RATE_HZ};
 pub use recovery::{scan_and_recover, RecoveredKind};
 pub use segment_writer::{commit_segment, CrashPoint, SegmentRequest};

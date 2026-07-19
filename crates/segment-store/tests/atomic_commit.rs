@@ -10,7 +10,10 @@ use recorder_domain::{
     AudioManifest, CaptureManifest, ConsentManifest, RemoteSourceKind, SessionId, SessionManifest,
     TrackKind,
 };
-use segment_store::{commit_segment, encode_segment_to_ogg_opus, scan_and_recover, CrashPoint, RecoveredKind, SegmentRequest, SAMPLE_RATE_HZ};
+use segment_store::{
+    commit_segment, decode_segment_to_pcm, decode_segments_to_pcm, encode_segment_to_ogg_opus, scan_and_recover, CrashPoint,
+    RecoveredKind, SegmentRequest, FRAME_SAMPLES, SAMPLE_RATE_HZ,
+};
 use session_store::SessionStore;
 use std::path::Path;
 
@@ -320,4 +323,75 @@ fn produced_ogg_opus_file_is_recognized_as_valid_by_ffprobe() {
 fn which_ffprobe() -> Option<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var).map(|dir| dir.join("ffprobe")).find(|p| p.is_file())
+}
+
+fn rms(pcm: &[f32]) -> f32 {
+    (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt()
+}
+
+#[test]
+fn decoded_committed_segment_roundtrips_close_to_original_pcm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::open_in_memory().unwrap();
+    let session_id = SessionId::new();
+    open_session(&store, session_id);
+
+    let pcm = sine_pcm(1.0, 440.0);
+    let encoded = encode_segment_to_ogg_opus(&pcm, BITRATE_BPS).unwrap();
+    let committed = commit_segment(&encoded, tmp.path(), &request(session_id, TrackKind::SelfMic, 0), &store, CrashPoint::None)
+        .unwrap()
+        .expect("should commit fully");
+
+    let decoded = decode_segment_to_pcm(&committed.local_path).unwrap();
+
+    // The encoder zero-pads the final 20ms frame, so decoded audio is never shorter
+    // than the input and at most one frame longer.
+    assert!(decoded.len() >= pcm.len(), "decoded {} shorter than original {}", decoded.len(), pcm.len());
+    assert!(
+        decoded.len() - pcm.len() < FRAME_SAMPLES,
+        "decoded length {} grew by more than one frame over original {}",
+        decoded.len(),
+        pcm.len()
+    );
+
+    // Opus has algorithmic delay, so decoded samples are phase-shifted relative to
+    // the input and cannot be compared sample-by-sample. Compare RMS amplitude
+    // instead, which is insensitive to a small phase shift over many sine periods.
+    let original_rms = rms(&pcm);
+    let decoded_rms = rms(&decoded[..pcm.len()]);
+    let relative_error = (decoded_rms - original_rms).abs() / original_rms;
+    assert!(
+        relative_error < 0.1,
+        "decoded RMS {decoded_rms} too far from original RMS {original_rms} (relative error {relative_error})"
+    );
+}
+
+#[test]
+fn decode_segments_to_pcm_concatenates_multiple_files_in_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::open_in_memory().unwrap();
+    let session_id = SessionId::new();
+    open_session(&store, session_id);
+
+    let mut paths = Vec::new();
+    for (i, freq) in [220.0, 440.0, 880.0].into_iter().enumerate() {
+        let pcm = sine_pcm(0.3, freq);
+        let encoded = encode_segment_to_ogg_opus(&pcm, BITRATE_BPS).unwrap();
+        let committed = commit_segment(&encoded, tmp.path(), &request(session_id, TrackKind::SelfMic, i as u64), &store, CrashPoint::None)
+            .unwrap()
+            .expect("should commit fully");
+        paths.push(committed.local_path);
+    }
+
+    let concatenated = decode_segments_to_pcm(&paths).unwrap();
+
+    let mut expected = Vec::new();
+    for path in &paths {
+        expected.extend(decode_segment_to_pcm(path).unwrap());
+    }
+
+    // Each file is decoded with a fresh decoder in both code paths, so concatenation
+    // must match byte-for-byte, not just approximately.
+    assert_eq!(concatenated, expected);
+    assert!(!concatenated.is_empty());
 }
