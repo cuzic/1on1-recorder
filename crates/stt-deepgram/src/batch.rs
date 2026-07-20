@@ -8,11 +8,10 @@
 //!
 //! Response shape (`results.channels[0].alternatives[0].transcript`/`words[]`, with
 //! each word carrying `speaker` when diarization is requested) is based on Deepgram's
-//! public API reference for the pre-recorded endpoint. **An actual API key has not
-//! been used to verify this against a live response** — this has only been exercised
-//! against the local mock server in this module's tests, so treat the
-//! `DeepgramBatch*` deserialization structs as best-effort until confirmed against a
-//! real call.
+//! public API reference for the pre-recorded endpoint, and confirmed 2026-07-20
+//! against a real API key/response via `examples/batch_smoke_test.rs` — transcript
+//! text, per-word timestamps, and speaker labels all round-tripped correctly for a
+//! real Japanese speech sample (see that example's usage comment to reproduce).
 
 use async_trait::async_trait;
 use reqwest::StatusCode;
