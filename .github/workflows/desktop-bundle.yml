@@ -66,8 +66,15 @@ jobs:
         run: dx --version
 
       - name: Bundle (msi + nsis installer)
-        working-directory: apps/desktop
-        run: dx bundle --platform desktop --package-types msi --package-types nsis
+        # Run from the repo root, not apps/desktop: dx-cli's workspace resolution
+        # (packages/cli/src/workspace.rs, when `[workspace] default-members` is
+        # set in the root Cargo.toml, as it is here) canonicalizes each default
+        # member path relative to the *current directory*, not the workspace
+        # root — cd'ing into apps/desktop first made it look for
+        # apps/desktop/apps/desktop and panic ("No such file or directory").
+        # `--package desktop` selects this crate explicitly instead of relying
+        # on default-member auto-detection.
+        run: dx bundle --platform desktop --package desktop --package-types msi --package-types nsis
 
       - name: Verify bundle outputs
         shell: pwsh
@@ -117,8 +124,10 @@ jobs:
         run: dx --version
 
       - name: Bundle (.app + .dmg)
-        working-directory: apps/desktop
-        run: dx bundle --platform desktop --package-types macos --package-types dmg
+        # Run from the repo root — see the Windows job's identical step for why
+        # (dx-cli's default-members path resolution breaks when cd'd into the
+        # crate directory first).
+        run: dx bundle --platform desktop --package desktop --package-types macos --package-types dmg
 
       - name: Verify bundle outputs
         run: |
