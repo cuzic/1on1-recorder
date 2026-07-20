@@ -11,3 +11,14 @@ name = "1on1 Recorder"
 identifier = "io.github.cuzic.one-on-one-recorder"
 publisher = "Tomoya Kawanishi"
 icon = ["assets/icon.png"]
+
+[bundle.windows]
+
+# dx's own default (WebviewInstallMode::OfflineInstaller) embeds the full
+# ~170MB WebView2 Runtime offline redistributable into the NSIS installer, on
+# top of this app's own ~9MB — confirmed by inspecting a real build's NSIS .exe
+# with `7z l` (desktop.exe was 9.3MB; $TEMP/MicrosoftEdgeWebView2RuntimeInstaller_x64.exe
+# was 178.8MB). Windows 10 2004+ and Windows 11 already ship WebView2 as an OS
+# component, so DownloadBootstrapper (a small stub that only fetches the
+# runtime if it's actually missing) is the sensible default here instead.
+webview_install_mode = { DownloadBootstrapper = { silent = false } }
