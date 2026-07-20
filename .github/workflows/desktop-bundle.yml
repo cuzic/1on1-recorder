@@ -73,8 +73,11 @@ jobs:
         # root — cd'ing into apps/desktop first made it look for
         # apps/desktop/apps/desktop and panic ("No such file or directory").
         # `--package desktop` selects this crate explicitly instead of relying
-        # on default-member auto-detection.
-        run: dx bundle --platform desktop --package desktop --package-types msi --package-types nsis
+        # on default-member auto-detection. `--release`: `dx bundle` defaults to
+        # a *debug* build ("Build in release mode [default: false]" per its own
+        # `--help`) — without this flag the first real run produced a ~200MB
+        # unoptimized, symbol-laden installer.
+        run: dx bundle --platform desktop --package desktop --release --package-types msi --package-types nsis
 
       - name: Verify bundle outputs
         shell: pwsh
@@ -126,8 +129,9 @@ jobs:
       - name: Bundle (.app + .dmg)
         # Run from the repo root — see the Windows job's identical step for why
         # (dx-cli's default-members path resolution breaks when cd'd into the
-        # crate directory first).
-        run: dx bundle --platform desktop --package desktop --package-types macos --package-types dmg
+        # crate directory first). `--release`: see the Windows job's comment —
+        # `dx bundle` defaults to an unoptimized debug build otherwise.
+        run: dx bundle --platform desktop --package desktop --release --package-types macos --package-types dmg
 
       - name: Verify bundle outputs
         run: |
