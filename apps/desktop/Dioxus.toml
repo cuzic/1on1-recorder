@@ -1,0 +1,13 @@
+[application]
+
+# Display name used for the bundled app/installer (Cargo.toml's package name is
+# just "desktop", which would otherwise show up as "desktop.app"/"desktop.msi").
+name = "1on1 Recorder"
+
+[bundle]
+
+# Placeholder reverse-DNS identifier (no registered domain for this project yet) —
+# change this before any real distribution; macOS uses it as the app's bundle ID.
+identifier = "io.github.cuzic.one-on-one-recorder"
+publisher = "Tomoya Kawanishi"
+icon = ["assets/icon.png"]

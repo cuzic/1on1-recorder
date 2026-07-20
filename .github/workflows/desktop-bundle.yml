@@ -1,0 +1,137 @@
+name: Desktop App Bundle
+
+# Produces installable desktop app packages via `dx bundle` (Windows: .msi/.exe
+# installer, macOS: .app + .dmg), one job per native OS — `dx bundle` cannot
+# cross-compile a bundle for another OS (confirmed against Dioxus's own docs and
+# its own CI, DioxusLabs/dioxus .github/workflows/main.yml's bundle-*-smoke jobs,
+# which this workflow's steps are modeled on).
+#
+# Separate from windows-app-build.yml/macos-build.yml: those are fast compile/
+# lint/test gates that run on every push/PR; this is a slower packaging step, run
+# on demand — there is no tagged-release process yet (Phase 1A hasn't even had
+# its first real-hardware pass, see the project's task list task #9/#28), so this
+# only runs via workflow_dispatch for now, plus a `v*.*.*` tag trigger for when a
+# real release process exists later.
+#
+# Known limitation: the output is unsigned/unnotarized (Dioxus has no built-in
+# code-signing support — see its bundling docs, which point to Tauri's signing
+# guide for the underlying mechanics if that's ever wired up here). On first
+# launch, macOS Gatekeeper will refuse to open the unsigned .app (right-click >
+# Open, or `xattr -d com.apple.quarantine` the .app, to bypass once) and Windows
+# SmartScreen may warn on the unsigned installer ("More info" > "Run anyway").
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  # Pinned to match Cargo.lock's `dioxus` version — `dx` and the `dioxus` crate
+  # it drives must stay in lockstep (see Dioxus's own version-compatibility
+  # guidance); bump both together.
+  DX_VERSION: "0.7.9"
+
+jobs:
+  bundle-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # stt-google's build.rs (tonic-build/prost-build) needs protoc — same
+      # requirement as windows-app-build.yml.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install dx (dioxus-cli, prebuilt)
+        # A prebuilt binary from Dioxus's own GitHub release, not `cargo install`
+        # from source — the latter takes 10+ minutes on every run for no benefit
+        # here (dx itself isn't part of this workspace).
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/DioxusLabs/dioxus/releases/download/v$env:DX_VERSION/dx-x86_64-pc-windows-msvc.zip" -OutFile dx.zip
+          Expand-Archive -Path dx.zip -DestinationPath dx-bin
+          echo "$PWD\dx-bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: dx --version
+        run: dx --version
+
+      - name: Bundle (msi + nsis installer)
+        working-directory: apps/desktop
+        run: dx bundle --platform desktop --package-types msi --package-types nsis
+
+      - name: Verify bundle outputs
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -Path .\target\dx -Recurse -File -Include "*.msi"
+          $nsis = Get-ChildItem -Path .\target\dx -Recurse -File -Include "*-setup.exe"
+          $msi | ForEach-Object { $_.FullName }
+          $nsis | ForEach-Object { $_.FullName }
+          if (-not $msi) { throw "Expected MSI artifact was not produced." }
+          if (-not $nsis) { throw "Expected NSIS installer artifact was not produced." }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 1on1-recorder-windows
+          path: |
+            target/dx/**/*.msi
+            target/dx/**/*-setup.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  bundle-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install dx (dioxus-cli, prebuilt)
+        # macos-latest GitHub-hosted runners are Apple Silicon (aarch64).
+        run: |
+          curl -sL -o dx.tar.gz "https://github.com/DioxusLabs/dioxus/releases/download/v${DX_VERSION}/dx-aarch64-apple-darwin.tar.gz"
+          mkdir dx-bin
+          tar xzf dx.tar.gz -C dx-bin
+          echo "$PWD/dx-bin" >> "$GITHUB_PATH"
+
+      - name: dx --version
+        run: dx --version
+
+      - name: Bundle (.app + .dmg)
+        working-directory: apps/desktop
+        run: dx bundle --platform desktop --package-types macos --package-types dmg
+
+      - name: Verify bundle outputs
+        run: |
+          find target -type d -name '*.app' -print
+          find target -type f -name '*.dmg' -print
+          test -n "$(find target -type d -name '*.app' -print -quit)"
+          test -n "$(find target -type f -name '*.dmg' -print -quit)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 1on1-recorder-macos
+          path: |
+            target/**/*.app
+            target/**/*.dmg
+          if-no-files-found: error
+          retention-days: 30
