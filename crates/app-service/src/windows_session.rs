@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use capture_windows::device_watch::DeviceWatch;
+use local_broker::LocalBroker;
 use recorder_domain::{SessionManifest, SessionSummary, TrackKind, UploadAdapter};
 use session_store::SessionStore;
 use tokio::sync::mpsc::Sender;
@@ -64,6 +65,7 @@ pub async fn run_windows_capture_session(
     credential_store: Option<Arc<dyn credential_store::CredentialStore + Send + Sync>>,
     transcription_status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
     silence_gate_enabled: bool,
+    broker: Option<&LocalBroker>,
 ) -> Result<SessionSummary, AppServiceError> {
     // Same shape as `level_sink`'s side channel (see `windows_frame_collector`'s doc
     // comment), but for raw PCM instead of RMS/peak. `stt_tx` is moved into
@@ -94,6 +96,7 @@ pub async fn run_windows_capture_session(
         store,
         transcription_status_sink,
         silence_gate_enabled,
+        broker,
     );
 
     let capture_fut = tokio::task::spawn_blocking(move || run_capture_blocking(callback_timeout_ms, shutdown_rx, level_sink, stt_tx));

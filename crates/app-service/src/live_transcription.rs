@@ -89,6 +89,23 @@ fn set_both_status(sink: &Option<Arc<Mutex<TranscriptionStatus>>>, status: Track
     guard.remote_status = status;
 }
 
+/// Same label format as `apps/desktop/src/transcript.rs::speaker_label` and
+/// `rhai-engine`'s dispatcher-local copy — duplicated here rather than shared,
+/// since `app-service` can't depend on the desktop binary crate and pulling in
+/// `rhai-engine` just for this would be backwards (that crate depends on
+/// `recorder-domain`, not the other way around).
+fn speaker_label(track: Option<TrackKind>, speaker: Option<u32>) -> String {
+    let base = match track {
+        Some(TrackKind::SelfMic) => "自分",
+        Some(TrackKind::RemoteAudio) => "相手",
+        None => "不明",
+    };
+    match speaker {
+        Some(n) => format!("{base} (話者{})", n + 1),
+        None => base.to_string(),
+    }
+}
+
 /// Re-exported from `crate::stt_provider_kind` (task #49) so existing
 /// `live_transcription::{CREDENTIAL_SERVICE, SELECTED_STT_PROVIDER_ACCOUNT,
 /// SttProviderKind}` paths keep working — that module is the canonical home now,
@@ -102,12 +119,14 @@ mod stt_wiring {
     use crate::resample::resample;
     use crate::silence_gate::{GateAction, GateConfig, SilenceGate};
     use crate::timestamp_mapper::TimestampMapper;
+    use local_broker::LocalBroker;
     use session_store::TranscriptSegment;
     use stt_api::{AudioChunk, KeepAliveEffect, SttError, SttEvent, SttProvider, SttSession, SttSessionConfig};
     use stt_assemblyai::AssemblyAIProvider;
     use stt_deepgram::DeepgramProvider;
     use stt_google::{GoogleProvider, GoogleSttCredentials};
     use stt_openai::OpenAiProvider;
+    use transcript_event::{self, EventEnvelope, Finality, TranscriptEvent, UtteranceEndReason};
     // `Receiver<(TrackKind, Vec<f32>, u32)>` (the `audio_rx` side channel) comes
     // from `super::*` above; `UnboundedReceiver` is only needed in here, for each
     // provider's per-track `SttEvent` stream (`SttProvider::start_session`'s
@@ -676,6 +695,7 @@ mod stt_wiring {
     /// at once (a realistic scenario, e.g. a shared network blip) — the other
     /// track's own disconnect detection and reconnect were delayed by however
     /// long the first one's attempt took.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_live_transcription(
         session_id: SessionId,
         sample_rate_hz: u32,
@@ -684,6 +704,7 @@ mod stt_wiring {
         store: &SessionStore,
         status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
         silence_gate_enabled: bool,
+        broker: Option<&LocalBroker>,
     ) {
         // Task #90: the clock every `transcription_gaps` row's `start_ms`/
         // `end_ms` is measured against (see `ms_since_start`) — captured as
@@ -692,6 +713,12 @@ mod stt_wiring {
         // (see this function's own doc comment: it runs for the recording's
         // full lifetime, fed by the same side channel capture is fed from).
         let recording_started = Instant::now();
+
+        // Monotonic counters for generating stable segment_ids per track.
+        // Incremented on each `is_final: true` segment; interim updates reuse
+        // the same segment_id with an incremented revision.
+        let mut self_segment_counter: u64 = 0;
+        let mut remote_segment_counter: u64 = 0;
 
         let Some(credential_store) = credential_store else {
             tracing::debug!("live transcription: no credential store configured, skipping");
@@ -866,6 +893,20 @@ mod stt_wiring {
                                 }
                             };
                             tokio::join!(self_finalize, remote.finalize());
+                            // Publish UtteranceEnded(SessionEnd) so consumers
+                            // (e.g. Summary Consumer) can react to session end.
+                            if let Some(broker) = broker {
+                                let event = TranscriptEvent::UtteranceEnded {
+                                    session_id,
+                                    segment_id: None,
+                                    reason: UtteranceEndReason::SessionEnd,
+                                };
+                                let subject = transcript_event::subject_for(&event, session_id);
+                                let envelope = EventEnvelope::new(session_id, event);
+                                if let Err(err) = broker.publish(&subject, &envelope) {
+                                    tracing::warn!(%err, "live transcription: failed to publish UtteranceEnded(SessionEnd)");
+                                }
+                            }
                         }
                     }
                 }
@@ -963,7 +1004,7 @@ mod stt_wiring {
                                     note_self_disconnect(&mut self_session, &mut self_reconnect, &status_sink, Some(err), store, session_id, recording_started);
                                 }
                             }
-                            persist_event(store, session_id, Some(TrackKind::SelfMic), event, None);
+                            persist_event(store, broker, session_id, TrackKind::SelfMic, event, None, &mut self_segment_counter);
                         }
                         None => {
                             self_events = None;
@@ -991,7 +1032,7 @@ mod stt_wiring {
                                     remote.note_disconnect(Some(err));
                                 }
                             }
-                            persist_event(store, session_id, Some(TrackKind::RemoteAudio), event, remote.timestamp_mapper());
+                            persist_event(store, broker, session_id, TrackKind::RemoteAudio, event, remote.timestamp_mapper(), &mut remote_segment_counter);
                         }
                         None => {
                             remote_events = None;
@@ -1377,28 +1418,85 @@ mod stt_wiring {
     /// See `persist_pending_interim`'s doc comment for `timestamp_mapper`'s
     /// contract (`None` for Self / gate-disabled, applied independently to
     /// `start`/`end` otherwise).
-    fn persist_event(store: &SessionStore, session_id: SessionId, track: Option<TrackKind>, event: SttEvent, timestamp_mapper: Option<&TimestampMapper>) {
+    fn persist_event(
+        store: &SessionStore,
+        broker: Option<&LocalBroker>,
+        session_id: SessionId,
+        track: TrackKind,
+        event: SttEvent,
+        timestamp_mapper: Option<&TimestampMapper>,
+        segment_counter: &mut u64,
+    ) {
         match event {
             SttEvent::PartialTranscript { text, audio_start_ms, audio_end_ms, .. } => {
                 let start_ms = corrected_ms(audio_start_ms, timestamp_mapper);
                 let end_ms = corrected_ms(audio_end_ms, timestamp_mapper);
-                let segment = TranscriptSegment { session_id, track, speaker: None, text, start_ms, end_ms, is_final: false, is_retranscribed: false };
+                let segment = TranscriptSegment { session_id, track: Some(track), speaker: None, text: text.clone(), start_ms, end_ms, is_final: false, is_retranscribed: false };
                 if let Err(err) = store.insert_transcript_segment(&segment) {
                     tracing::warn!(%err, ?track, "live transcription: failed to persist partial transcript");
                 }
+                publish_transcript_event(broker, session_id, track, &segment, Finality::Interim, *segment_counter);
             }
             SttEvent::FinalTranscript { text, words, audio_start_ms, audio_end_ms, .. } => {
                 let speaker = words.as_ref().and_then(|words| words.first()).and_then(|word| word.speaker);
                 let start_ms = corrected_ms(audio_start_ms, timestamp_mapper);
                 let end_ms = corrected_ms(audio_end_ms, timestamp_mapper);
-                let segment = TranscriptSegment { session_id, track, speaker, text, start_ms, end_ms, is_final: true, is_retranscribed: false };
+                let segment = TranscriptSegment { session_id, track: Some(track), speaker, text: text.clone(), start_ms, end_ms, is_final: true, is_retranscribed: false };
                 if let Err(err) = store.insert_transcript_segment(&segment) {
                     tracing::warn!(%err, ?track, "live transcription: failed to persist final transcript");
                 }
+                publish_transcript_event(broker, session_id, track, &segment, Finality::Final, *segment_counter);
+                *segment_counter += 1;
             }
             SttEvent::SpeechStarted => tracing::debug!(?track, "live transcription: speech started"),
             SttEvent::SpeechEnded => tracing::debug!(?track, "live transcription: speech ended"),
             SttEvent::Error(err) => tracing::warn!(?track, %err, "live transcription: STT error"),
+        }
+    }
+
+    fn publish_transcript_event(
+        broker: Option<&LocalBroker>,
+        session_id: SessionId,
+        track: TrackKind,
+        segment: &TranscriptSegment,
+        finality: Finality,
+        counter: u64,
+    ) {
+        let broker = match broker {
+            Some(b) => b,
+            None => return,
+        };
+        let segment_id = transcript_event::segment_id_for(session_id, track, counter);
+        let speaker_label = super::speaker_label(segment.track, segment.speaker);
+        let data = transcript_event::SegmentData {
+            segment_id: segment_id.clone(),
+            revision: 0,
+            text: segment.text.clone(),
+            speaker_label,
+            track,
+            start_ms: segment.start_ms,
+            end_ms: segment.end_ms,
+        };
+        let updated = TranscriptEvent::SegmentUpdated {
+            session_id,
+            data: data.clone(),
+            finality,
+        };
+        let subject = transcript_event::subject_for(&updated, session_id);
+        let envelope = EventEnvelope::new(session_id, updated);
+        if let Err(err) = broker.publish(&subject, &envelope) {
+            tracing::warn!(%err, ?track, "live transcription: failed to publish SegmentUpdated");
+        }
+        if matches!(finality, Finality::Final) {
+            let finalized = TranscriptEvent::SegmentFinalized {
+                session_id,
+                data,
+            };
+            let subject = transcript_event::subject_for(&finalized, session_id);
+            let envelope = EventEnvelope::new(session_id, finalized);
+            if let Err(err) = broker.publish(&subject, &envelope) {
+                tracing::warn!(%err, ?track, "live transcription: failed to publish SegmentFinalized");
+            }
         }
     }
 
@@ -2011,7 +2109,7 @@ mod stt_wiring {
                 audio_end_ms: Some(700),
                 extra: Default::default(),
             };
-            persist_event(&store, manifest.session_id, Some(TrackKind::RemoteAudio), event, Some(&mapper));
+            persist_event(&store, None, manifest.session_id, TrackKind::RemoteAudio, event, Some(&mapper), &mut 0);
             let segments = store.list_transcript_segments(manifest.session_id).unwrap();
             assert_eq!(segments.len(), 1);
             assert_eq!(segments[0].start_ms, Some(1_100));
@@ -2154,6 +2252,7 @@ pub async fn run_live_transcription(
     _store: &SessionStore,
     status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
     _silence_gate_enabled: bool,
+    _broker: Option<&LocalBroker>,
 ) {
     set_both_status(&status_sink, TrackTranscriptionStatus::Unavailable);
     while audio_rx.recv().await.is_some() {}
