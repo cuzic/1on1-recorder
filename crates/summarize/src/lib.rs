@@ -13,13 +13,14 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::Arc;
 
 use credential_store::CredentialStore;
 use genai::adapter::AdapterKind;
 use genai::chat::{ChatMessage, ChatRequest};
 use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
-use genai::{Client, ModelIden, ServiceTarget};
+use genai::{Client, Headers, ModelIden, ServiceTarget};
 use serde::{Deserialize, Serialize};
 
 pub mod cli_backend;
@@ -448,6 +449,110 @@ pub fn build_ollama_client(base_url: Option<String>) -> Client {
     builder.build()
 }
 
+/// The official Anthropic CLI binary name, checked on `PATH` by
+/// [`ant_cli_is_available`] and invoked by [`build_claude_oauth_client`].
+const ANT_CLI_BINARY: &str = "ant";
+
+/// Anthropic's Messages API endpoint and version header — the same values
+/// `genai`'s own Anthropic adapter hardcodes internally (`adapter_shared.rs`), kept
+/// here as our own constants since [`build_claude_oauth_client`] bypasses that
+/// adapter code path entirely (see its doc comment).
+const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Required alongside a `Authorization: Bearer` OAuth token on every Anthropic API
+/// call — confirmed against the `ant` CLI's own reference (raw HTTP with an OAuth
+/// token needs this beta header; the plain `x-api-key` path does not).
+const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// Whether the `ant` CLI (Anthropic's own official CLI, not `claude`/`codex` — see
+/// `cli_backend`) is on `PATH` and runnable, checked via `ant --version`. Doesn't
+/// verify the user has actually run `ant auth login` — a login-required failure
+/// only surfaces once [`build_claude_oauth_client`]'s resolver actually runs.
+pub async fn ant_cli_is_available() -> bool {
+    tokio::process::Command::new(ANT_CLI_BINARY)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Shells out to `ant auth print-credentials --access-token` to get a short-lived
+/// OAuth access token for whichever profile the user last `ant auth login`'d with.
+/// `ant` itself handles minting/refreshing the token (see its own reference doc:
+/// the no-flag form of this command prints the full credentials JSON, not a bare
+/// token — `--access-token` is required), so this crate never stores or refreshes
+/// one directly.
+async fn resolve_ant_oauth_token() -> Result<String, genai::resolver::Error> {
+    let output = tokio::process::Command::new(ANT_CLI_BINARY)
+        .args(["auth", "print-credentials", "--access-token"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| genai::resolver::Error::Custom(format!("failed to launch {ANT_CLI_BINARY} CLI: {e}")))?;
+
+    if !output.status.success() {
+        return Err(genai::resolver::Error::Custom(format!(
+            "`{ANT_CLI_BINARY} auth print-credentials` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        return Err(genai::resolver::Error::Custom(format!(
+            "`{ANT_CLI_BINARY} auth print-credentials` returned no access token — run `{ANT_CLI_BINARY} auth login` first"
+        )));
+    }
+    Ok(token)
+}
+
+/// Builds a `genai` `Client` that authenticates Claude calls with a short-lived
+/// OAuth access token minted by the official Anthropic CLI (`ant auth login` /
+/// `ant auth print-credentials --access-token`) — an alternative to a
+/// `credential-store` API key ([`credential_store_auth_resolver`]) that bills
+/// against the user's own Claude subscription rather than pay-per-token API
+/// credits. Unlike [`cli_backend`]'s `claude`/`codex` CLI subprocess path, this
+/// still goes through `genai`'s normal `exec_chat`/`ChatRequest` call shape — `ant`
+/// is only used to mint the token, not to run the whole conversation.
+///
+/// `genai`'s Anthropic adapter has no Bearer-token option built in — it always
+/// sends `x-api-key` (confirmed by reading `adapter_shared.rs`). `AuthData::
+/// RequestOverride` bypasses that entirely: `Client::exec_chat` substitutes the
+/// override's `url`/`headers` for whatever the adapter would have built, so this
+/// resolver supplies the exact `Authorization: Bearer <token>` +
+/// `anthropic-beta: oauth-2025-04-20` shape the Messages API expects for OAuth
+/// tokens instead. The resolver is async (like [`build_vertex_client`]'s) because
+/// it shells out to `ant` on every call.
+///
+/// Uses `AdapterKind::Anthropic` via `with_adapter_kind` — same reasoning as
+/// [`build_ollama_client`]: pins the adapter explicitly rather than relying on
+/// `options.model`'s string prefix to keep sniffing to the right adapter.
+pub fn build_claude_oauth_client() -> Client {
+    let auth_resolver = AuthResolver::from_resolver_async_fn(move |_model_iden: ModelIden| {
+        Box::pin(async move {
+            let token = resolve_ant_oauth_token().await?;
+            Ok(Some(AuthData::RequestOverride {
+                url: ANTHROPIC_MESSAGES_URL.to_string(),
+                headers: Headers::from(vec![
+                    ("authorization".to_string(), format!("Bearer {token}")),
+                    ("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
+                    ("anthropic-beta".to_string(), ANTHROPIC_OAUTH_BETA.to_string()),
+                ]),
+            }))
+        }) as Pin<Box<dyn Future<Output = Result<Option<AuthData>, genai::resolver::Error>> + Send>>
+    });
+
+    Client::builder()
+        .with_adapter_kind(AdapterKind::Anthropic)
+        .with_auth_resolver(auth_resolver)
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,5 +667,20 @@ mod tests {
     #[test]
     fn build_ollama_client_constructs_with_base_url_override() {
         let _client = build_ollama_client(Some("http://localhost:12345".to_string()));
+    }
+
+    #[test]
+    fn build_claude_oauth_client_constructs_without_touching_network() {
+        // Only wires up the async resolver; nothing should call `ant` or the
+        // network until an actual `exec_chat` runs.
+        let _client = build_claude_oauth_client();
+    }
+
+    #[tokio::test]
+    async fn ant_cli_is_available_does_not_panic() {
+        // `ant` isn't guaranteed present in every environment this crate builds in
+        // (CI, other contributors' machines) — same rationale as
+        // `cli_backend`'s `is_available_is_false_for_a_nonexistent_binary_by_construction`.
+        let _ = ant_cli_is_available().await;
     }
 }
