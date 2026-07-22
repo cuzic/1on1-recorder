@@ -145,6 +145,13 @@ pub(crate) enum SummaryProvider {
     GeminiVertex,
     ClaudeBedrock,
     ClaudeCli,
+    /// Claude via the official Anthropic CLI's OAuth login (`ant auth login` /
+    /// `ant auth print-credentials --access-token`) — bills against the user's own
+    /// Claude subscription instead of a pay-per-token API key, same motivation as
+    /// [`ClaudeCli`] but going through `genai`'s normal `exec_chat` call (see
+    /// `summarize::build_claude_oauth_client`) rather than a `claude` CLI
+    /// subprocess per summary.
+    ClaudeOAuth,
     Codex,
     /// A local/self-hosted Ollama server (`genai`'s built-in `AdapterKind::Ollama`,
     /// default endpoint `http://localhost:11434/`) — no API key, base URL is
@@ -155,7 +162,7 @@ pub(crate) enum SummaryProvider {
 }
 
 impl SummaryProvider {
-    const ALL: [SummaryProvider; 12] = [
+    const ALL: [SummaryProvider; 13] = [
         SummaryProvider::Claude,
         SummaryProvider::OpenAi,
         SummaryProvider::Gemini,
@@ -166,6 +173,7 @@ impl SummaryProvider {
         SummaryProvider::GeminiVertex,
         SummaryProvider::ClaudeBedrock,
         SummaryProvider::ClaudeCli,
+        SummaryProvider::ClaudeOAuth,
         SummaryProvider::Codex,
         SummaryProvider::Ollama,
     ];
@@ -182,6 +190,7 @@ impl SummaryProvider {
             SummaryProvider::GeminiVertex => "gemini-vertex",
             SummaryProvider::ClaudeBedrock => "claude-bedrock",
             SummaryProvider::ClaudeCli => "claude-cli",
+            SummaryProvider::ClaudeOAuth => "claude-oauth",
             SummaryProvider::Codex => "codex",
             SummaryProvider::Ollama => "ollama",
         }
@@ -199,6 +208,7 @@ impl SummaryProvider {
             SummaryProvider::GeminiVertex => "Gemini (Google Vertex AI)",
             SummaryProvider::ClaudeBedrock => "Claude (AWS Bedrock)",
             SummaryProvider::ClaudeCli => "Claude (Claude Code CLI)",
+            SummaryProvider::ClaudeOAuth => "Claude (ant CLIでOAuthログイン)",
             SummaryProvider::Codex => "Codex (Codex CLI)",
             SummaryProvider::Ollama => "Ollama (ローカル)",
         }
@@ -233,6 +243,10 @@ impl SummaryProvider {
             // These two go through `claude --model`/`codex -m`, not `genai` — plain
             // CLI model aliases, not `genai` model spec strings.
             SummaryProvider::ClaudeCli => "sonnet",
+            // Unlike `ClaudeCli` above, this goes through `genai`'s normal
+            // `exec_chat` (see `summarize::build_claude_oauth_client`), so it takes
+            // the same bare `genai` model spec string as `SummaryProvider::Claude`.
+            SummaryProvider::ClaudeOAuth => "claude-sonnet-4-5",
             SummaryProvider::Codex => "gpt-5.5",
             // Not a `genai` model spec string in the usual sense — just a common
             // Ollama library model name, prefilled as a starting point in the
@@ -266,10 +280,13 @@ impl SummaryProvider {
             SummaryProvider::GeminiVertex => Some(summarize::GEMINI_VERTEX_CREDENTIALS_ACCOUNT),
             SummaryProvider::ClaudeBedrock => Some(summarize::BEDROCK_API_KEY_ACCOUNT),
             // `ClaudeCli`/`Codex` authenticate as the CLI's own login (see the doc
-            // comment above); `Ollama` needs no credential at all — a local server
-            // with no API key, configured instead via `AppSettings::ollama_base_url`
-            // (see the "Ollama設定" section in `Settings`'s `rsx!`).
-            SummaryProvider::ClaudeCli | SummaryProvider::Codex | SummaryProvider::Ollama => None,
+            // comment above); `ClaudeOAuth` likewise authenticates as the `ant`
+            // CLI's own OAuth login (`ant auth login`), no API key of this app's
+            // own to store either; `Ollama` needs no credential at all — a local
+            // server with no API key, configured instead via
+            // `AppSettings::ollama_base_url` (see the "Ollama設定" section in
+            // `Settings`'s `rsx!`).
+            SummaryProvider::ClaudeCli | SummaryProvider::ClaudeOAuth | SummaryProvider::Codex | SummaryProvider::Ollama => None,
         }
     }
 
@@ -331,6 +348,9 @@ impl SummaryProvider {
             // `claude --model` aliases (see `claude --help`), not `genai` model
             // spec strings.
             SummaryProvider::ClaudeCli => &["sonnet", "opus", "haiku"],
+            // Same bare `genai` model spec strings as `SummaryProvider::Claude` —
+            // see `default_model()`'s comment on why this differs from `ClaudeCli`.
+            SummaryProvider::ClaudeOAuth => &["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5"],
             // Model slugs from this sandbox's `~/.codex/models_cache.json`.
             SummaryProvider::Codex => &["gpt-5.5", "gpt-5.5-codex"],
             // Deliberately empty: unlike the hosted providers above, there's no
@@ -377,14 +397,23 @@ fn summary_provider_is_configured(state: &AppState, provider: SummaryProvider) -
 /// result for `provider` (see the `use_effect` that keeps `summary_cli_available`
 /// in sync with `summary_edit_provider`).
 fn summary_cli_status_text(provider: SummaryProvider, available: Option<bool>) -> String {
-    let Some(backend) = provider.cli_backend() else {
-        return String::new();
-    };
-    match available {
-        Some(true) => format!("{} コマンドを検出しました(ログイン状態は要約生成時に確認されます)", backend.binary()),
-        Some(false) => format!("{} コマンドが見つかりません。インストールしてPATHに追加し、ログインしてください", backend.binary()),
-        None => "確認中...".to_string(),
+    if let Some(backend) = provider.cli_backend() {
+        return match available {
+            Some(true) => format!("{} コマンドを検出しました(ログイン状態は要約生成時に確認されます)", backend.binary()),
+            Some(false) => format!("{} コマンドが見つかりません。インストールしてPATHに追加し、ログインしてください", backend.binary()),
+            None => "確認中...".to_string(),
+        };
     }
+    if provider == SummaryProvider::ClaudeOAuth {
+        return match available {
+            Some(true) => "ant コマンドを検出しました(ログイン状態は要約生成時に確認されます)".to_string(),
+            Some(false) => {
+                "ant コマンドが見つかりません。https://github.com/anthropics/anthropic-cli からインストールし、`ant auth login` でログインしてください".to_string()
+            }
+            None => "確認中...".to_string(),
+        };
+    }
+    String::new()
 }
 
 const STYLE: &str = r#"
@@ -508,21 +537,27 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
     let mut summary_vertex_json_input = use_signal(String::new);
     let mut summary_credential_message = use_signal(|| None::<String>);
     // `Some(true/false)` once `<binary> --version` has been checked for the
-    // currently-edited CLI-based provider (#59); `None` while checking or when
-    // `summary_edit_provider()` isn't CLI-based. Re-checked whenever the edited
-    // provider changes (see the `use_effect` below), since detection is async
-    // (spawns a subprocess) and can't happen inline in `summary_provider_is_configured`.
+    // currently-edited CLI-based provider (#59) or `ant --version` for
+    // `SummaryProvider::ClaudeOAuth`; `None` while checking or when
+    // `summary_edit_provider()` needs neither check. Re-checked whenever the
+    // edited provider changes (see the `use_effect` below), since detection is
+    // async (spawns a subprocess) and can't happen inline in
+    // `summary_provider_is_configured`.
     let mut summary_cli_available = use_signal(|| None::<bool>);
     use_effect(move || {
         let provider = summary_edit_provider();
-        match provider.cli_backend() {
-            Some(backend) => {
-                summary_cli_available.set(None);
-                spawn(async move {
-                    summary_cli_available.set(Some(backend.is_available().await));
-                });
-            }
-            None => summary_cli_available.set(None),
+        if let Some(backend) = provider.cli_backend() {
+            summary_cli_available.set(None);
+            spawn(async move {
+                summary_cli_available.set(Some(backend.is_available().await));
+            });
+        } else if provider == SummaryProvider::ClaudeOAuth {
+            summary_cli_available.set(None);
+            spawn(async move {
+                summary_cli_available.set(Some(summarize::ant_cli_is_available().await));
+            });
+        } else {
+            summary_cli_available.set(None);
         }
     });
 
@@ -992,6 +1027,12 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                     // this app to save, so show detection status instead of a
                     // form/save button.
                     p { class: "hint", "APIキーは不要です。このプロバイダは claude/codex CLI 自体のログイン(OAuth/サブスクリプション認証)をそのまま使います。" }
+                    p { class: "status-badge", "{summary_cli_status_text(summary_edit_provider(), summary_cli_available())}" }
+                } else if summary_edit_provider() == SummaryProvider::ClaudeOAuth {
+                    // Like the CLI-based providers above, no API key of this app's
+                    // own to save — this one authenticates as the official `ant`
+                    // CLI's own OAuth login instead of `claude`/`codex`'s.
+                    p { class: "hint", "APIキーは不要です。事前に `ant auth login` でログインしておいてください。要約自体は claude CLIのサブプロセスではなく、antが発行したトークンで直接APIを呼びます。" }
                     p { class: "status-badge", "{summary_cli_status_text(summary_edit_provider(), summary_cli_available())}" }
                 } else if summary_edit_provider() == SummaryProvider::Ollama {
                     // Local Ollama server (`SummaryProvider::api_key_account() ==

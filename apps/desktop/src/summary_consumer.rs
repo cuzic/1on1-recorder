@@ -260,6 +260,8 @@ impl SummaryConsumer {
 
         let summarizer: Result<Box<dyn Summarizer>, String> = if let Some(backend) = provider.cli_backend() {
             Ok(Box::new(summarize::CliSummarizer(backend)))
+        } else if provider == SummaryProvider::ClaudeOAuth {
+            Ok(Box::new(summarize::GenaiSummarizer(summarize::build_claude_oauth_client())))
         } else if provider.is_vertex() {
             let raw = stored_credential.and_then(Result::ok).unwrap_or_default();
             match serde_json::from_str::<summarize::VertexCredentials>(&raw) {
