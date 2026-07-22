@@ -18,6 +18,7 @@ members = [
     "crates/stt-openai",
     "crates/stt-whisper",
     "crates/summarize",
+    "crates/transcript-event",
     "crates/upload-client",
 ]
 # `stt-whisper` is deliberately excluded here: unlike every other member, it pulls in
@@ -45,6 +46,7 @@ default-members = [
     "crates/stt-google",
     "crates/stt-openai",
     "crates/summarize",
+    "crates/transcript-event",
     "crates/upload-client",
 ]
 

@@ -1,0 +1,13 @@
+[package]
+name = "transcript-event"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Canonical transcript events for the event-driven decoupling between transcription and summary generation. Defines TranscriptEvent, SummaryEvent, and EventEnvelope — the single message contract between the Local Broker and all consumers."
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+recorder-domain = { path = "../recorder-domain" }
+serde = { workspace = true }
+ulid = { version = "1", features = ["serde"] }
