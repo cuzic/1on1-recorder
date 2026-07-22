@@ -16,6 +16,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 
+#[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub id: String, // IMMDevice::GetId()
     pub friendly_name: String,
