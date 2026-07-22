@@ -416,6 +416,74 @@ fn summary_cli_status_text(provider: SummaryProvider, available: Option<bool>) -
     String::new()
 }
 
+/// `<select>` sentinel meaning "follow whatever the OS reports as its current
+/// default device" — `AppSettings::microphone_device_id`/`render_device_id`'s
+/// `None`. Not a real `DeviceInfo::id` (those are opaque WASAPI/CoreAudio
+/// endpoint IDs, never this literal string), so it can't collide with one.
+const FOLLOW_SYSTEM_DEFAULT_DEVICE: &str = "__system_default__";
+
+/// Platform-agnostic view of `app_service::DeviceInfo` for the `<select>` options
+/// below — built once per list load so the `rsx!` markup doesn't need its own
+/// `#[cfg(windows)]`/`#[cfg(target_os = "macos")]` branches (device enumeration
+/// itself is real capture backend territory; this file only renders the result).
+/// `is_default` is kept as its own field (rather than baked into a `label`
+/// string) so it can also drive the "現在のシステム既定" hint line below each
+/// `<select>` — that hint has to stay visible even while "システム既定" itself
+/// is the selected option, i.e. even when no single `<option>`'s own label is
+/// showing.
+#[derive(Debug, Clone)]
+struct DeviceOption {
+    id: String,
+    friendly_name: String,
+    is_default: bool,
+}
+
+impl DeviceOption {
+    fn option_label(&self) -> String {
+        if self.is_default { format!("{} (既定)", self.friendly_name) } else { self.friendly_name.clone() }
+    }
+}
+
+/// `true` only where a real capture backend (and therefore real device
+/// enumeration) exists at all — see `recording.rs`'s three-way `#[cfg]` split.
+/// Everywhere else, `load_capture_devices`/`load_render_devices` return an empty
+/// list and the settings UI shows a hint instead of a picker with nothing but
+/// "システム既定" in it.
+fn device_selection_supported() -> bool {
+    cfg!(any(windows, target_os = "macos"))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn to_device_option(d: app_service::DeviceInfo) -> DeviceOption {
+    DeviceOption { id: d.id, friendly_name: d.friendly_name, is_default: d.is_default_for_role.is_some() }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn load_capture_devices() -> (Vec<DeviceOption>, Option<String>) {
+    match app_service::enumerate_capture_devices() {
+        Ok(devices) => (devices.into_iter().map(to_device_option).collect(), None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn load_render_devices() -> (Vec<DeviceOption>, Option<String>) {
+    match app_service::enumerate_render_devices() {
+        Ok(devices) => (devices.into_iter().map(to_device_option).collect(), None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn load_capture_devices() -> (Vec<DeviceOption>, Option<String>) {
+    (Vec::new(), None)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn load_render_devices() -> (Vec<DeviceOption>, Option<String>) {
+    (Vec::new(), None)
+}
+
 const STYLE: &str = r#"
 .settings-container {
   margin: 0;
@@ -590,6 +658,19 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
         move || state.app_settings.lock().unwrap().ollama_base_url.clone().unwrap_or_default()
     });
     let mut ollama_base_url_message = use_signal(|| None::<String>);
+
+    // ---- 録音デバイスの選択(マイク/スピーカーが複数あるとき用、他の設定とは独立) ----
+    let mut mic_devices = use_signal(load_capture_devices);
+    let mut render_devices = use_signal(load_render_devices);
+    let mut mic_device_select = use_signal({
+        let state = state.clone();
+        move || state.app_settings.lock().unwrap().microphone_device_id.clone().unwrap_or_else(|| FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string())
+    });
+    let mut render_device_select = use_signal({
+        let state = state.clone();
+        move || state.app_settings.lock().unwrap().render_device_id.clone().unwrap_or_else(|| FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string())
+    });
+    let mut device_message = use_signal(|| None::<String>);
 
     // ---- 要約: プロンプトテンプレートの選択(プロバイダ・モデルの選択とは独立) ----
     let mut summary_template_select = use_signal({
@@ -862,6 +943,65 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
         }
     };
 
+    // ==== 録音デバイスハンドラ ====
+
+    // Re-runs `enumerate_capture_devices`/`enumerate_render_devices` — lets a
+    // device plugged in (or unplugged) after Settings opened show up without
+    // restarting the app.
+    let refresh_devices = move |_| {
+        let (mic_list, mic_error) = load_capture_devices();
+        let (render_list, render_error) = load_render_devices();
+        mic_devices.set((mic_list, mic_error.clone()));
+        render_devices.set((render_list, render_error.clone()));
+        device_message.set(match (mic_error, render_error) {
+            (Some(e), _) => Some(format!("マイク一覧の取得に失敗しました: {e}")),
+            (None, Some(e)) => Some(format!("スピーカー一覧の取得に失敗しました: {e}")),
+            (None, None) => None,
+        });
+    };
+
+    let onchange_mic_device = move |evt: FormEvent| {
+        mic_device_select.set(evt.value());
+        device_message.set(None);
+    };
+    let onchange_render_device = move |evt: FormEvent| {
+        render_device_select.set(evt.value());
+        device_message.set(None);
+    };
+
+    // Persists `AppSettings::microphone_device_id`/`render_device_id` —
+    // `FOLLOW_SYSTEM_DEFAULT_DEVICE` maps back to `None` ("follow whatever the OS
+    // reports as current default", the pre-existing behavior before this picker
+    // existed). Same rollback-on-failed-save pattern as `save_ollama_base_url`
+    // above.
+    let save_devices = {
+        let state = state.clone();
+        move |_| {
+            let mic = mic_device_select();
+            let render = render_device_select();
+            let new_mic = if mic == FOLLOW_SYSTEM_DEFAULT_DEVICE { None } else { Some(mic) };
+            let new_render = if render == FOLLOW_SYSTEM_DEFAULT_DEVICE { None } else { Some(render) };
+
+            let save_result = {
+                let mut settings = state.app_settings.lock().unwrap();
+                let previous_mic = settings.microphone_device_id.clone();
+                let previous_render = settings.render_device_id.clone();
+                settings.microphone_device_id = new_mic;
+                settings.render_device_id = new_render;
+                let result = settings.save(&state.app_data_dir);
+                if result.is_err() {
+                    settings.microphone_device_id = previous_mic;
+                    settings.render_device_id = previous_render;
+                }
+                result
+            };
+            match save_result {
+                Ok(()) => device_message.set(Some("保存しました。次回の録音開始時から反映されます".to_string())),
+                Err(e) => device_message.set(Some(format!("保存に失敗しました: {e}"))),
+            }
+        }
+    };
+
     // ==== 要約プロンプトテンプレートハンドラ ====
 
     let onchange_summary_template = move |evt: FormEvent| {
@@ -929,6 +1069,61 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
             div { class: "settings-header",
                 button { onclick: move |_| screen.set(Screen::Main), "← 戻る" }
                 h1 { "設定" }
+            }
+
+            section { class: "settings-section",
+                h2 { "録音デバイス" }
+                if device_selection_supported() {
+                    p { class: "hint", "マイクやスピーカーが複数ある場合、録音に使うデバイスを選べます。「システム既定」を選ぶとOSの既定デバイスに追従します。" }
+                    label {
+                        "マイク(自分の音声)"
+                        select {
+                            onchange: onchange_mic_device,
+                            option {
+                                value: FOLLOW_SYSTEM_DEFAULT_DEVICE,
+                                selected: mic_device_select() == FOLLOW_SYSTEM_DEFAULT_DEVICE,
+                                "システム既定"
+                            }
+                            for d in mic_devices().0 {
+                                option { value: "{d.id}", selected: mic_device_select() == d.id, "{d.option_label()}" }
+                            }
+                        }
+                    }
+                    // Shown regardless of which option is selected above — "シ
+                    // ステム既定" itself doesn't reveal which physical device
+                    // that resolves to, and even when a specific device is
+                    // already pinned, it's useful to see whether the OS
+                    // default has since drifted away from it.
+                    if let Some(current) = mic_devices().0.iter().find(|d| d.is_default) {
+                        p { class: "hint", "現在のシステム既定のマイク: {current.friendly_name}" }
+                    }
+                    label {
+                        "スピーカー(相手の音声・ループバック)"
+                        select {
+                            onchange: onchange_render_device,
+                            option {
+                                value: FOLLOW_SYSTEM_DEFAULT_DEVICE,
+                                selected: render_device_select() == FOLLOW_SYSTEM_DEFAULT_DEVICE,
+                                "システム既定"
+                            }
+                            for d in render_devices().0 {
+                                option { value: "{d.id}", selected: render_device_select() == d.id, "{d.option_label()}" }
+                            }
+                        }
+                    }
+                    if let Some(current) = render_devices().0.iter().find(|d| d.is_default) {
+                        p { class: "hint", "現在のシステム既定のスピーカー: {current.friendly_name}" }
+                    }
+                    div { style: "display: flex; gap: 0.5em;",
+                        button { class: "primary", onclick: save_devices, "この設定を保存" }
+                        button { onclick: refresh_devices, "デバイス一覧を更新" }
+                    }
+                } else {
+                    p { class: "hint", "このプラットフォームでは実際のマイク/スピーカー録音に対応していないため、デバイス選択はできません(開発用のスタブ録音のみ)。" }
+                }
+                if let Some(msg) = device_message() {
+                    p { class: "status-badge", "{msg}" }
+                }
             }
 
             section { class: "settings-section",
