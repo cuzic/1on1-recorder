@@ -38,6 +38,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # windows-latest's Defender real-time scanning re-scans every object file
+      # rustc/link.exe touches, which is a well-documented major slowdown for Rust
+      # builds on this runner image (this job's own `Bundle` step alone took ~22
+      # minutes on its first run, compiling the newly added rhai-engine/genai/
+      # tonic/webview2 dependency stack from scratch — Defender overhead compounds
+      # that further, on every run, cache-warm or not). Excluding both the cargo
+      # registry/target dir *paths* and the compiler *processes* covers builds that
+      # land outside `github.workspace` too (e.g. `~/.cargo/registry`).
+      - name: Exclude Cargo/target dirs from Windows Defender scanning
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+          Add-MpPreference -ExclusionProcess "cargo.exe"
+          Add-MpPreference -ExclusionProcess "rustc.exe"
+          Add-MpPreference -ExclusionProcess "link.exe"
+
       # stt-google's build.rs (tonic-build/prost-build) needs protoc — same
       # requirement as windows-app-build.yml.
       - uses: arduino/setup-protoc@v3
