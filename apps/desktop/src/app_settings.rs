@@ -64,6 +64,18 @@ pub struct AppSettings {
     /// unconditionally; no settings-UI toggle exists yet for this field, so it
     /// currently only takes effect via manual `settings.json` edits.
     pub silence_gate_enabled: Option<bool>,
+    /// `capture_windows`/`capture_macos::device_select::DeviceInfo::id` of the
+    /// microphone to record the Self track from, as chosen in the settings
+    /// screen's "録音デバイス" section. `None` (the default, same as before this
+    /// field existed) means "whatever the OS reports as its current default
+    /// capture device" — see `recording.rs::start`, which resolves this into
+    /// `run_windows_capture_session`/`run_macos_capture_session`'s
+    /// `mic_device_id` parameter.
+    pub microphone_device_id: Option<String>,
+    /// Same as `microphone_device_id`, but for the render/loopback device the
+    /// Remote track is captured from (a speaker/output device — WASAPI loopback
+    /// on Windows, ScreenCaptureKit's system-audio capture on macOS).
+    pub render_device_id: Option<String>,
 }
 
 impl AppSettings {
@@ -133,6 +145,8 @@ mod tests {
             whisper_model_path: Some(PathBuf::from("/models/ggml-large-v3.bin")),
             exports_root: Some(PathBuf::from("/exports")),
             silence_gate_enabled: Some(true),
+            microphone_device_id: Some("{0.0.1.00000000}.{aaaa}".to_string()),
+            render_device_id: Some("{0.0.0.00000000}.{bbbb}".to_string()),
         };
 
         settings.save(dir.path()).expect("save");
@@ -166,6 +180,8 @@ mod tests {
         assert_eq!(loaded.whisper_model_path, None);
         assert_eq!(loaded.exports_root, None);
         assert_eq!(loaded.silence_gate_enabled, None);
+        assert_eq!(loaded.microphone_device_id, None);
+        assert_eq!(loaded.render_device_id, None);
     }
 
     #[test]
