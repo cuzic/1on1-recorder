@@ -1,10 +1,14 @@
 name: Desktop App Bundle
 
-# Produces installable desktop app packages via `dx bundle` (Windows: .msi/.exe
-# installer, macOS: .app + .dmg), one job per native OS — `dx bundle` cannot
-# cross-compile a bundle for another OS (confirmed against Dioxus's own docs and
+# Produces desktop app builds, one job per native OS — `dx bundle`/`dx build`
+# cannot cross-compile for another OS (confirmed against Dioxus's own docs and
 # its own CI, DioxusLabs/dioxus .github/workflows/main.yml's bundle-*-smoke jobs,
-# which this workflow's steps are modeled on).
+# which this workflow's steps are modeled on). Windows produces a single portable
+# `desktop.exe` (via `dx build`, no installer wrapping — dioxus embeds all assets
+# into the binary via manganis, so there's no separate resource folder to carry
+# alongside it); macOS still goes through `dx bundle` for a proper .app + .dmg,
+# since unlike Windows, a bare unix executable isn't something a user can just
+# double-click-run/hand around the way an .app bundle is.
 #
 # Separate from windows-app-build.yml/macos-build.yml: those are fast compile/
 # lint/test gates that run on every push/PR; this is a slower packaging step, run
@@ -18,7 +22,7 @@ name: Desktop App Bundle
 # guide for the underlying mechanics if that's ever wired up here). On first
 # launch, macOS Gatekeeper will refuse to open the unsigned .app (right-click >
 # Open, or `xattr -d com.apple.quarantine` the .app, to bypass once) and Windows
-# SmartScreen may warn on the unsigned installer ("More info" > "Run anyway").
+# SmartScreen may warn on the unsigned exe ("More info" > "Run anyway").
 
 on:
   workflow_dispatch: {}
@@ -82,7 +86,16 @@ jobs:
       - name: dx --version
         run: dx --version
 
-      - name: Bundle (msi + nsis installer)
+      - name: Build (portable exe, no installer)
+        # `dx build` (not `dx bundle`): skips the WiX/NSIS packaging step
+        # entirely, leaving the plain compiled+asset-processed exe at
+        # target/dx/desktop/release/windows/app/desktop.exe (see dioxus-cli's
+        # own BuildRequest::root_dir/exe_dir: Windows's app dir *is* its exe
+        # dir, unlike macOS's Contents/MacOS split) — that exe is already
+        # fully self-contained (dioxus embeds all assets into the binary via
+        # manganis; confirmed by extracting a prior MSI build and finding it
+        # wrapped exactly one file, the exe itself), so there's nothing an
+        # installer step would add other than Start Menu/registry entries.
         # Run from the repo root, not apps/desktop: dx-cli's workspace resolution
         # (packages/cli/src/workspace.rs, when `[workspace] default-members` is
         # set in the root Cargo.toml, as it is here) canonicalizes each default
@@ -90,28 +103,25 @@ jobs:
         # root — cd'ing into apps/desktop first made it look for
         # apps/desktop/apps/desktop and panic ("No such file or directory").
         # `--package desktop` selects this crate explicitly instead of relying
-        # on default-member auto-detection. `--release`: `dx bundle` defaults to
+        # on default-member auto-detection. `--release`: `dx build` defaults to
         # a *debug* build ("Build in release mode [default: false]" per its own
-        # `--help`) — without this flag the first real run produced a ~200MB
-        # unoptimized, symbol-laden installer.
-        run: dx bundle --platform desktop --package desktop --release --package-types msi --package-types nsis
+        # `--help`) — without this flag the first real bundle run produced a
+        # ~200MB unoptimized, symbol-laden installer.
+        run: dx build --platform desktop --package desktop --release
 
-      - name: Verify bundle outputs
+      - name: Verify build output and stage for upload
         shell: pwsh
         run: |
-          $msi = Get-ChildItem -Path .\target\dx -Recurse -File -Include "*.msi"
-          $nsis = Get-ChildItem -Path .\target\dx -Recurse -File -Include "*-setup.exe"
-          $msi | ForEach-Object { $_.FullName }
-          $nsis | ForEach-Object { $_.FullName }
-          if (-not $msi) { throw "Expected MSI artifact was not produced." }
-          if (-not $nsis) { throw "Expected NSIS installer artifact was not produced." }
+          $exe = Get-ChildItem -Path .\target\dx\desktop\release\windows\app -File -Include "*.exe" -Recurse
+          if (-not $exe) { throw "Expected desktop.exe was not produced." }
+          $exe | ForEach-Object { $_.FullName }
+          New-Item -ItemType Directory -Path .\dist -Force | Out-Null
+          Copy-Item $exe[0].FullName -Destination .\dist\1on1-recorder-windows-x64.exe
 
       - uses: actions/upload-artifact@v4
         with:
           name: 1on1-recorder-windows
-          path: |
-            target/dx/**/*.msi
-            target/dx/**/*-setup.exe
+          path: dist/1on1-recorder-windows-x64.exe
           if-no-files-found: error
           retention-days: 30
 
