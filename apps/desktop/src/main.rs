@@ -91,6 +91,26 @@ fn main() {
 
     tracing::info!("1on1 Recorder starting up (pid {})", std::process::id());
 
+    // `RhaiEngine::new()` below calls `tokio::spawn` (its background async_worker
+    // task) before `LaunchBuilder::desktop()...launch()` runs — but that's the
+    // point in the app's lifecycle where dioxus-desktop's own `tokio_runtime`
+    // feature (on by default; see `dioxus-desktop`'s launch.rs) creates its
+    // runtime, not before. Entering our own multi-thread runtime here first means
+    // `Handle::try_current()` succeeds both for this early `tokio::spawn` call and
+    // for dioxus-desktop's own launch (which reuses whatever runtime is already
+    // current instead of building a second one — see its
+    // `launch_virtual_dom`/`assert_ne!(..., RuntimeFlavor::CurrentThread, ...)`).
+    // Without this, `RhaiEngine::new()` panicked with "there is no reactor
+    // running, must be called from the context of a Tokio 1.x runtime" (caught via
+    // the panic hook set up in `init_logging` above — this app had only ever been
+    // cross-compile-checked before, never actually run on real Windows hardware,
+    // so this bug survived every prior `cargo check`/`clippy`/`test` pass).
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    let _tokio_guard = tokio_runtime.enter();
+
     let config = Config::load(app_data_dir.clone());
     std::fs::create_dir_all(&config.sessions_root).ok();
 
