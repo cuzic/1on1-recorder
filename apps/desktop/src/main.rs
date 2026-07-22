@@ -9,14 +9,17 @@ mod level;
 mod recording;
 mod settings;
 mod status;
+mod summary_consumer;
 mod summary_template;
 mod transcript;
 mod transcription_status;
 mod ui;
+mod ui_consumer;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use credential_store::CredentialStore;
 use dioxus::desktop::tao::dpi::LogicalSize;
 use dioxus::desktop::tao::window::WindowBuilder;
 use dioxus::desktop::{Config as DesktopConfig, WindowCloseBehaviour};
@@ -73,14 +76,45 @@ fn main() {
     let adapter = Arc::new(upload_client::HttpUploadClient::new(config.api_base_url.clone(), Duration::from_secs(30), token_provider));
 
     let app_settings = app_settings::AppSettings::load(&app_data_dir);
+    let app_settings = std::sync::Arc::new(std::sync::Mutex::new(app_settings));
+
+    let broker = local_broker::LocalBroker::new();
+    let summary_consumer = summary_consumer::SummaryConsumer::new(
+        broker.clone(),
+        store.clone(),
+        credential_store.clone(),
+        app_settings.clone(),
+    );
+
+    // Settings provider for Rhai plugins
+    let settings_provider = Arc::new(AppSettingsProvider {
+        app_settings: app_settings.clone(),
+        credential_store: credential_store.clone(),
+    });
+
+    let mut rhai_engine = rhai_engine::RhaiEngine::new(
+        broker.clone(),
+        store.clone(),
+        credential_store.clone(),
+        settings_provider,
+    );
+
+    // Load plugins from the app data directory
+    let plugin_dir = app_data_dir.join("plugins");
+    if let Err(err) = rhai_engine.load_plugins(&plugin_dir) {
+        tracing::warn!(%err, "failed to load Rhai plugins");
+    }
 
     let state = Arc::new(AppState {
         store,
         adapter,
         config,
+        broker,
+        summary_consumer,
+        rhai_engine,
         credential_store,
         app_data_dir: app_data_dir.clone(),
-        app_settings: Mutex::new(app_settings),
+        app_settings,
         consent_confirmed: Mutex::new(false),
         current: Mutex::new(None),
         last_error: Mutex::new(None),
@@ -99,4 +133,40 @@ fn main() {
 
 fn app_entry() -> Element {
     ui::App()
+}
+
+/// Implements rhai_engine::SettingsProvider for the desktop app.
+struct AppSettingsProvider {
+    app_settings: Arc<Mutex<app_settings::AppSettings>>,
+    credential_store: Arc<credential_store::FallbackCredentialStore>,
+}
+
+impl rhai_engine::SettingsProvider for AppSettingsProvider {
+    fn get(&self, key: &str) -> Option<String> {
+        match key {
+            "ollama_base_url" => self.app_settings.lock().unwrap().ollama_base_url.clone(),
+            "summary_template" => self.app_settings.lock().unwrap().summary_template.clone(),
+            "summary_provider_key" => self.credential_store
+                .load(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_PROVIDER_ACCOUNT)
+                .ok(),
+            _ => None,
+        }
+    }
+
+    fn selected_model(&self) -> String {
+        let provider_key = self.credential_store
+            .load(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_PROVIDER_ACCOUNT)
+            .unwrap_or_else(|_| "claude".to_string());
+        self.credential_store
+            .load(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_MODEL_ACCOUNT)
+            .unwrap_or_else(|_| {
+                crate::settings::SummaryProvider::from_key(&provider_key)
+                    .default_model()
+                    .to_string()
+            })
+    }
+
+    fn session_metadata(&self, _session_id: recorder_domain::SessionId) -> rhai::Map {
+        rhai::Map::new()
+    }
 }

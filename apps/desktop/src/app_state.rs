@@ -3,17 +3,24 @@ use std::sync::Mutex;
 use std::sync::Arc;
 use std::time::Instant;
 
+use local_broker::LocalBroker;
 use recorder_domain::{SessionId, SessionManifest, SessionSummary};
+use rhai_engine::RhaiEngine;
 use session_store::SessionStore;
 use upload_client::HttpUploadClient;
 
 use crate::app_settings::AppSettings;
 use crate::config::Config;
+use crate::summary_consumer::SummaryConsumer;
+use crate::ui_consumer::TranscriptBuffer;
 
 pub struct AppState {
     pub store: Arc<SessionStore>,
     pub adapter: Arc<HttpUploadClient>,
     pub config: Config,
+    pub broker: LocalBroker,
+    pub summary_consumer: SummaryConsumer,
+    pub rhai_engine: RhaiEngine,
     /// Backs the settings screen (Deepgram / summary provider API keys and the
     /// selected-provider/model strings) — same instance `main.rs` already builds
     /// for the upload bearer token, so there's one credential-store handle per app
@@ -30,7 +37,7 @@ pub struct AppState {
     /// comment for why these don't go through `credential_store`. Read by
     /// `export.rs::export_dir` for `exports_root`; no settings-screen writer
     /// exists yet for any of these fields.
-    pub app_settings: Mutex<AppSettings>,
+    pub app_settings: Arc<Mutex<AppSettings>>,
     pub consent_confirmed: Mutex<bool>,
     pub current: Mutex<Option<ActiveRecording>>,
     pub last_error: Mutex<Option<String>>,
@@ -45,6 +52,7 @@ pub struct ActiveRecording {
     #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
     pub manifest: SessionManifest,
     pub started_at: Instant,
+    pub transcript_buffer: TranscriptBuffer,
     /// Updated live by `app_service::windows_frame_collector`/
     /// `app_service::macos_frame_collector` as real capture happens — only exists
     /// on Windows/macOS. Other platforms report `level::dev_placeholder_level(elapsed)`

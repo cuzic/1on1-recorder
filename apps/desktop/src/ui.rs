@@ -3,23 +3,23 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use credential_store::CredentialStore;
 use dioxus::desktop::trayicon::{self, DioxusTrayIcon, DioxusTrayMenu};
 use dioxus::desktop::{use_tray_icon_event_handler, use_tray_menu_event_handler, use_window};
 use dioxus::html::geometry::PixelsVector2D;
 use dioxus::prelude::*;
 use recorder_domain::{SessionId, TrackKind};
-use session_store::{Summary, TranscriptSegment, TranscriptionGap};
+use session_store::{TranscriptSegment, TranscriptionGap};
 
 use crate::actions;
 use crate::app_state::AppState;
 use crate::export;
 use crate::gap_retranscription::{self, GapRetranscribeState};
 use crate::history;
-use crate::settings::{self, Screen, SummaryProvider};
+use crate::settings::{self, Screen};
 use crate::status::Status;
 use crate::transcript::{self, TimelineItem};
 use crate::transcription_status;
+use crate::ui_consumer;
 
 const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 
@@ -519,9 +519,18 @@ pub fn App() -> Element {
                 // immediately on every selection change, so a picked-but-not-yet-
                 // polled session doesn't show a stale flash of the previous one.
                 if let Some(id) = selected_session_id() {
-                    if let Ok(segments) = state.store.list_transcript_segments(id) {
-                        transcript_segments.set(segments);
-                    }
+                    // During live recording, read from the broker-backed
+                    // TranscriptBuffer for real-time updates. Otherwise, read
+                    // from SessionStore for historical sessions.
+                    let segments = {
+                        let current = state.current.lock().unwrap();
+                        if current.as_ref().is_some_and(|a| a.session_id == id) {
+                            current.as_ref().unwrap().transcript_buffer.take()
+                        } else {
+                            state.store.list_transcript_segments(id).unwrap_or_default()
+                        }
+                    };
+                    transcript_segments.set(segments);
                     if let Ok(session_gaps) = state.store.gaps_for_session(id) {
                         gaps.set(session_gaps);
                     }
@@ -594,13 +603,23 @@ pub fn App() -> Element {
         busy.set(true);
         match actions::start_recording(&start_state) {
             Ok(s) => {
-                // Task #69: sync `selected_session_id` immediately rather than
-                // waiting for the next 250ms poll tick — otherwise a stale
-                // selection (e.g. picked from `history::History` before this
-                // click) could still be the target of a summary/export click
-                // during that window (Codex review finding).
                 if let Some(id) = s.last_session_id.as_deref().and_then(|id| id.parse::<SessionId>().ok()) {
                     selected_session_id.set(Some(id));
+                    // Spawn UI Consumer: subscribes to broker events for this
+                    // session and updates the shared transcript buffer in real time.
+                    if let Some(ref active) = *start_state.current.lock().unwrap() {
+                        ui_consumer::spawn_ui_consumer(
+                            start_state.broker.clone(),
+                            id,
+                            start_state.store.clone(),
+                            active.transcript_buffer.clone(),
+                        );
+                    }
+                    // Spawn auto-summary: generates summary when session ends.
+                    start_state.summary_consumer.spawn_auto_summary(id);
+                    // Spawn Rhai plugin session: dispatches broker events
+                    // to all loaded .rhai scripts.
+                    start_state.rhai_engine.spawn_session(&start_state.broker, id);
                 }
                 status.set(s);
             }
@@ -636,7 +655,8 @@ pub fn App() -> Element {
 
     // #38: user-triggered summary. Works both mid-recording and after stop (any
     // time `last_session_id` is set) — unlike the transcript panel above, this
-    // isn't gated on `recording`.
+    // isn't gated on `recording`. Delegates to SummaryConsumer for the actual
+    // summarization logic; this handler only manages UI state.
     let summary_state = state.clone();
     let on_generate_summary = move |_| {
         let state = summary_state.clone();
@@ -650,116 +670,14 @@ pub fn App() -> Element {
                 return;
             };
 
-            let provider = state
-                .credential_store
-                .load(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_PROVIDER_ACCOUNT)
-                .ok()
-                .map(|key| SummaryProvider::from_key(&key))
-                .unwrap_or(SummaryProvider::Claude);
-            let model = state
-                .credential_store
-                .load(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_MODEL_ACCOUNT)
-                .unwrap_or_else(|_| provider.default_model().to_string());
-
-            // CLI-based providers (#59) authenticate as the `claude`/`codex` CLI's
-            // own OAuth/subscription login, and Ollama needs no credential at all
-            // (just an optional base URL, read separately below) — neither has a
-            // stored API key, so this check only applies to the genai/Vertex paths
-            // below (`api_key_account()` is `None` for them, so `stored_credential`
-            // stays `None` and the check is skipped).
-            let stored_credential = provider.api_key_account().map(|account| state.credential_store.load(summarize::CREDENTIAL_SERVICE, account));
-            if matches!(stored_credential, Some(Err(_))) {
-                let message = if provider.is_vertex() { "設定画面でGoogle Vertex AIの認証情報を設定してください" } else { "設定画面でAPIキーを設定してください" };
-                summary_message.set(Some(message.to_string()));
-                summary_busy.set(false);
-                return;
-            }
-
-            let segments = match state.store.list_transcript_segments(session_id) {
-                Ok(segments) => segments,
-                Err(e) => {
-                    summary_message.set(Some(format!("文字起こしの取得に失敗しました: {e}")));
-                    summary_busy.set(false);
-                    return;
-                }
-            };
-            let turns = transcript::to_turns(&segments);
-            if turns.is_empty() {
-                summary_message.set(Some("要約対象の文字起こしがありません".to_string()));
-                summary_busy.set(false);
-                return;
-            }
-            // Task: "要約プロンプトテンプレート" (`settings::Settings`'s dedicated
-            // section, independent of the provider/model picker above) — `None`
-            // when unset falls through to `summarize::DEFAULT_SYSTEM_PROMPT` via
-            // `crate::summary_template::summarize_options_for`, exactly like
-            // `SummarizeOptions::new` alone used to behave before this template
-            // existed.
-            let summary_template = state.app_settings.lock().unwrap().summary_template.clone();
-            let options = crate::summary_template::summarize_options_for(model.clone(), summary_template);
-
-            // Four independent ways to build a `Summarizer`: a `claude`/`codex` CLI
-            // subprocess (#59, no API key needed), Google Vertex AI (a GCP project/
-            // location/service-account bundle), a local Ollama server (no API key,
-            // just an optional base URL), and plain `genai` with a stored API key —
-            // see `SummaryProvider::uses_cli`/`is_vertex`. Once built, all four are
-            // invoked identically below.
-            let summarizer: Result<Box<dyn summarize::Summarizer>, String> = if let Some(backend) = provider.cli_backend() {
-                Ok(Box::new(summarize::CliSummarizer(backend)))
-            } else if provider.is_vertex() {
-                // `matches!(stored_credential, Some(Err(_)))` already returned above,
-                // so this is `Some(Ok(_))`.
-                let raw = stored_credential.and_then(Result::ok).unwrap_or_default();
-                match serde_json::from_str::<summarize::VertexCredentials>(&raw) {
-                    Ok(credentials) => Ok(Box::new(summarize::GenaiSummarizer(summarize::build_vertex_client(credentials)))),
-                    Err(e) => Err(format!("認証情報の読み込みに失敗しました: {e}")),
-                }
-            } else if provider == SummaryProvider::Ollama {
-                // No stored credential to check (`api_key_account() == None`, so
-                // `stored_credential` above is `None` and was skipped) — just an
-                // optional base URL from the non-secret `AppSettings` store (#67),
-                // read fresh here since it can change independently of which
-                // provider is selected (see the "Ollama設定" section in
-                // `settings::Settings`).
-                let base_url = state.app_settings.lock().unwrap().ollama_base_url.clone();
-                Ok(Box::new(summarize::GenaiSummarizer(summarize::build_ollama_client(base_url))))
-            } else if let Some(account) = provider.api_key_account() {
-                // Every remaining provider (non-CLI, non-Vertex, non-Ollama) has an
-                // `api_key_account()`, so this is the only reachable arm here.
-                let resolver = summarize::credential_store_auth_resolver(state.credential_store.clone(), account);
-                let client = genai::Client::builder().with_auth_resolver(resolver).build();
-                Ok(Box::new(summarize::GenaiSummarizer(client)))
-            } else {
-                // Unreachable: every API-key-free provider (`ClaudeCli`/`Codex` via
-                // `cli_backend()` above, `Ollama` above) is handled by an earlier
-                // arm. Kept as a safety net (a plain client with no auth resolver)
-                // rather than `unreachable!()`, in case a future provider variant
-                // adds `api_key_account() == None` without also adding a dedicated
-                // branch here.
-                let client = genai::Client::builder().build();
-                Ok(Box::new(summarize::GenaiSummarizer(client)))
-            };
-
-            let result: Result<String, String> = match summarizer {
-                Ok(summarizer) => summarizer.summarize(&turns, &options).await.map_err(|e| e.to_string()),
-                Err(e) => Err(e),
-            };
-
-            match result {
+            match state.summary_consumer.generate_summary_now(session_id).await {
                 Ok(text) => {
-                    let summary = Summary {
-                        session_id,
-                        text: text.clone(),
-                        provider_model: format!("{}/{}", provider.key(), model),
-                        generated_at: chrono::Utc::now(),
-                    };
-                    if let Err(e) = state.store.insert_summary(&summary) {
-                        tracing::warn!(error = %e, "failed to persist summary");
-                    }
                     summary_text.set(Some(text));
                 }
                 Err(e) => summary_message.set(Some(format!("要約に失敗しました: {e}"))),
             }
+            // Also trigger via Rhai plugins
+            state.rhai_engine.trigger_manual_summary(&state.broker, session_id);
             summary_busy.set(false);
         }
     };

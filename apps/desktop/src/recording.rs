@@ -6,6 +6,7 @@ use chrono::Utc;
 use recorder_domain::{AudioManifest, CaptureManifest, ConsentManifest, RemoteSourceKind, SessionId, SessionManifest, SessionSummary, TrackKind};
 
 use crate::app_state::{ActiveRecording, AppState};
+use crate::ui_consumer::TranscriptBuffer;
 
 /// Placeholder until Phase 1A gets real device-selection UI (design.md §14.1's
 /// "マイク選択"/"会議音声ソース選択" — not in task #8's stated scope list for this
@@ -59,6 +60,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
     // `None` (no settings-UI toggle yet, or never saved) means "off", matching
     // the pre-existing always-send-everything behavior.
     let silence_gate_enabled_for_task = state.app_settings.lock().unwrap().silence_gate_enabled.unwrap_or(false);
+    let broker_for_task = state.broker.clone();
 
     // WASAPI's callback timeout — how long the capture loop waits for a device
     // callback before treating it as a stall (`capture_windows::capture_loop`).
@@ -78,11 +80,21 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
             Some(credential_store_for_task),
             Some(transcription_status_for_task),
             silence_gate_enabled_for_task,
+            Some(&broker_for_task),
         )
         .await
     });
 
-    *state.current.lock().unwrap() = Some(ActiveRecording { session_id, manifest, started_at: Instant::now(), level, transcription_status, shutdown_tx, join_handle });
+    *state.current.lock().unwrap() = Some(ActiveRecording {
+        session_id,
+        manifest,
+        started_at: Instant::now(),
+        level,
+        transcription_status,
+        shutdown_tx,
+        join_handle,
+        transcript_buffer: TranscriptBuffer::new(),
+    });
     Ok(session_id)
 }
 
@@ -142,6 +154,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
         level,
         shutdown_tx,
         join_handle,
+        transcript_buffer: TranscriptBuffer::new(),
     });
     Ok(session_id)
 }
@@ -164,7 +177,12 @@ pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
 pub fn start(state: &AppState) -> Result<SessionId, String> {
     let manifest = build_manifest();
     let session_id = manifest.session_id;
-    *state.current.lock().unwrap() = Some(ActiveRecording { session_id, manifest, started_at: Instant::now() });
+    *state.current.lock().unwrap() = Some(ActiveRecording {
+        session_id,
+        manifest,
+        started_at: Instant::now(),
+        transcript_buffer: TranscriptBuffer::new(),
+    });
     Ok(session_id)
 }
 
