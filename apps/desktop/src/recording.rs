@@ -8,13 +8,15 @@ use recorder_domain::{AudioManifest, CaptureManifest, ConsentManifest, RemoteSou
 use crate::app_state::{ActiveRecording, AppState};
 use crate::ui_consumer::TranscriptBuffer;
 
-/// Placeholder until Phase 1A gets real device-selection UI (design.md §14.1's
-/// "マイク選択"/"会議音声ソース選択" — not in task #8's stated scope list for this
-/// pass) — both tracks follow whatever WASAPI resolves as the current default
-/// device, matching `capture-windows`'s own `DeviceRole::Console` default.
+/// Sentinel meaning "whatever the OS reports as its current default device" —
+/// `AppSettings::microphone_device_id`/`render_device_id`'s `None` (nothing chosen
+/// in the settings screen's "録音デバイス" section yet) resolves to this before
+/// being recorded in the manifest, matching `capture-windows`'s/`capture-macos`'s
+/// own `"default"` sentinel (see `capture_windows::device_select::
+/// resolve_capture_device`).
 const DEFAULT_DEVICE_ID: &str = "default";
 
-fn build_manifest() -> SessionManifest {
+fn build_manifest(mic_device_id: &str, render_device_id: &str) -> SessionManifest {
     let now = Utc::now();
     SessionManifest {
         schema_version: 1,
@@ -24,8 +26,8 @@ fn build_manifest() -> SessionManifest {
         platform: std::env::consts::OS.to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         capture: CaptureManifest {
-            microphone_device_id: DEFAULT_DEVICE_ID.to_string(),
-            remote_source_id: DEFAULT_DEVICE_ID.to_string(),
+            microphone_device_id: mic_device_id.to_string(),
+            remote_source_id: render_device_id.to_string(),
             remote_source_kind: RemoteSourceKind::EndpointLoopback,
         },
         audio: AudioManifest { sample_rate: 48_000, segment_duration_ms: 30_000, tracks: vec![TrackKind::SelfMic, TrackKind::RemoteAudio] },
@@ -35,7 +37,15 @@ fn build_manifest() -> SessionManifest {
 
 #[cfg(windows)]
 pub fn start(state: &AppState) -> Result<SessionId, String> {
-    let manifest = build_manifest();
+    // The settings screen's "録音デバイス" section (`settings.rs`) persists these as
+    // `Some(DeviceInfo::id)` once the user picks a specific mic/speaker; `None`
+    // (nothing chosen yet) falls back to `DEFAULT_DEVICE_ID`, matching the
+    // pre-existing "always follow the OS default" behavior.
+    let (mic_device_id, render_device_id) = {
+        let settings = state.app_settings.lock().unwrap();
+        (settings.microphone_device_id.clone(), settings.render_device_id.clone())
+    };
+    let manifest = build_manifest(mic_device_id.as_deref().unwrap_or(DEFAULT_DEVICE_ID), render_device_id.as_deref().unwrap_or(DEFAULT_DEVICE_ID));
     let session_id = manifest.session_id;
 
     let level = std::sync::Arc::new(std::sync::Mutex::new(app_service::LevelSnapshot::default()));
@@ -81,6 +91,8 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
             Some(transcription_status_for_task),
             silence_gate_enabled_for_task,
             Some(&broker_for_task),
+            mic_device_id,
+            render_device_id,
         )
         .await
     });
@@ -111,7 +123,12 @@ pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
 /// `crates/capture-macos`'s crate doc comment and README.
 #[cfg(target_os = "macos")]
 pub fn start(state: &AppState) -> Result<SessionId, String> {
-    let manifest = build_manifest();
+    // See the `#[cfg(windows)]` `start` above's identical comment.
+    let (mic_device_id, render_device_id) = {
+        let settings = state.app_settings.lock().unwrap();
+        (settings.microphone_device_id.clone(), settings.render_device_id.clone())
+    };
+    let manifest = build_manifest(mic_device_id.as_deref().unwrap_or(DEFAULT_DEVICE_ID), render_device_id.as_deref().unwrap_or(DEFAULT_DEVICE_ID));
     let session_id = manifest.session_id;
 
     let level = std::sync::Arc::new(std::sync::Mutex::new(
@@ -143,6 +160,8 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
             &store,
             adapter.as_ref(),
             Some(level_for_task),
+            mic_device_id,
+            render_device_id,
         )
         .await
     });
@@ -175,7 +194,7 @@ pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
 /// actually recorded from a real microphone — see this crate's README.
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn start(state: &AppState) -> Result<SessionId, String> {
-    let manifest = build_manifest();
+    let manifest = build_manifest(DEFAULT_DEVICE_ID, DEFAULT_DEVICE_ID);
     let session_id = manifest.session_id;
     *state.current.lock().unwrap() = Some(ActiveRecording {
         session_id,

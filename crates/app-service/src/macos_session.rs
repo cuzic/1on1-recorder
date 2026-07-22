@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use capture_api::rebinding::EndpointId;
 use capture_macos::device_watch::DeviceWatch;
 use recorder_domain::{SessionManifest, SessionSummary, UploadAdapter};
 use session_store::SessionStore;
@@ -23,6 +24,9 @@ use crate::pipeline::run_pipeline;
 /// caller since `SCStreamConfiguration` takes them as an explicit request rather
 /// than reporting a queried default.
 ///
+/// `mic_device_id`/`render_device_id` — see `run_windows_capture_session`'s doc
+/// comment on the same two parameters; identical contract here.
+///
 /// **Not yet run on real macOS hardware or verified against a real build at all**
 /// — see `capture-macos`'s crate doc comment and this crate's README.
 #[allow(clippy::too_many_arguments)]
@@ -36,9 +40,11 @@ pub async fn run_macos_capture_session(
     store: &SessionStore,
     adapter: &dyn UploadAdapter,
     level_sink: Option<Arc<Mutex<LevelSnapshot>>>,
+    mic_device_id: Option<String>,
+    render_device_id: Option<String>,
 ) -> Result<SessionSummary, AppServiceError> {
     let collected = tokio::task::spawn_blocking(move || {
-        run_capture_blocking(sample_rate_hz, channels, shutdown_rx, level_sink)
+        run_capture_blocking(sample_rate_hz, channels, shutdown_rx, level_sink, mic_device_id, render_device_id)
     })
     .await
     .expect("capture supervisor thread panicked")
@@ -91,6 +97,8 @@ fn run_capture_blocking(
     channels: u16,
     shutdown_rx: crossbeam_channel::Receiver<()>,
     level_sink: Option<Arc<Mutex<LevelSnapshot>>>,
+    mic_device_id: Option<String>,
+    render_device_id: Option<String>,
 ) -> Result<CollectedFrames, capture_macos::CaptureError> {
     let mut supervisor = MacosSupervisor::new(sample_rate_hz, channels);
     let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
@@ -100,8 +108,20 @@ fn run_capture_blocking(
     let _device_watch = DeviceWatch::start(watch_tx)?;
 
     // design.md §16.5, identical policy to Windows: pin to whatever's currently in
-    // use for the rest of the session, never FollowDefault.
-    let (mic_endpoint_id, render_endpoint_id) = supervisor.resolve_current_defaults()?;
+    // use for the rest of the session, never FollowDefault. `mic_device_id`/
+    // `render_device_id` — see `windows_session::run_capture_blocking`'s identical
+    // comment on skipping `resolve_current_defaults` per-track when the caller
+    // already has an explicit choice.
+    let needs_defaults = mic_device_id.is_none() || render_device_id.is_none();
+    let defaults = if needs_defaults { Some(supervisor.resolve_current_defaults()?) } else { None };
+    let mic_endpoint_id = match mic_device_id {
+        Some(id) => EndpointId(id),
+        None => defaults.as_ref().expect("resolved when mic_device_id is None").0.clone(),
+    };
+    let render_endpoint_id = match render_device_id {
+        Some(id) => EndpointId(id),
+        None => defaults.as_ref().expect("resolved when render_device_id is None").1.clone(),
+    };
     supervisor.pin_devices(mic_endpoint_id, render_endpoint_id);
     supervisor.start_all()?;
 
