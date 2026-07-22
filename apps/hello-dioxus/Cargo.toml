@@ -1,0 +1,10 @@
+[package]
+name = "hello-dioxus"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal dioxus-desktop smoke test — isolates whether a launch failure is in this app's own startup code or in the dioxus-desktop/WebView2 stack itself (see docs/decouple-summary-transcription.md-era debugging: the desktop app has never actually been run on real Windows hardware before, only cross-compile-checked)."
+
+[dependencies]
+dioxus = { version = "0.7", features = ["desktop"] }

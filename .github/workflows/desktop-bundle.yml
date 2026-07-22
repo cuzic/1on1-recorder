@@ -125,6 +125,65 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Diagnostic-only job (see apps/hello-dioxus's own Cargo.toml description): a
+  # minimal dioxus-desktop app with no app-specific startup code (no
+  # SessionStore/CredentialStore/tray icon/RhaiEngine), to isolate whether a
+  # "double-click does nothing" failure on real Windows hardware is in this
+  # repo's own app code or in the dioxus-desktop/wry/WebView2 stack itself —
+  # `bundle-windows` above has only ever been cross-compile-checked before, never
+  # actually run on real Windows hardware. Not wired to the `v*.*.*` tag trigger
+  # since it isn't a release artifact; workflow_dispatch only.
+  hello-dioxus-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Exclude Cargo/target dirs from Windows Defender scanning
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+          Add-MpPreference -ExclusionPath "${{ github.workspace }}"
+          Add-MpPreference -ExclusionProcess "cargo.exe"
+          Add-MpPreference -ExclusionProcess "rustc.exe"
+          Add-MpPreference -ExclusionProcess "link.exe"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install dx (dioxus-cli, prebuilt)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/DioxusLabs/dioxus/releases/download/v$env:DX_VERSION/dx-x86_64-pc-windows-msvc.zip" -OutFile dx.zip
+          Expand-Archive -Path dx.zip -DestinationPath dx-bin
+          echo "$PWD\dx-bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: dx --version
+        run: dx --version
+
+      - name: Build (portable exe, no installer)
+        run: dx build --platform desktop --package hello-dioxus --release
+
+      - name: Verify build output and stage for upload
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path .\target\dx\hello-dioxus\release\windows\app -File -Include "*.exe" -Recurse
+          if (-not $exe) { throw "Expected hello-dioxus.exe was not produced." }
+          $exe | ForEach-Object { $_.FullName }
+          New-Item -ItemType Directory -Path .\dist -Force | Out-Null
+          Copy-Item $exe[0].FullName -Destination .\dist\hello-dioxus-windows-x64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hello-dioxus-windows
+          path: dist/hello-dioxus-windows-x64.exe
+          if-no-files-found: error
+          retention-days: 30
+
   bundle-macos:
     runs-on: macos-latest
     steps:

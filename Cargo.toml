@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "apps/desktop",
+    "apps/hello-dioxus",
     "crates/app-service",
     "crates/audio-timeline",
     "crates/capture-api",
@@ -31,6 +32,11 @@ members = [
 # request it with `cargo build -p stt-whisper` / `--workspace` instead. See
 # crates/stt-whisper/Cargo.toml's top comment and crates/stt-whisper/src/lib.rs's
 # module doc comment for the full rationale.
+#
+# `apps/hello-dioxus` is excluded for a different reason: it's a throwaway
+# dioxus-desktop smoke test (see its Cargo.toml description), not part of the
+# app proper — kept opt-in (`cargo build -p hello-dioxus` / `--workspace`) so it
+# doesn't show up in every regular `desktop`-focused build/check.
 default-members = [
     "apps/desktop",
     "crates/app-service",
