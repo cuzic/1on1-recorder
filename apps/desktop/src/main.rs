@@ -60,11 +60,36 @@ fn migrate_from_old_tauri_app_data_dir(base: &std::path::Path, new_dir: &std::pa
     }
 }
 
-fn main() {
-    tracing_subscriber::fmt::try_init().ok();
+/// Logs to `<app_data_dir>/app.log` in addition to stdout — a GUI-subsystem exe
+/// launched by double-click has no console to write stdout to at all, and a
+/// panic before any window appears (the exact class of bug this is here to
+/// catch — this app has so far only ever been cross-compile-checked, never
+/// actually run on real Windows hardware) would otherwise leave no trace.
+/// Falls back to stdout-only if the log file can't be opened (e.g. read-only
+/// app data dir) rather than failing startup over a logging problem.
+fn init_logging(app_data_dir: &std::path::Path) {
+    let log_path = app_data_dir.join("app.log");
+    match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(file) => {
+            tracing_subscriber::fmt().with_writer(std::sync::Mutex::new(file)).with_ansi(false).init();
+        }
+        Err(err) => {
+            tracing_subscriber::fmt::try_init().ok();
+            tracing::warn!(%err, ?log_path, "failed to open log file, logging to stdout only");
+        }
+    }
 
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!(%info, "panic");
+    }));
+}
+
+fn main() {
     let app_data_dir = app_data_dir();
     std::fs::create_dir_all(&app_data_dir).ok();
+    init_logging(&app_data_dir);
+
+    tracing::info!("1on1 Recorder starting up (pid {})", std::process::id());
 
     let config = Config::load(app_data_dir.clone());
     std::fs::create_dir_all(&config.sessions_root).ok();
