@@ -42,23 +42,32 @@ impl SummaryConsumer {
         Self { broker, store, credential_store, app_settings }
     }
 
-    /// Spawns an auto-summary task for `session_id`. Returns immediately; the task
-    /// runs until `UtteranceEnded(SessionEnd)` arrives, then generates the summary.
-    /// Does nothing if the broker is not configured (broker is always configured
+    /// Spawns an auto-summary task for `session_id`. Returns immediately; the
+    /// task runs until `UtteranceEnded(SessionEnd)` (published only by the
+    /// Windows-only `app_service::live_transcription`) **or**
+    /// `session.{id}.stopped` (published by every platform's
+    /// `apps/desktop/src/recording.rs::stop`) arrives, then generates the
+    /// summary — see `stop_subject`'s use below. Before that second signal
+    /// existed, this task waited for an event that macOS/dev-fallback builds
+    /// never publish at all, meaning auto-summary silently never ran there
+    /// (and the task leaked for the rest of the process's life). Does
+    /// nothing if the broker is not configured (broker is always configured
     /// in this app, but the parameter is kept for future IPC mode).
-    pub fn spawn_auto_summary(&self, session_id: SessionId) {
+    pub fn spawn_auto_summary(&self, session_id: SessionId) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
             this.run_auto_summary(session_id).await;
-        });
+        })
     }
 
     async fn run_auto_summary(&self, session_id: SessionId) {
         let segment_subject = format!("transcription.{session_id}.segment.finalized");
         let utterance_subject = format!("transcription.{session_id}.utterance.ended");
+        let stop_subject = format!("session.{session_id}.stopped");
 
         let mut segment_rx = self.broker.subscribe(&segment_subject);
         let mut utterance_rx = self.broker.subscribe(&utterance_subject);
+        let mut stop_rx = self.broker.subscribe(&stop_subject);
 
         // 1. Load existing finalized segments from SessionStore (late-join support)
         let existing = self.store.list_transcript_segments(session_id).unwrap_or_default();
@@ -140,6 +149,12 @@ impl SummaryConsumer {
                         }
                     }
                 }
+                // See `spawn_auto_summary`'s doc comment — whichever of this
+                // or the real `SessionEnd` above arrives first finalizes the
+                // summary from whatever `turns` have been collected so far;
+                // the other, if it still arrives afterward, is simply never
+                // observed once this task has already exited.
+                _ = stop_rx.recv() => break,
             }
         }
 

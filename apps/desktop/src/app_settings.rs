@@ -76,6 +76,34 @@ pub struct AppSettings {
     /// Remote track is captured from (a speaker/output device — WASAPI loopback
     /// on Windows, ScreenCaptureKit's system-audio capture on macOS).
     pub render_device_id: Option<String>,
+    /// Whether the live conversation-hint feature (`plugins/default/hint.rhai`,
+    /// driven by `RhaiEngine::spawn_hint_debounce_driver`) is on at all.
+    /// `None`/`Some(false)` (the default) means disabled: an unconfigured
+    /// install would otherwise fail its RAG query and `log_error` on every
+    /// debounce interval of every recording, forever, with nothing telling
+    /// the user why — opt-in avoids that. `actions::start_recording` reads
+    /// this directly and simply doesn't spawn `hint_consumer`/the debounce
+    /// driver at all when it's off (no wasted subscriptions either).
+    pub hint_enabled: Option<bool>,
+    /// Which `rag_search` provider (`crates/rhai-engine/src/rag.rs`)
+    /// `plugins/default/hint.rhai` queries for live conversation hints —
+    /// `"cloudflare"` | `"vertex"` | `"bedrock"`. `None` (the default) means
+    /// `"cloudflare"`, matching `hint.rhai`'s own fallback when this setting
+    /// is unset.
+    pub hint_provider: Option<String>,
+    /// Silence-detection debounce window (seconds) for hint generation —
+    /// `RhaiEngine::spawn_hint_debounce_driver` (`crates/rhai-engine`) reads
+    /// this directly and drives a real, non-blocking timer (via the
+    /// `timed-fsm` crate) that fires `on_hint_timeout()` this many seconds
+    /// after the *last* finalized segment, not merely "N seconds since the
+    /// last query" — Rhai itself has no timer primitive, so this used to be
+    /// a same-named setting read from inside `hint.rhai` via `get_setting`
+    /// and only approximated as a throttle; it's Rust-side now. `None` (the
+    /// default) means 15 seconds, matching the driver's own fallback when
+    /// this setting is unset. This remains `AppSettings`'s first numeric
+    /// field with a working settings-screen `<input type="number">` (unlike
+    /// `silence_gate_enabled`, which has none yet).
+    pub hint_debounce_seconds: Option<u32>,
 }
 
 impl AppSettings {
@@ -147,6 +175,9 @@ mod tests {
             silence_gate_enabled: Some(true),
             microphone_device_id: Some("{0.0.1.00000000}.{aaaa}".to_string()),
             render_device_id: Some("{0.0.0.00000000}.{bbbb}".to_string()),
+            hint_enabled: Some(true),
+            hint_provider: Some("vertex".to_string()),
+            hint_debounce_seconds: Some(30),
         };
 
         settings.save(dir.path()).expect("save");
@@ -182,6 +213,9 @@ mod tests {
         assert_eq!(loaded.silence_gate_enabled, None);
         assert_eq!(loaded.microphone_device_id, None);
         assert_eq!(loaded.render_device_id, None);
+        assert_eq!(loaded.hint_enabled, None);
+        assert_eq!(loaded.hint_provider, None);
+        assert_eq!(loaded.hint_debounce_seconds, None);
     }
 
     #[test]

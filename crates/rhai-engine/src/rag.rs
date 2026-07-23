@@ -7,14 +7,22 @@
 //! Supported providers:
 //! - `vertex` — Google Cloud Vertex AI RAG Engine / Discovery Engine
 //! - `bedrock` — Amazon Bedrock Knowledge Bases
+//! - `cloudflare` — Cloudflare AI Search (formerly "AutoRAG")
 //! - (more to be added: Azure Cognitive Search, Hyperspell, Contextual.ai, etc.)
 
 mod bedrock;
+mod cloudflare;
 mod vertex;
 
 use std::sync::Arc;
 
 use crate::SettingsProvider;
+
+// Re-exported one hop at a time (here, then again in `lib.rs`) so
+// `apps/desktop/src/settings.rs` can write credentials under the exact same
+// `(service, account)` pair `cloudflare::search` reads — without depending on
+// `crates/rhai-engine` internals any deeper than these two constants.
+pub use cloudflare::{CloudflareCredentials, CLOUDFLARE_AI_SEARCH_ACCOUNT, CREDENTIAL_SERVICE as CLOUDFLARE_CREDENTIAL_SERVICE};
 
 /// Dispatches a RAG search to the appropriate provider.
 pub async fn rag_search(
@@ -29,6 +37,7 @@ pub async fn rag_search(
     match provider.as_str() {
         "vertex" => vertex::search(&query, &options, credential_store, settings).await,
         "bedrock" => bedrock::search(&query, &options, credential_store, settings).await,
+        "cloudflare" => cloudflare::search(&query, &options, credential_store, settings).await,
         other => Err(format!("unsupported RAG provider: {other}")),
     }
 }
@@ -46,6 +55,7 @@ pub async fn rag_index(
     match provider.as_str() {
         "vertex" => vertex::index(documents, &options, credential_store, settings).await,
         "bedrock" => bedrock::index(documents, &options, credential_store, settings).await,
+        "cloudflare" => cloudflare::index(documents, &options, credential_store, settings).await,
         other => Err(format!("unsupported RAG provider: {other}")),
     }
 }

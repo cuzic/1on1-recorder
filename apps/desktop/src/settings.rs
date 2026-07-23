@@ -391,6 +391,13 @@ fn summary_provider_is_configured(state: &AppState, provider: SummaryProvider) -
     }
 }
 
+/// Same "設定済み"/"未設定" badge pattern as `summary_provider_is_configured`,
+/// for the Cloudflare AI Search credential `plugins/default/hint.rhai`'s
+/// `rag_search("cloudflare", ...)` reads via `crates/rhai-engine/src/rag/cloudflare.rs`.
+fn hint_cloudflare_is_configured(state: &AppState) -> bool {
+    state.credential_store.load(rhai_engine::CLOUDFLARE_CREDENTIAL_SERVICE, rhai_engine::CLOUDFLARE_AI_SEARCH_ACCOUNT).is_ok()
+}
+
 /// Status text for the "資格情報の登録" section when `provider` is CLI-based
 /// (#59) — replaces the API key form, since these providers have nothing to save.
 /// `available` is the latest [`summarize::cli_backend::CliBackend::is_available`]
@@ -671,6 +678,24 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
         move || state.app_settings.lock().unwrap().render_device_id.clone().unwrap_or_else(|| FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string())
     });
     let mut device_message = use_signal(|| None::<String>);
+
+    // ---- 会話ヒント (RAG): 有効化・プロバイダ・デバウンス秒数・Cloudflare資格情報(他の設定とは独立) ----
+    let mut hint_enabled_select = use_signal({
+        let state = state.clone();
+        move || state.app_settings.lock().unwrap().hint_enabled.unwrap_or(false)
+    });
+    let mut hint_provider_select = use_signal({
+        let state = state.clone();
+        move || state.app_settings.lock().unwrap().hint_provider.clone().unwrap_or_else(|| "cloudflare".to_string())
+    });
+    let mut hint_debounce_input = use_signal({
+        let state = state.clone();
+        move || state.app_settings.lock().unwrap().hint_debounce_seconds.map(|s| s.to_string()).unwrap_or_else(|| "15".to_string())
+    });
+    let mut hint_cloudflare_account_id_input = use_signal(String::new);
+    let mut hint_cloudflare_api_token_input = use_signal(String::new);
+    let mut hint_cloudflare_instance_input = use_signal(String::new);
+    let mut hint_message = use_signal(|| None::<String>);
 
     // ---- 要約: プロンプトテンプレートの選択(プロバイダ・モデルの選択とは独立) ----
     let mut summary_template_select = use_signal({
@@ -1002,6 +1027,91 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
         }
     };
 
+    // ==== 会話ヒント (RAG) ハンドラ ====
+
+    let onchange_hint_enabled = move |evt: FormEvent| {
+        hint_enabled_select.set(evt.checked());
+        hint_message.set(None);
+    };
+    let onchange_hint_provider = move |evt: FormEvent| {
+        hint_provider_select.set(evt.value());
+        hint_message.set(None);
+    };
+
+    // Persists `AppSettings::hint_enabled`/`hint_provider`/`hint_debounce_seconds`
+    // — same rollback-on-failed-save pattern as `save_devices` above. An empty
+    // or unparseable debounce input falls back to 15 (matching
+    // `spawn_hint_debounce_driver`'s own fallback when the setting is unset)
+    // rather than saving garbage.
+    let save_hint_settings = {
+        let state = state.clone();
+        move |_| {
+            let enabled = hint_enabled_select();
+            let provider = hint_provider_select();
+            let debounce_seconds = hint_debounce_input().trim().parse::<u32>().ok().filter(|s| *s > 0).unwrap_or(15);
+            hint_debounce_input.set(debounce_seconds.to_string());
+
+            let save_result = {
+                let mut settings = state.app_settings.lock().unwrap();
+                let previous_enabled = settings.hint_enabled;
+                let previous_provider = settings.hint_provider.clone();
+                let previous_debounce = settings.hint_debounce_seconds;
+                settings.hint_enabled = Some(enabled);
+                settings.hint_provider = Some(provider);
+                settings.hint_debounce_seconds = Some(debounce_seconds);
+                let result = settings.save(&state.app_data_dir);
+                if result.is_err() {
+                    settings.hint_enabled = previous_enabled;
+                    settings.hint_provider = previous_provider;
+                    settings.hint_debounce_seconds = previous_debounce;
+                }
+                result
+            };
+            match save_result {
+                Ok(()) => hint_message.set(Some("保存しました。次回の録音開始時から反映されます".to_string())),
+                Err(e) => hint_message.set(Some(format!("保存に失敗しました: {e}"))),
+            }
+        }
+    };
+
+    // Saves the Cloudflare AI Search credential as one JSON blob under
+    // `rhai_engine::{CLOUDFLARE_CREDENTIAL_SERVICE, CLOUDFLARE_AI_SEARCH_ACCOUNT}`
+    // — same "collect several plain `<input>`s into a typed struct, serialize,
+    // `credential_store.save`" shape as the summary Vertex AI credential above,
+    // via the shared `rhai_engine::CloudflareCredentials` type so this can
+    // never drift from the field names `rag/cloudflare.rs` actually reads.
+    let save_hint_cloudflare_credential = {
+        let state = state.clone();
+        move |_| {
+            let account_id = hint_cloudflare_account_id_input().trim().to_string();
+            let api_token = hint_cloudflare_api_token_input().trim().to_string();
+            let instance_name = hint_cloudflare_instance_input().trim().to_string();
+            if account_id.is_empty() || api_token.is_empty() || instance_name.is_empty() {
+                hint_message.set(Some("アカウントID・APIトークン・インスタンス名をすべて入力してください".to_string()));
+                return;
+            }
+
+            let credentials = rhai_engine::CloudflareCredentials { account_id, api_token, instance_name };
+            let serialized = match serde_json::to_string(&credentials) {
+                Ok(s) => s,
+                Err(e) => {
+                    hint_message.set(Some(format!("資格情報のシリアライズに失敗しました: {e}")));
+                    return;
+                }
+            };
+
+            match state.credential_store.save(rhai_engine::CLOUDFLARE_CREDENTIAL_SERVICE, rhai_engine::CLOUDFLARE_AI_SEARCH_ACCOUNT, &serialized) {
+                Ok(()) => {
+                    hint_cloudflare_account_id_input.set(String::new());
+                    hint_cloudflare_api_token_input.set(String::new());
+                    hint_cloudflare_instance_input.set(String::new());
+                    hint_message.set(Some("Cloudflareの資格情報を保存しました".to_string()));
+                }
+                Err(e) => hint_message.set(Some(format!("保存に失敗しました: {e}"))),
+            }
+        }
+    };
+
     // ==== 要約プロンプトテンプレートハンドラ ====
 
     let onchange_summary_template = move |evt: FormEvent| {
@@ -1122,6 +1232,77 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
                     p { class: "hint", "このプラットフォームでは実際のマイク/スピーカー録音に対応していないため、デバイス選択はできません(開発用のスタブ録音のみ)。" }
                 }
                 if let Some(msg) = device_message() {
+                    p { class: "status-badge", "{msg}" }
+                }
+            }
+
+            section { class: "settings-section",
+                h2 { "会話ヒント (RAG)" }
+                p { class: "hint", "録音中の会話をもとに、RAGサービスから「今話すと良さそうなこと」のヒントをリアルタイムで表示します。BYOAI(ユーザー自身のアカウント)方式です。既定では無効 — 資格情報を設定してから有効にしてください。" }
+                label { class: "consent",
+                    input {
+                        r#type: "checkbox",
+                        checked: hint_enabled_select(),
+                        onchange: onchange_hint_enabled,
+                    }
+                    "会話ヒントを有効にする"
+                }
+
+                if hint_enabled_select() {
+                    label {
+                        "使用するRAGプロバイダ"
+                        select {
+                            onchange: onchange_hint_provider,
+                            option { value: "cloudflare", selected: hint_provider_select() == "cloudflare", "Cloudflare AI Search" }
+                            option { value: "vertex", selected: hint_provider_select() == "vertex", "Google Vertex AI (要約用の資格情報を流用)" }
+                            option { value: "bedrock", selected: hint_provider_select() == "bedrock", "AWS Bedrock (⚠️ 既知の問題により現在利用不可)" }
+                        }
+                    }
+                    label {
+                        "ヒント生成までの静寂時間(秒、最後の発話からこの秒数、会話が途切れたら生成)"
+                        input {
+                            r#type: "number",
+                            min: "1",
+                            value: "{hint_debounce_input}",
+                            oninput: move |e| hint_debounce_input.set(e.value()),
+                        }
+                    }
+                    if hint_provider_select() == "cloudflare" {
+                        h3 { "Cloudflare AI Search の資格情報" }
+                        p { class: "status-badge", if hint_cloudflare_is_configured(&state) { "設定済み" } else { "未設定" } }
+                        label {
+                            "アカウントID"
+                            input {
+                                r#type: "text",
+                                value: "{hint_cloudflare_account_id_input}",
+                                oninput: move |e| hint_cloudflare_account_id_input.set(e.value()),
+                            }
+                        }
+                        label {
+                            "APIトークン"
+                            input {
+                                r#type: "password",
+                                value: "{hint_cloudflare_api_token_input}",
+                                oninput: move |e| hint_cloudflare_api_token_input.set(e.value()),
+                            }
+                        }
+                        label {
+                            "インスタンス名"
+                            input {
+                                r#type: "text",
+                                value: "{hint_cloudflare_instance_input}",
+                                oninput: move |e| hint_cloudflare_instance_input.set(e.value()),
+                            }
+                        }
+                        button { class: "primary", onclick: save_hint_cloudflare_credential, "資格情報を保存" }
+                    } else if hint_provider_select() == "vertex" {
+                        p { class: "hint", "要約機能の「Google Vertex AI」用に設定済みの資格情報をそのまま使用します。追加の設定は不要です。" }
+                    } else {
+                        p { class: "hint", "AWS Bedrock RAGは、要約機能のBedrock APIキーと資格情報の形式が競合する既知の問題により、現時点では動作しません。" }
+                    }
+                }
+                button { class: "primary", onclick: save_hint_settings, "この設定を保存" }
+                if let Some(msg) = hint_message() {
                     p { class: "status-badge", "{msg}" }
                 }
             }
