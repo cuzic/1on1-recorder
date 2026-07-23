@@ -491,21 +491,22 @@ fn load_render_devices() -> (Vec<DeviceOption>, Option<String>) {
     (Vec::new(), None)
 }
 
-/// `mic_device_select`/`render_device_select`'s one-shot `use_signal` initializer
-/// value: `saved` unchanged if it's still in `devices`, otherwise "システム既定"
-/// with a visible notice via `message` — see the call sites' doc comment on why
-/// silently keeping a stale id (with the `<select>` just happening to *display*
-/// "システム既定" because no `<option>` matches) is a trap for the next save.
-fn resolve_initial_device_selection(saved: Option<String>, devices: &[DeviceOption], mut message: Signal<Option<String>>, label: &str) -> String {
+/// `mic_device_select`/`render_device_select`'s one-shot initial value: `saved`
+/// unchanged if it's still in `devices`, otherwise "システム既定" plus `true` in
+/// the second element. Returns the stale flag instead of setting a message signal
+/// directly (Codex review finding): called once each for mic and render from two
+/// independent `use_signal` initializers, a version that set `device_message`
+/// itself would have the second call silently clobber the first's message
+/// whenever both are stale at once, dropping the mic notice entirely. The caller
+/// folds both flags into one combined `device_message` instead — see the call
+/// site's doc comment. Silently keeping a stale id (with the `<select>` just
+/// happening to *display* "システム既定" because no `<option>` matches) is a trap
+/// for the next save.
+fn resolve_initial_device_selection(saved: Option<String>, devices: &[DeviceOption]) -> (String, bool) {
     match saved {
-        Some(id) if devices.iter().any(|d| d.id == id) => id,
-        Some(_) => {
-            message.set(Some(format!(
-                "選択していた{label}が見つからないため、システム既定に切り替えました。必要であれば選び直して保存してください。"
-            )));
-            FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string()
-        }
-        None => FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string(),
+        Some(id) if devices.iter().any(|d| d.id == id) => (id, false),
+        Some(_) => (FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string(), true),
+        None => (FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string(), false),
     }
 }
 
@@ -701,29 +702,33 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
     let mut ollama_base_url_message = use_signal(|| None::<String>);
 
     // ---- 録音デバイスの選択(マイク/スピーカーが複数あるとき用、他の設定とは独立) ----
-    let mut device_message = use_signal(|| None::<String>);
-    let mut mic_devices = use_signal(load_capture_devices);
-    let mut render_devices = use_signal(load_render_devices);
+    // Resolved up front — rather than inside `mic_device_select`/`render_device_select`'s
+    // own `use_signal` initializers — so a stale mic pick and a stale render pick
+    // found at the same time fold into one combined `device_message` below (the
+    // same four-way match `refresh_devices` uses for its own re-check), instead of
+    // the second initializer's message silently overwriting the first's.
+    let initial_mic_devices = load_capture_devices();
+    let initial_render_devices = load_render_devices();
+    let saved_mic_device = state.app_settings.lock().unwrap().microphone_device_id.clone();
+    let saved_render_device = state.app_settings.lock().unwrap().render_device_id.clone();
     // Falls back to "システム既定" (rather than the saved-but-now-missing id) when
     // the saved device isn't in the freshly enumerated list — e.g. a USB headset
     // unplugged since it was chosen. Without this, the `<select>` below displays
     // "システム既定" (no `<option>` matches the stale id) while this signal still
     // holds it, so an unrelated save silently re-persists a device id that no
     // longer exists. See `resolve_initial_device_selection`'s doc comment.
-    let mut mic_device_select = use_signal({
-        let state = state.clone();
-        move || {
-            let saved = state.app_settings.lock().unwrap().microphone_device_id.clone();
-            resolve_initial_device_selection(saved, &mic_devices().0, device_message, "マイク")
-        }
+    let (initial_mic_select, mic_was_stale) = resolve_initial_device_selection(saved_mic_device, &initial_mic_devices.0);
+    let (initial_render_select, render_was_stale) = resolve_initial_device_selection(saved_render_device, &initial_render_devices.0);
+    let mut device_message = use_signal(move || match (mic_was_stale, render_was_stale) {
+        (true, true) => Some("選択していたマイクとスピーカーが見つからないため、システム既定に切り替えました。必要であれば選び直して保存してください。".to_string()),
+        (true, false) => Some("選択していたマイクが見つからないため、システム既定に切り替えました。必要であれば選び直して保存してください。".to_string()),
+        (false, true) => Some("選択していたスピーカーが見つからないため、システム既定に切り替えました。必要であれば選び直して保存してください。".to_string()),
+        (false, false) => None,
     });
-    let mut render_device_select = use_signal({
-        let state = state.clone();
-        move || {
-            let saved = state.app_settings.lock().unwrap().render_device_id.clone();
-            resolve_initial_device_selection(saved, &render_devices().0, device_message, "スピーカー")
-        }
-    });
+    let mut mic_devices = use_signal(move || initial_mic_devices);
+    let mut render_devices = use_signal(move || initial_render_devices);
+    let mut mic_device_select = use_signal(move || initial_mic_select);
+    let mut render_device_select = use_signal(move || initial_render_select);
 
     // ---- 会話ヒント (RAG): 有効化・プロバイダ・デバウンス秒数・Cloudflare資格情報(他の設定とは独立) ----
     let mut hint_enabled_select = use_signal({
