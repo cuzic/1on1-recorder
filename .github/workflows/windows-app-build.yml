@@ -211,3 +211,79 @@ jobs:
       - name: Assert audio data was actually captured
         shell: bash
         run: ./scripts/ci/assert-segment-written.sh smoke-test.raw
+
+      # 1on1ctl (apps/desktop-cli) end-to-end pass — never verified against a
+      # real running `desktop` process before this: the dev sandbox this was
+      # built in can't launch dioxus-desktop's webview at all (WebKitGTK hangs
+      # there), so `1on1ctl`'s auto-launch path (find a sibling `desktop.exe`,
+      # spawn it, poll-connect to its control socket) was only ever exercised
+      # against a hand-rolled stand-in server, never the real app. This
+      # runner's interactive desktop session (unlike a headless Linux runner,
+      # no Xvfb-equivalent needed) is what makes that possible here. Reuses
+      # this job's already-configured CABLE Output default recording device
+      # and microphone consent seeding above, since `1on1ctl start` drives
+      # the same real WASAPI capture path the smoke test above just proved
+      # works on this runner.
+      - name: Build desktop + 1on1ctl
+        run: |
+          cargo build -p desktop --target x86_64-pc-windows-msvc
+          cargo build -p desktop-cli --target x86_64-pc-windows-msvc
+
+      - name: 1on1ctl E2E — status/start/status/stop against a real running app
+        # `cargo build`'s own output layout (not `dx build`'s) puts
+        # `1on1ctl.exe` and `desktop.exe` side by side in the same
+        # target/<triple>/debug/ directory — exactly what `1on1ctl`'s
+        # `locate_gui_binary` (a sibling-of-`current_exe()` lookup) expects,
+        # so no extra packaging step should be needed for the auto-launch
+        # below to find `desktop.exe`.
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $ctl = ".\target\x86_64-pc-windows-msvc\debug\1on1ctl.exe"
+
+          # No `desktop.exe` is running yet — this specifically exercises
+          # `1on1ctl`'s auto-launch-and-wait path, not just a plain connect.
+          & $ctl status
+          if ($LASTEXITCODE -ne 0) { throw "initial 'status' (auto-launch) failed: exit $LASTEXITCODE" }
+
+          # Consent is auto-confirmed by the control server for CLI-triggered
+          # starts (see control_server.rs's dispatch) — no extra step needed.
+          & $ctl start
+          if ($LASTEXITCODE -ne 0) { throw "'start' failed: exit $LASTEXITCODE" }
+
+          Start-Sleep -Seconds 5
+
+          # `--json` rather than the human-readable output: both the
+          # recording and not-recording branches of the plain-text output
+          # literally start with the word "recording" (`recording: N経過` vs
+          # `recording: 停止中`), so a plain substring match on that word
+          # can't actually distinguish the two states.
+          $statusJson = & $ctl --json status
+          Write-Host $statusJson
+          if ($LASTEXITCODE -ne 0) { throw "'status' while recording failed: exit $LASTEXITCODE" }
+          if (-not ($statusJson -match '"recording":true')) { throw "expected status to report recording:true, got: $statusJson" }
+
+          & $ctl stop
+          if ($LASTEXITCODE -ne 0) { throw "'stop' failed: exit $LASTEXITCODE" }
+
+      - name: Assert a session was actually written to disk
+        # Confirms more than "the control socket answered" — that the full
+        # start -> real WASAPI capture -> stop -> session-store pipeline ran
+        # to completion, the same way `assert-segment-written.sh` does for
+        # the lower-level smoke test above.
+        shell: pwsh
+        run: |
+          $sessionsRoot = Join-Path $env:APPDATA "1on1-recorder\sessions"
+          if (-not (Test-Path $sessionsRoot)) { throw "sessions root not found: $sessionsRoot" }
+          $sessions = Get-ChildItem $sessionsRoot -Directory -ErrorAction SilentlyContinue
+          if (-not $sessions -or $sessions.Count -eq 0) { throw "no session directories found under $sessionsRoot" }
+          Write-Host "Found $($sessions.Count) session directory(ies): $($sessions.Name -join ', ')"
+
+      - name: Stop the desktop app
+        # `desktop` hides to the tray rather than exiting on window close
+        # (WindowCloseBehaviour::WindowHides) — kill it explicitly so it
+        # doesn't linger past this job. `if: always()` so a failed assertion
+        # above still cleans up rather than leaving the runner mid-recording.
+        if: always()
+        shell: pwsh
+        run: Stop-Process -Name desktop -Force -ErrorAction SilentlyContinue
