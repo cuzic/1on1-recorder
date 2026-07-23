@@ -131,6 +131,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same reason as Tier 0's identical step: `desktop` (built later in this
+      # job) depends on stt-google, whose build.rs shells out to `protoc` —
+      # without this, "Build desktop + 1on1ctl" below fails with "Could not
+      # find `protoc`" (confirmed: this job doesn't inherit Tier 0's protoc
+      # setup, they're separate jobs/runners).
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -224,10 +233,20 @@ jobs:
       # and microphone consent seeding above, since `1on1ctl start` drives
       # the same real WASAPI capture path the smoke test above just proved
       # works on this runner.
-      - name: Build desktop + 1on1ctl
-        run: |
-          cargo build -p desktop --target x86_64-pc-windows-msvc
-          cargo build -p desktop-cli --target x86_64-pc-windows-msvc
+      # Two separate steps (not one `run:` block with two `cargo build`
+      # lines) deliberately — pwsh's default `run:` shell does NOT stop on a
+      # failing external command's exit code (unlike bash's implicit `-e`
+      # elsewhere in this workflow); a failing `cargo build -p desktop`
+      # followed by a *succeeding* `cargo build -p desktop-cli` in the same
+      # script would leave `$LASTEXITCODE` at 0 and the step reported as
+      # green with `desktop.exe` silently never having been produced. Splitting
+      # into two steps makes each one's own exit code (checked by the runner
+      # itself at the step boundary) the source of truth.
+      - name: Build desktop
+        run: cargo build -p desktop --target x86_64-pc-windows-msvc
+
+      - name: Build 1on1ctl
+        run: cargo build -p desktop-cli --target x86_64-pc-windows-msvc
 
       - name: 1on1ctl E2E — status/start/status/stop against a real running app
         # `cargo build`'s own output layout (not `dx build`'s) puts

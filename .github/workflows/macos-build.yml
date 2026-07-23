@@ -104,6 +104,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same reason as Tier 0's identical step: `desktop` (built later in this
+      # job) depends on stt-google, whose build.rs shells out to `protoc` —
+      # without this, "Build desktop + 1on1ctl" below fails with "Could not
+      # find `protoc`" (confirmed: this job doesn't inherit Tier 0's protoc
+      # setup, they're separate jobs/runners).
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
