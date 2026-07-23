@@ -86,7 +86,11 @@ async fn try_register_remote_session(store: &SessionStore, adapter: &dyn UploadA
 /// crash-mid-session; `Finalized` would misleadingly imply the API confirmed
 /// it). Local capture still fully succeeded — every segment committed to
 /// segment-store — so the returned `SessionSummary` is real, not a placeholder;
-/// only the remote registration/upload/finalize steps never happened.
+/// only the remote registration/upload/finalize steps never happened. This is
+/// genuinely `recoverable`, not just optimistically labeled: `session-store`'s
+/// `failed_sessions_missing_remote_registration` finds exactly this state, and
+/// `recover_incomplete_sessions` retries `create_session` for it (via
+/// `session_manifest`) on every future app startup until it succeeds.
 fn finalize_local_only_session(store: &SessionStore, session_id: SessionId, total_duration_ms: u64) -> Result<SessionSummary, AppServiceError> {
     store.update_capture_state(
         session_id,

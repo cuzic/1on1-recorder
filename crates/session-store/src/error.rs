@@ -18,6 +18,8 @@ pub enum StoreError {
     InvalidTrackKind(#[from] recorder_domain::ParseTrackKindError),
     #[error("invalid audio codec stored in database: {0}")]
     InvalidAudioCodec(#[from] recorder_domain::ParseAudioCodecError),
+    #[error("invalid remote source kind stored in database: {0}")]
+    InvalidRemoteSourceKind(#[from] recorder_domain::ParseRemoteSourceKindError),
     #[error("invalid timestamp stored in database: {0}")]
     InvalidTimestamp(#[from] chrono::ParseError),
 }

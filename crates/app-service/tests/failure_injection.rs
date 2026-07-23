@@ -114,7 +114,7 @@ async fn disk_write_failure_during_recording_leaves_a_recoverable_session() {
 }
 
 #[tokio::test]
-async fn network_outage_from_session_start_captures_locally_and_recovery_still_skips_remote_finalize() {
+async fn network_outage_from_session_start_captures_locally_and_is_recovered_once_the_network_is_back() {
     let unreachable = unreachable_base_url().await;
     let adapter = HttpUploadClient::new(unreachable, Duration::from_millis(200), Arc::new(StaticTokenProvider("test-token".to_string()))).with_max_attempts(1);
 
@@ -133,10 +133,11 @@ async fn network_outage_from_session_start_captures_locally_and_recovery_still_s
     assert_eq!(store.capture_state(session_id).unwrap(), CaptureState::Recording);
     assert_eq!(store.remote_session_id(session_id).unwrap(), None);
 
-    // Once the network is back, recovery correctly does *not* try to resume this
-    // session automatically — see recover_incomplete_sessions's documented known
-    // gap (no remote_session_id means no way to know the remote side ever heard
-    // about it, and no SessionManifest getter yet to retry create_session).
+    // Once the network is back, recovery reconstructs this session's manifest
+    // (session_manifest) and retries create_session (try_register_remote_session
+    // in session_lifecycle.rs) — no segments were ever captured in this test (the
+    // failure happened before any capture started), so finalizing succeeds
+    // immediately with zero segments.
     let (working_base_url, _server_state) = spawn_test_server(NO_FAULTS).await;
     let working_adapter = HttpUploadClient::new(working_base_url, Duration::from_secs(5), Arc::new(StaticTokenProvider("test-token".to_string())));
     let sessions_root = tempfile::tempdir().unwrap();
@@ -144,16 +145,9 @@ async fn network_outage_from_session_start_captures_locally_and_recovery_still_s
         .await
         .unwrap();
 
-    // `Recording` is one of `reconcile_on_startup`'s non-terminal tags (see
-    // session-store's `NON_TERMINAL_CAPTURE_STATE_TAGS`), so it does get marked
-    // `Failed { recoverable: true }` — but with no `remote_session_id`,
-    // `recover_incomplete_sessions` skips straight past trying to finalize it
-    // (the documented known gap).
-    assert_eq!(recovered, Vec::<SessionId>::new());
-    match store.capture_state(session_id).unwrap() {
-        CaptureState::Failed { recoverable, .. } => assert!(recoverable),
-        other => panic!("expected Failed{{recoverable: true}} from reconcile_on_startup, got {other:?}"),
-    }
+    assert_eq!(recovered, vec![session_id]);
+    assert!(store.remote_session_id(session_id).unwrap().is_some(), "recovery should have registered a remote session");
+    assert_eq!(store.capture_state(session_id).unwrap(), CaptureState::Finalized);
 }
 
 /// The direct regression test for #4: a remote API that is unreachable for the
@@ -204,10 +198,36 @@ async fn run_pipeline_survives_remote_registration_failure_and_preserves_local_c
     }
 
     assert_eq!(store.remote_session_id(session_id).unwrap(), None);
+    // update_capture_state's ended_at CASE WHEN must cover 'failed', not just
+    // 'finalized' — otherwise a session marked Failed here would keep
+    // ended_at NULL in the ledger forever, even though the in-memory
+    // SessionSummary above already reports a real ended_at.
+    let listed = store.list_sessions().unwrap();
+    let listed_session = listed.iter().find(|s| s.session_id == session_id).expect("session should be listed");
+    assert!(listed_session.ended_at.is_some(), "ended_at should be set once the session is marked Failed, not left NULL");
     match store.capture_state(session_id).unwrap() {
         CaptureState::Failed { recoverable, .. } => assert!(recoverable),
         other => panic!("expected Failed{{recoverable: true}} (never registered remotely), got {other:?}"),
     }
+
+    // The actual point of `recoverable: true`: once the remote API is reachable
+    // again — even in a *later* process (simulated here via a fresh
+    // `recover_incomplete_sessions` call) — this session's real captured audio
+    // gets registered, uploaded, and finalized, instead of sitting stranded
+    // forever with no remote_session_id.
+    let (working_base_url, server_state) = spawn_test_server(NO_FAULTS).await;
+    let working_adapter = HttpUploadClient::new(working_base_url, Duration::from_secs(5), Arc::new(StaticTokenProvider("test-token".to_string())));
+    let recovered = recover_incomplete_sessions(&store, &working_adapter, sessions_root.path(), SEGMENT_DURATION_MS as u64, SAMPLE_RATE, 1, Duration::from_millis(10), 10)
+        .await
+        .unwrap();
+
+    assert_eq!(recovered, vec![session_id]);
+    assert!(store.remote_session_id(session_id).unwrap().is_some());
+    assert_eq!(store.capture_state(session_id).unwrap(), CaptureState::Finalized);
+    assert!(store.pending_uploads(session_id).unwrap().is_empty());
+
+    let stats = server_state.stats.lock().unwrap();
+    assert_eq!(stats.segment_write_counts.len(), 2, "both previously-local-only segments should have been uploaded during recovery");
 }
 
 #[tokio::test]
