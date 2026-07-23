@@ -19,14 +19,29 @@ use crate::upload_worker::run_until_drained;
 /// records exactly these two.
 const PHASE_1A_TRACKS: [TrackKind; 2] = [TrackKind::SelfMic, TrackKind::RemoteAudio];
 
-/// design.md §10: `Idle -> Preparing -> Recording`. Registers the session locally
-/// and with the remote API. Call once, before capture begins.
-pub async fn begin_session(store: &SessionStore, adapter: &dyn UploadAdapter, manifest: &SessionManifest) -> Result<RemoteSession, AppServiceError> {
+/// design.md §10: `Idle -> Preparing -> Recording`. Registers the session
+/// locally, and attempts to register it with the remote API too — but a
+/// credential/network failure on that second half is **not** fatal to local
+/// capture (unlike a `store.create_session` failure, which is a real local bug
+/// and still propagates): local recording has no dependency on the remote API
+/// being reachable, matching the resilience `commit_and_upload_track` already
+/// gives per-segment upload failures. Returns `None` in that case — the caller
+/// still proceeds to capture and commit segments locally, and `run_pipeline`
+/// gets one more chance to register a remote session before finalizing.
+pub async fn begin_session(store: &SessionStore, adapter: &dyn UploadAdapter, manifest: &SessionManifest) -> Result<Option<RemoteSession>, AppServiceError> {
     store.create_session(manifest)?; // starts in CaptureState::Preparing
-    let remote = adapter.create_session(manifest).await?;
-    store.set_remote_session_id(manifest.session_id, &remote.remote_session_id)?;
-    store.update_capture_state(manifest.session_id, &CaptureState::Recording)?;
-    Ok(remote)
+    match adapter.create_session(manifest).await {
+        Ok(remote) => {
+            store.set_remote_session_id(manifest.session_id, &remote.remote_session_id)?;
+            store.update_capture_state(manifest.session_id, &CaptureState::Recording)?;
+            Ok(Some(remote))
+        }
+        Err(err) => {
+            tracing::warn!(%err, "remote session registration failed; proceeding with local-only capture");
+            store.update_capture_state(manifest.session_id, &CaptureState::Recording)?;
+            Ok(None)
+        }
+    }
 }
 
 /// design.md §10: `Recording -> Stopping -> Finalizing -> Finalized`. Call once
@@ -56,21 +71,22 @@ pub async fn end_session(
 ///    process instance left mid-flight and marks them `Failed { recoverable: true }`
 ///    (design.md §10's diagram: `Failed -> Finalizing`, to persist whatever data
 ///    is available rather than discard it).
-/// 2. For each, `segment_store::scan_and_recover` re-scans its segment
+/// 2. Also collects any session already `Failed` with no `remote_session_id` —
+///    whether from a crash reconciled just now, or from a *clean* end-of-session
+///    that never managed to register with the remote API at all (see
+///    `pipeline::finalize_local_only_session`, which leaves sessions in exactly
+///    this state so they're retried here rather than silently dropped).
+/// 3. For each, `segment_store::scan_and_recover` re-scans its segment
 ///    directories — discarding orphaned `.partial` files, registering any
-///    complete-but-unregistered `.opus` file the crash landed between rename and
-///    DB registration.
-/// 3. Resumes uploading and finalizes each one, *if* it already has a
-///    `remote_session_id` (i.e. `UploadAdapter::create_session` had already
-///    succeeded before the crash — the overwhelmingly common case, since that
-///    call happens once at the very start of a session).
-///
-/// A session that crashed *before* ever getting a `remote_session_id` is a known
-/// gap: reconstructing its original `SessionManifest` to retry `create_session`
-/// needs a `SessionManifest` getter `session-store` doesn't have yet (its
-/// `sessions` table has all the necessary fields, just not a query that
-/// reassembles them) — such a session is left `Failed`/un-finalized rather than
-/// silently dropped, but isn't resumed automatically.
+///    complete-but-unregistered `.opus` file a crash landed between rename and
+///    DB registration (a no-op for a cleanly-ended local-only session, since
+///    nothing was left mid-write).
+/// 4. If it still has no `remote_session_id`, reconstructs its original
+///    `SessionManifest` via `SessionStore::session_manifest` and retries
+///    `UploadAdapter::create_session` — on success, proceeds to finalize exactly
+///    like a session that already had one; on failure, it's left `Failed` (i.e.
+///    still matched by step 2 on the *next* restart, so this keeps retrying
+///    indefinitely rather than being a one-shot attempt).
 #[allow(clippy::too_many_arguments)]
 pub async fn recover_incomplete_sessions(
     store: &SessionStore,
@@ -82,10 +98,15 @@ pub async fn recover_incomplete_sessions(
     upload_retry_interval: Duration,
     max_upload_passes: u32,
 ) -> Result<Vec<SessionId>, AppServiceError> {
-    let recovered_ids = store.reconcile_on_startup()?;
+    let mut session_ids = store.reconcile_on_startup()?;
+    for session_id in store.failed_sessions_missing_remote_registration()? {
+        if !session_ids.contains(&session_id) {
+            session_ids.push(session_id);
+        }
+    }
     let mut finalized = Vec::new();
 
-    for session_id in recovered_ids {
+    for session_id in session_ids {
         let session_dir = session_dir_for(sessions_root, session_id);
         for track in PHASE_1A_TRACKS {
             // Best-effort: a directory that was never created (e.g. that track
@@ -93,8 +114,12 @@ pub async fn recover_incomplete_sessions(
             let _ = segment_store::scan_and_recover(&session_dir, session_id, track, nominal_segment_duration_ms, sample_rate, channels, store);
         }
 
-        let Some(remote_session_id) = store.remote_session_id(session_id)? else {
-            continue; // known gap — see this function's doc comment
+        let remote_session_id = match store.remote_session_id(session_id)? {
+            Some(id) => id,
+            None => match try_register_remote_session(store, adapter, session_id).await? {
+                Some(id) => id,
+                None => continue, // still unreachable — retried again on the next restart
+            },
         };
         let remote = RemoteSession { session_id, remote_session_id };
         let total_duration_ms = estimate_total_duration_ms(store, session_id, nominal_segment_duration_ms)?;
@@ -104,6 +129,28 @@ pub async fn recover_incomplete_sessions(
     }
 
     Ok(finalized)
+}
+
+/// Reconstructs `session_id`'s manifest and makes one attempt at
+/// `UploadAdapter::create_session` — the recovery-time counterpart of
+/// `pipeline::try_register_remote_session`. Returns `None` (not an error) for
+/// either an unreachable/unauthenticated remote API or a missing manifest (the
+/// latter should be unreachable in practice, since every session row is written
+/// by `store.create_session` with every field this reconstructs).
+async fn try_register_remote_session(store: &SessionStore, adapter: &dyn UploadAdapter, session_id: SessionId) -> Result<Option<String>, AppServiceError> {
+    let Some(manifest) = store.session_manifest(session_id)? else {
+        return Ok(None);
+    };
+    match adapter.create_session(&manifest).await {
+        Ok(remote) => {
+            store.set_remote_session_id(session_id, &remote.remote_session_id)?;
+            Ok(Some(remote.remote_session_id))
+        }
+        Err(err) => {
+            tracing::warn!(%err, "remote session registration still failing during recovery; will retry on next restart");
+            Ok(None)
+        }
+    }
 }
 
 /// Shared tail of `end_session` and `recover_incomplete_sessions`: drain pending

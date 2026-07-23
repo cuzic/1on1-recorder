@@ -18,12 +18,24 @@ impl From<app_service::LevelSnapshot> for LevelSnapshot {
     }
 }
 
-/// Dev-mode (non-Windows) placeholder level, deterministic from elapsed time only
-/// (no randomness/system clock, so it's reproducible) — ported from
-/// `spikes/spike-05-tauri-tray`'s `synthesize_level`. Real capture only exists on
-/// Windows (`capture-windows`), so this is what lets the UI be exercised locally;
-/// it is never used when `cfg(windows)` (see `recording.rs`).
-#[cfg(not(windows))]
+/// Same field mapping as the Windows `From` impl above — the two source types
+/// are structurally identical but distinct (see `app_state::ActiveRecording`'s
+/// doc comment on why macOS's isn't unified with Windows's at the crate root).
+#[cfg(target_os = "macos")]
+impl From<app_service::macos_frame_collector::LevelSnapshot> for LevelSnapshot {
+    fn from(s: app_service::macos_frame_collector::LevelSnapshot) -> Self {
+        Self { self_rms: s.self_rms, self_peak: s.self_peak, remote_rms: s.remote_rms, remote_peak: s.remote_peak }
+    }
+}
+
+/// Dev-mode (non-Windows, non-macOS) placeholder level, deterministic from
+/// elapsed time only (no randomness/system clock, so it's reproducible) —
+/// ported from `spikes/spike-05-tauri-tray`'s `synthesize_level`. Real capture
+/// only exists on Windows (`capture-windows`) and macOS (`capture-macos`), so
+/// this is what lets the UI be exercised locally on other platforms; it is
+/// never used when `cfg(windows)` or `cfg(target_os = "macos")` (see
+/// `recording.rs`/`status.rs`).
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn dev_placeholder_level(elapsed: std::time::Duration) -> LevelSnapshot {
     let t = elapsed.as_secs_f32();
     let envelope = 0.5 + 0.5 * (t * 0.3).sin();

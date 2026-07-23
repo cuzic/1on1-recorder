@@ -3,14 +3,7 @@
 //! end of a session, and resuming/idempotently re-sending after a restart. Builds
 //! directly on stage 3's `session_lifecycle`/`upload_worker` (task #11).
 
-// Only used by `disk_write_failure_during_recording_leaves_a_recoverable_session`
-// below, which is itself `#[cfg(unix)]` (it relies on Unix file permission bits to
-// simulate a disk-write failure — see that test's own comment) — gated the same way
-// here so a non-unix `--tests` type-check (e.g. this crate's Windows cross-compile
-// check) doesn't flag these as unused imports.
-#[cfg(unix)]
 use app_service::pseudo_source::{generate_frames, nominal_frame_interval_ns, PseudoSourceConfig};
-#[cfg(unix)]
 use app_service::run_pipeline;
 use app_service::{begin_session, end_session, recover_incomplete_sessions};
 use chrono::Utc;
@@ -121,7 +114,7 @@ async fn disk_write_failure_during_recording_leaves_a_recoverable_session() {
 }
 
 #[tokio::test]
-async fn network_outage_from_session_start_leaves_a_local_only_session_recovery_correctly_skips() {
+async fn network_outage_from_session_start_captures_locally_and_is_recovered_once_the_network_is_back() {
     let unreachable = unreachable_base_url().await;
     let adapter = HttpUploadClient::new(unreachable, Duration::from_millis(200), Arc::new(StaticTokenProvider("test-token".to_string()))).with_max_attempts(1);
 
@@ -129,19 +122,22 @@ async fn network_outage_from_session_start_leaves_a_local_only_session_recovery_
     let session_id = SessionId::new();
     let manifest = manifest(session_id);
 
-    let result = begin_session(&store, &adapter, &manifest).await;
-    assert!(result.is_err(), "create_session should fail when the network is unreachable from the start");
+    let remote = begin_session(&store, &adapter, &manifest).await.unwrap();
+    assert!(remote.is_none(), "create_session failing should not fail begin_session — local capture proceeds");
 
     // The local ledger already has the session (from session-store's own
-    // create_session call, which happens before the remote one) — but it never
-    // advanced past Preparing, and has no remote_session_id yet.
-    assert_eq!(store.capture_state(session_id).unwrap(), CaptureState::Preparing);
+    // create_session call, which happens before the remote one) — remote
+    // registration failing is non-fatal, so it still advances to Recording
+    // (local capture has no dependency on the remote API), just with no
+    // remote_session_id yet.
+    assert_eq!(store.capture_state(session_id).unwrap(), CaptureState::Recording);
     assert_eq!(store.remote_session_id(session_id).unwrap(), None);
 
-    // Once the network is back, recovery correctly does *not* try to resume this
-    // session automatically — see recover_incomplete_sessions's documented known
-    // gap (no remote_session_id means no way to know the remote side ever heard
-    // about it, and no SessionManifest getter yet to retry create_session).
+    // Once the network is back, recovery reconstructs this session's manifest
+    // (session_manifest) and retries create_session (try_register_remote_session
+    // in session_lifecycle.rs) — no segments were ever captured in this test (the
+    // failure happened before any capture started), so finalizing succeeds
+    // immediately with zero segments.
     let (working_base_url, _server_state) = spawn_test_server(NO_FAULTS).await;
     let working_adapter = HttpUploadClient::new(working_base_url, Duration::from_secs(5), Arc::new(StaticTokenProvider("test-token".to_string())));
     let sessions_root = tempfile::tempdir().unwrap();
@@ -149,16 +145,89 @@ async fn network_outage_from_session_start_leaves_a_local_only_session_recovery_
         .await
         .unwrap();
 
-    // `Preparing` is one of `reconcile_on_startup`'s non-terminal tags (see
-    // session-store's `NON_TERMINAL_CAPTURE_STATE_TAGS`), so it does get marked
-    // `Failed { recoverable: true }` — but with no `remote_session_id`,
-    // `recover_incomplete_sessions` skips straight past trying to finalize it
-    // (the documented known gap).
-    assert_eq!(recovered, Vec::<SessionId>::new());
+    assert_eq!(recovered, vec![session_id]);
+    assert!(store.remote_session_id(session_id).unwrap().is_some(), "recovery should have registered a remote session");
+    assert_eq!(store.capture_state(session_id).unwrap(), CaptureState::Finalized);
+}
+
+/// The direct regression test for #4: a remote API that is unreachable for the
+/// *entire* session (both `begin_session`'s initial attempt and `run_pipeline`'s
+/// one extra attempt right before finalizing) must not lose any locally
+/// captured audio — every segment should still land in segment-store and on
+/// disk, and `run_pipeline` should return a real `Ok(summary)`, not an error.
+#[tokio::test]
+async fn run_pipeline_survives_remote_registration_failure_and_preserves_local_capture() {
+    let unreachable = unreachable_base_url().await;
+    let adapter = HttpUploadClient::new(unreachable, Duration::from_millis(200), Arc::new(StaticTokenProvider("test-token".to_string()))).with_max_attempts(1);
+
+    let store = SessionStore::open_in_memory().unwrap();
+    let sessions_root = tempfile::tempdir().unwrap();
+    let session_id = SessionId::new();
+    let manifest = manifest(session_id);
+    let session_dir = sessions_root.path().join(session_id.to_string());
+
+    let duration_secs = 30u32; // 1 segment per track
+    let config = PseudoSourceConfig { duration_secs, frame_interval_ms: 20, sample_rate: SAMPLE_RATE, channels: 1, tone_freq_hz: 440.0 };
+    let self_frames = generate_frames(TrackKind::SelfMic, &config);
+    let remote_frames = generate_frames(TrackKind::RemoteAudio, &config);
+    let total_duration_ns = duration_secs as u64 * 1_000_000_000;
+
+    let summary = run_pipeline(
+        &manifest,
+        &self_frames,
+        &remote_frames,
+        nominal_frame_interval_ns(&config),
+        nominal_frame_interval_ns(&config),
+        total_duration_ns,
+        &session_dir,
+        32_000,
+        &store,
+        &adapter,
+    )
+    .await
+    .expect("local capture must succeed even though the remote API is never reachable");
+
+    assert_eq!(summary.segment_counts_by_track.get(&TrackKind::SelfMic), Some(&1));
+    assert_eq!(summary.segment_counts_by_track.get(&TrackKind::RemoteAudio), Some(&1));
+    assert_eq!(summary.total_duration_ms, duration_secs as u64 * 1000);
+
+    for track in [TrackKind::SelfMic, TrackKind::RemoteAudio] {
+        let segments = store.segments_for_track(session_id, track).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].local_path.exists(), "segment file should exist on disk: {:?}", segments[0].local_path);
+    }
+
+    assert_eq!(store.remote_session_id(session_id).unwrap(), None);
+    // update_capture_state's ended_at CASE WHEN must cover 'failed', not just
+    // 'finalized' — otherwise a session marked Failed here would keep
+    // ended_at NULL in the ledger forever, even though the in-memory
+    // SessionSummary above already reports a real ended_at.
+    let listed = store.list_sessions().unwrap();
+    let listed_session = listed.iter().find(|s| s.session_id == session_id).expect("session should be listed");
+    assert!(listed_session.ended_at.is_some(), "ended_at should be set once the session is marked Failed, not left NULL");
     match store.capture_state(session_id).unwrap() {
         CaptureState::Failed { recoverable, .. } => assert!(recoverable),
-        other => panic!("expected Failed{{recoverable: true}} from reconcile_on_startup, got {other:?}"),
+        other => panic!("expected Failed{{recoverable: true}} (never registered remotely), got {other:?}"),
     }
+
+    // The actual point of `recoverable: true`: once the remote API is reachable
+    // again — even in a *later* process (simulated here via a fresh
+    // `recover_incomplete_sessions` call) — this session's real captured audio
+    // gets registered, uploaded, and finalized, instead of sitting stranded
+    // forever with no remote_session_id.
+    let (working_base_url, server_state) = spawn_test_server(NO_FAULTS).await;
+    let working_adapter = HttpUploadClient::new(working_base_url, Duration::from_secs(5), Arc::new(StaticTokenProvider("test-token".to_string())));
+    let recovered = recover_incomplete_sessions(&store, &working_adapter, sessions_root.path(), SEGMENT_DURATION_MS as u64, SAMPLE_RATE, 1, Duration::from_millis(10), 10)
+        .await
+        .unwrap();
+
+    assert_eq!(recovered, vec![session_id]);
+    assert!(store.remote_session_id(session_id).unwrap().is_some());
+    assert_eq!(store.capture_state(session_id).unwrap(), CaptureState::Finalized);
+    assert!(store.pending_uploads(session_id).unwrap().is_empty());
+
+    let stats = server_state.stats.lock().unwrap();
+    assert_eq!(stats.segment_write_counts.len(), 2, "both previously-local-only segments should have been uploaded during recovery");
 }
 
 #[tokio::test]
@@ -177,7 +246,7 @@ async fn network_outage_through_end_of_session_is_recovered_and_finalized_idempo
 
     // Session starts while the network is up: create_session succeeds, one
     // segment commits and uploads fine.
-    let remote = begin_session(&store, &working_adapter, &manifest).await.unwrap();
+    let remote = begin_session(&store, &working_adapter, &manifest).await.unwrap().expect("working adapter should register a remote session");
     let pcm = vec![0.0f32; SAMPLE_RATE as usize];
     let encoded = encode_segment_to_ogg_opus(&pcm, 32_000).unwrap();
     let seq0 = SegmentRequest { session_id, track: TrackKind::SelfMic, sequence: 0, timeline_start_ms: 0, sample_rate: SAMPLE_RATE, channels: 1 };

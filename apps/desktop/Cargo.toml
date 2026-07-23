@@ -16,6 +16,8 @@ chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+control-protocol = { path = "../../crates/control-protocol" }
+interprocess = { version = "2", features = ["tokio"] }
 recorder-domain = { path = "../../crates/recorder-domain" }
 session-store = { path = "../../crates/session-store" }
 credential-store = { path = "../../crates/credential-store" }

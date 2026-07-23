@@ -6,6 +6,7 @@ use chrono::Utc;
 use recorder_domain::{AudioManifest, CaptureManifest, ConsentManifest, RemoteSourceKind, SessionId, SessionManifest, SessionSummary, TrackKind};
 
 use crate::app_state::{ActiveRecording, AppState};
+use crate::hint_consumer::HintBuffer;
 use crate::ui_consumer::TranscriptBuffer;
 
 /// Sentinel meaning "whatever the OS reports as its current default device" —
@@ -33,6 +34,22 @@ fn build_manifest(mic_device_id: &str, render_device_id: &str) -> SessionManifes
         audio: AudioManifest { sample_rate: 48_000, segment_duration_ms: 30_000, tracks: vec![TrackKind::SelfMic, TrackKind::RemoteAudio] },
         consent: ConsentManifest { confirmed_by_user: true, confirmed_at: now },
     }
+}
+
+/// Tells every session-scoped background task (`ui_consumer`, `hint_consumer`,
+/// `RhaiEngine::spawn_session`, `RhaiEngine::spawn_hint_debounce_driver`,
+/// `SummaryConsumer::spawn_auto_summary`) that this session is actually over,
+/// so each one can finalize (if it needs to — auto-summary) and exit — see
+/// those modules' own doc comments for why none of them can reliably detect
+/// this on their own: several wait for `UtteranceEnded(SessionEnd)`, which
+/// only the Windows-only `app_service::live_transcription` ever publishes.
+/// A subject nobody is (or is still) subscribed to is a silent no-op, not an
+/// error — this is safe to call unconditionally regardless of which
+/// optional consumers (e.g. hints, if disabled) were ever spawned for this
+/// session, or whether some of them have already ended via a real
+/// `SessionEnd` broadcast by the time this runs.
+fn publish_session_stopped(state: &AppState, session_id: SessionId) {
+    let _ = state.broker.publish_bytes(&format!("session.{session_id}.stopped"), Vec::new());
 }
 
 #[cfg(windows)]
@@ -106,6 +123,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
         shutdown_tx,
         join_handle,
         transcript_buffer: TranscriptBuffer::new(),
+        hint_buffer: HintBuffer::new(),
     });
     Ok(session_id)
 }
@@ -113,8 +131,45 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
 #[cfg(windows)]
 pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
     let active = state.current.lock().unwrap().take().ok_or_else(|| "not recording".to_string())?;
-    active.shutdown_tx.send(()).map_err(|e| format!("failed to signal shutdown: {e}"))?;
-    active.join_handle.await.map_err(|e| format!("capture task panicked: {e}"))?.map_err(|e| e.to_string())
+    let session_id = active.session_id;
+
+    // Wrapped in a block (rather than `?`-returning directly from `stop`) so
+    // that a failed shutdown signal or a capture-task panic can't skip the
+    // `publish_session_stopped` call below — an earlier version of this
+    // function *did* return early via `?` on exactly these two error paths,
+    // silently leaking every session-scoped background task (and skipping
+    // auto-summary) on a capture-task panic, i.e. the precise failure this
+    // whole redesign exists to prevent.
+    //
+    // `shutdown_tx.send`'s error is deliberately NOT `?`-propagated: a send
+    // failure means `shutdown_rx` was already dropped, i.e. the capture task
+    // already returned (successfully, or with a real error) *before* this
+    // call. The earlier version of this function treated that send failure
+    // itself as the stop error ("failed to signal shutdown: sending on a
+    // disconnected channel") and never awaited `join_handle` at all — masking
+    // whatever `app_service::run_windows_capture_session` actually failed
+    // with. Always awaiting `join_handle` (which resolves immediately in this
+    // case, since the task has already finished) surfaces the real result
+    // instead.
+    let result = async {
+        if let Err(err) = active.shutdown_tx.send(()) {
+            tracing::warn!(%err, "shutdown signal not delivered (capture task already exited) — awaiting its result directly");
+        }
+        active.join_handle.await.map_err(|e| format!("capture task panicked: {e}"))?.map_err(|e| e.to_string())
+    }
+    .await;
+
+    // Published *after* the capture task (and with it,
+    // `app_service::live_transcription`'s own `UtteranceEnded(SessionEnd)`
+    // publish) has fully resolved, whether or not that resolved
+    // successfully — see `publish_session_stopped`'s doc comment. On
+    // Windows the real `SessionEnd` normally already finalized
+    // auto-summary/hints by this point, making this call a no-op; it's the
+    // only signal at all on platforms without live transcription, and the
+    // only one at all if the capture task panicked before publishing its
+    // own `SessionEnd`.
+    publish_session_stopped(state, session_id);
+    result
 }
 
 /// The macOS analogue of the `#[cfg(windows)]` `start` above — real
@@ -174,6 +229,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
         shutdown_tx,
         join_handle,
         transcript_buffer: TranscriptBuffer::new(),
+        hint_buffer: HintBuffer::new(),
     });
     Ok(session_id)
 }
@@ -181,8 +237,25 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
 #[cfg(target_os = "macos")]
 pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
     let active = state.current.lock().unwrap().take().ok_or_else(|| "not recording".to_string())?;
-    active.shutdown_tx.send(()).map_err(|e| format!("failed to signal shutdown: {e}"))?;
-    active.join_handle.await.map_err(|e| format!("capture task panicked: {e}"))?.map_err(|e| e.to_string())
+    let session_id = active.session_id;
+
+    // See the `#[cfg(windows)]` `stop` above's identical comment on why this
+    // is wrapped in a block rather than `?`-returning directly, and why the
+    // `shutdown_tx.send` error is deliberately not `?`-propagated.
+    let result = async {
+        if let Err(err) = active.shutdown_tx.send(()) {
+            tracing::warn!(%err, "shutdown signal not delivered (capture task already exited) — awaiting its result directly");
+        }
+        active.join_handle.await.map_err(|e| format!("capture task panicked: {e}"))?.map_err(|e| e.to_string())
+    }
+    .await;
+
+    // macOS has no live-transcription pipeline at all yet (see
+    // `capture-macos`'s doc comment), so — success or failure above — this
+    // is the *only* signal auto-summary/hints ever get that the session
+    // actually ended here.
+    publish_session_stopped(state, session_id);
+    result
 }
 
 /// No real capture backend exists on this platform (neither `capture-windows` nor
@@ -201,6 +274,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
         manifest,
         started_at: Instant::now(),
         transcript_buffer: TranscriptBuffer::new(),
+        hint_buffer: HintBuffer::new(),
     });
     Ok(session_id)
 }
@@ -210,6 +284,7 @@ pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
     use app_service::pseudo_source::{generate_frames, nominal_frame_interval_ns, PseudoSourceConfig};
 
     let active = state.current.lock().unwrap().take().ok_or_else(|| "not recording".to_string())?;
+    let session_id = active.session_id;
     let duration_secs = active.started_at.elapsed().as_secs().max(1) as u32;
     let session_dir = state.config.sessions_root.join(active.session_id.to_string());
 
@@ -219,7 +294,12 @@ pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
     let total_duration_ns = duration_secs as u64 * 1_000_000_000;
     let interval_ns = nominal_frame_interval_ns(&config);
 
-    app_service::run_pipeline(&active.manifest, &self_frames, &remote_frames, interval_ns, interval_ns, total_duration_ns, &session_dir, state.config.bitrate_bps, &state.store, state.adapter.as_ref())
+    let result = app_service::run_pipeline(&active.manifest, &self_frames, &remote_frames, interval_ns, interval_ns, total_duration_ns, &session_dir, state.config.bitrate_bps, &state.store, state.adapter.as_ref())
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    // No real capture/live-transcription pipeline on this platform at all —
+    // see `publish_session_stopped`'s doc comment — so this is unconditionally
+    // the only signal auto-summary/hints ever get here.
+    publish_session_stopped(state, session_id);
+    result
 }

@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use recorder_domain::{AudioCodec, AudioSegment, CaptureState, SessionId, SessionManifest, TrackKind, UploadState};
+use recorder_domain::{
+    AudioCodec, AudioManifest, AudioSegment, CaptureManifest, CaptureState, ConsentManifest, RemoteSourceKind, SessionId, SessionManifest, TrackKind,
+    UploadState,
+};
 use rusqlite::{named_params, params, Connection, OptionalExtension};
 
 use crate::error::StoreError;
@@ -190,6 +193,81 @@ impl SessionStore {
         })
     }
 
+    /// Reconstructs a session's original `SessionManifest` from `sessions` (plus
+    /// `tracks` for `AudioManifest::tracks`) — every field `create_session` wrote
+    /// is read back here, so a session that never got a `remote_session_id` (no
+    /// crash needed; see `app-service::pipeline::finalize_local_only_session`) can
+    /// still retry `UploadAdapter::create_session` on a later restart without the
+    /// original in-memory manifest ever having survived. Returns `None` only if
+    /// `session_id` doesn't exist at all.
+    pub fn session_manifest(&self, session_id: SessionId) -> Result<Option<SessionManifest>, StoreError> {
+        let session_id_str = session_id.to_string();
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT schema_version, started_at, ended_at, platform, app_version,
+                    microphone_device_id, remote_source_id, remote_source_kind,
+                    sample_rate, segment_duration_ms,
+                    consent_confirmed_by_user, consent_confirmed_at
+             FROM sessions WHERE session_id = ?1",
+            params![session_id_str],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, u32>(8)?,
+                    row.get::<_, u32>(9)?,
+                    row.get::<_, bool>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            },
+        );
+        let (schema_version, started_at, ended_at, platform, app_version, microphone_device_id, remote_source_id, remote_source_kind, sample_rate, segment_duration_ms, consent_confirmed_by_user, consent_confirmed_at) = match row {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(other) => return Err(StoreError::Sqlite(other)),
+        };
+
+        let mut stmt = conn.prepare("SELECT track FROM tracks WHERE session_id = ?1")?;
+        let tracks = stmt
+            .query_map(params![session_id_str], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|t| t.parse::<TrackKind>())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Some(SessionManifest {
+            schema_version,
+            session_id,
+            started_at: DateTime::parse_from_rfc3339(&started_at)?.with_timezone(&Utc),
+            ended_at: ended_at.map(|s| DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc))).transpose()?,
+            platform,
+            app_version,
+            capture: CaptureManifest { microphone_device_id, remote_source_id, remote_source_kind: remote_source_kind.parse::<RemoteSourceKind>()? },
+            audio: AudioManifest { sample_rate, segment_duration_ms, tracks },
+            consent: ConsentManifest { confirmed_by_user: consent_confirmed_by_user, confirmed_at: DateTime::parse_from_rfc3339(&consent_confirmed_at)?.with_timezone(&Utc) },
+        }))
+    }
+
+    /// Sessions stuck exactly the way `app-service::pipeline::finalize_local_only_session`
+    /// (and, before it, a crash reconciled by `reconcile_on_startup` with no
+    /// `remote_session_id`) leaves them: `Failed` (so capture itself is done, one
+    /// way or another) but never registered with the remote API at all. Distinct
+    /// from `pending_uploads` (which is per-segment and needs a `RemoteSession`
+    /// already) — this is the set `recover_incomplete_sessions` retries
+    /// `create_session` for via `session_manifest` above.
+    pub fn failed_sessions_missing_remote_registration(&self) -> Result<Vec<SessionId>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT session_id FROM sessions WHERE capture_state_tag = 'failed' AND remote_session_id IS NULL")?;
+        let ids = stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter().map(|s| s.parse::<SessionId>().map_err(|_| StoreError::SessionNotFound(s))).collect()
+    }
+
     pub fn capture_state(&self, session_id: SessionId) -> Result<CaptureState, StoreError> {
         let session_id_str = session_id.to_string();
         let conn = self.conn.lock().unwrap();
@@ -258,7 +336,7 @@ impl SessionStore {
                 capture_state_recoverable = :recoverable,
                 capture_state_reason = :reason,
                 updated_at = :now,
-                ended_at = CASE WHEN :tag = 'finalized' AND ended_at IS NULL THEN :now ELSE ended_at END
+                ended_at = CASE WHEN :tag IN ('finalized', 'failed') AND ended_at IS NULL THEN :now ELSE ended_at END
              WHERE session_id = :session_id",
             named_params! {
                 ":tag": tag,

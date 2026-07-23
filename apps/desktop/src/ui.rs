@@ -14,12 +14,12 @@ use crate::actions;
 use crate::app_state::AppState;
 use crate::export;
 use crate::gap_retranscription::{self, GapRetranscribeState};
+use crate::hint_consumer::HintState;
 use crate::history;
 use crate::settings::{self, Screen};
 use crate::status::Status;
 use crate::transcript::{self, TimelineItem};
 use crate::transcription_status;
-use crate::ui_consumer;
 
 const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
 
@@ -160,6 +160,23 @@ button.gear {
   padding: 0.5em;
   border: 1px solid #444;
   border-radius: 8px;
+}
+.hint-panel {
+  width: 100%;
+  padding: 0.5em 0.75em;
+  border: 1px solid #7a6a2a;
+  border-radius: 8px;
+  background: rgba(255, 200, 50, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 0.2em;
+}
+.hint-panel-text {
+  margin: 0;
+}
+.hint-panel-meta {
+  font-size: 0.8em;
+  opacity: 0.6;
 }
 .bubble-row {
   display: flex;
@@ -427,6 +444,12 @@ pub fn App() -> Element {
     // tracked as a plain loop-local `Option<String>` (not a signal) since nothing
     // outside this future reads it.
     let mut transcript_segments = use_signal(Vec::<TranscriptSegment>::new);
+    // `hint.rhai`'s live "what to talk about now" suggestion for whichever
+    // session is currently *recording* — unlike `transcript_segments`, hints
+    // are ephemeral (never persisted to `SessionStore`), so this only ever
+    // has a value while `selected_session_id` is the actively-recording
+    // session, and clears otherwise (see the poll loop below).
+    let mut current_hint = use_signal(|| None::<HintState>);
     // Task #92: gaps (task #90) for whichever session `transcript_segments` above
     // is currently showing, and per-gap client-side state for the "この区間を
     // 再文字起こしする" button (#91) each renders — a gap missing from the map
@@ -522,18 +545,22 @@ pub fn App() -> Element {
                     // During live recording, read from the broker-backed
                     // TranscriptBuffer for real-time updates. Otherwise, read
                     // from SessionStore for historical sessions.
-                    let segments = {
+                    let (segments, hint) = {
                         let current = state.current.lock().unwrap();
                         if current.as_ref().is_some_and(|a| a.session_id == id) {
-                            current.as_ref().unwrap().transcript_buffer.take()
+                            let active = current.as_ref().unwrap();
+                            (active.transcript_buffer.take(), active.hint_buffer.take())
                         } else {
-                            state.store.list_transcript_segments(id).unwrap_or_default()
+                            (state.store.list_transcript_segments(id).unwrap_or_default(), None)
                         }
                     };
                     transcript_segments.set(segments);
+                    current_hint.set(hint);
                     if let Ok(session_gaps) = state.store.gaps_for_session(id) {
                         gaps.set(session_gaps);
                     }
+                } else {
+                    current_hint.set(None);
                 }
 
                 status.set(new_status);
@@ -569,6 +596,10 @@ pub fn App() -> Element {
         let session_gaps = session_id.and_then(|id| selection_reload_state.store.gaps_for_session(id).ok()).unwrap_or_default();
         gaps.set(session_gaps);
         gap_retranscribe_state.set(HashMap::new());
+        // Hints are ephemeral (see `current_hint`'s doc comment) — a picked
+        // historical session never has one, and switching selection shouldn't
+        // show the previous live session's stale hint even for a moment.
+        current_hint.set(None);
     });
 
     // design.md's force-quit recovery (task #11): resume any session a previous
@@ -603,23 +634,11 @@ pub fn App() -> Element {
         busy.set(true);
         match actions::start_recording(&start_state) {
             Ok(s) => {
+                // ui_consumer/auto-summary/Rhai plugin dispatch are spawned by
+                // `actions::start_recording` itself now, so both this button and
+                // the control-server-backed CLI get identical wiring.
                 if let Some(id) = s.last_session_id.as_deref().and_then(|id| id.parse::<SessionId>().ok()) {
                     selected_session_id.set(Some(id));
-                    // Spawn UI Consumer: subscribes to broker events for this
-                    // session and updates the shared transcript buffer in real time.
-                    if let Some(ref active) = *start_state.current.lock().unwrap() {
-                        ui_consumer::spawn_ui_consumer(
-                            start_state.broker.clone(),
-                            id,
-                            start_state.store.clone(),
-                            active.transcript_buffer.clone(),
-                        );
-                    }
-                    // Spawn auto-summary: generates summary when session ends.
-                    start_state.summary_consumer.spawn_auto_summary(id);
-                    // Spawn Rhai plugin session: dispatches broker events
-                    // to all loaded .rhai scripts.
-                    start_state.rhai_engine.spawn_session(&start_state.broker, id);
                 }
                 status.set(s);
             }
@@ -820,6 +839,18 @@ pub fn App() -> Element {
                     if let Some(msg) = transcription_status_line {
                         p { class: "hint", "{msg}" }
                     }
+                }
+            }
+
+            // Live conversation hint from `plugins/default/hint.rhai` — only
+            // ever present while `selected_session_id` is the actively
+            // recording session (see `current_hint`'s doc comment), so this
+            // naturally disappears once recording stops or a different
+            // (historical) session is selected.
+            if let Some(hint) = current_hint() {
+                section { class: "panel hint-panel",
+                    p { class: "hint-panel-text", "💡 {hint.text}" }
+                    p { class: "hint-panel-meta", "{hint.provider} · {hint.updated_at.elapsed().as_secs()}秒前" }
                 }
             }
 

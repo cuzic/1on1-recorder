@@ -48,7 +48,7 @@ fn on_session_end() {
         system_prompt = "You summarize 1-on-1 meeting transcripts. Produce a concise summary covering key discussion points, decisions, and action items.";
     }
 
-    std::publish_event(`summary.${session_id}.started`, #{ session_id });
+    std::publish_event(`summary.${session_id}.started`, #{ session_id: session_id });
 
     try {
         let text = std::call_ai(model, system_prompt, turns);

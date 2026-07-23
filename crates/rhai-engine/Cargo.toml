@@ -15,8 +15,9 @@ session-store = { path = "../session-store" }
 credential-store = { path = "../credential-store" }
 recorder-domain = { path = "../recorder-domain" }
 summarize = { path = "../summarize" }
+serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "macros"] }
 tracing = "0.1"
 thiserror = { workspace = true }
 chrono = "0.4"
@@ -27,3 +28,11 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 hmac = "0.12"
+# Real, non-blocking silence-detection debounce timer for `hint.rhai`'s hint
+# generation (`hint_debounce.rs`) — see that module's doc comment. Published
+# by this repo's own maintainer; API confirmed directly against its source at
+# the time this was added.
+timed-fsm = { version = "0.5", features = ["tokio"] }
+
+[dev-dependencies]
+tempfile = "3"

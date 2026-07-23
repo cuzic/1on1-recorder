@@ -28,17 +28,23 @@ impl TranscriptBuffer {
 }
 
 /// Spawns a background task that subscribes to broker events for `session_id` and
-/// updates `buffer` with the latest transcript state. Returns immediately; the task
-/// runs until the broker channel closes.
+/// updates `buffer` with the latest transcript state. Returns immediately.
+///
+/// The task ends itself as soon as `apps/desktop/src/recording.rs::stop`
+/// publishes `session.{id}.stopped` — before that was added, this looped
+/// forever on `rx.recv()` waiting for the broker channel to close, which
+/// never happens (`LocalBroker` keeps a subject's sender alive as long as
+/// any receiver, including this task's own, still exists), leaking one task
+/// per recording session for the process's lifetime.
 pub fn spawn_ui_consumer(
     broker: LocalBroker,
     session_id: SessionId,
     store: Arc<SessionStore>,
     buffer: TranscriptBuffer,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         run_ui_consumer(broker, session_id, store, buffer).await;
-    });
+    })
 }
 
 async fn run_ui_consumer(
@@ -48,26 +54,31 @@ async fn run_ui_consumer(
     buffer: TranscriptBuffer,
 ) {
     let subject = format!("transcription.{session_id}.segment.updated");
+    let stop_subject = format!("session.{session_id}.stopped");
     let mut rx = broker.subscribe(&subject);
+    let mut stop_rx = broker.subscribe(&stop_subject);
 
     let mut segment_map: BTreeMap<String, TranscriptSegment> = BTreeMap::new();
     let mut validator = ProtocolValidator::new(session_id);
 
     loop {
-        let payload = match rx.recv().await {
-            Ok(p) => p,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!(n, %session_id, "ui_consumer: lagged, reloading from store");
-                if let Ok(segments) = store.list_transcript_segments(session_id) {
-                    if let Ok(mut guard) = buffer.segments.lock() {
-                        *guard = segments;
+        let payload = tokio::select! {
+            result = rx.recv() => match result {
+                Ok(p) => p,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(n, %session_id, "ui_consumer: lagged, reloading from store");
+                    if let Ok(segments) = store.list_transcript_segments(session_id) {
+                        if let Ok(mut guard) = buffer.segments.lock() {
+                            *guard = segments;
+                        }
                     }
+                    rx = broker.subscribe(&subject);
+                    segment_map.clear();
+                    continue;
                 }
-                rx = broker.subscribe(&subject);
-                segment_map.clear();
-                continue;
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            _ = stop_rx.recv() => break,
         };
 
         let envelope: EventEnvelope<TranscriptEvent> = match serde_json::from_slice(&payload) {
