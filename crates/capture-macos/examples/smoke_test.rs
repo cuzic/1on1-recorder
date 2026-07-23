@@ -50,6 +50,7 @@ fn main() {
         },
         BindingKind::EndpointLoopback, // unused: system_audio is disabled above
         0,
+        None,
     );
 
     let (tx, rx) = crossbeam_channel::unbounded::<CaptureEvent>();
