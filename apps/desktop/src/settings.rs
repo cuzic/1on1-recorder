@@ -484,6 +484,40 @@ fn load_render_devices() -> (Vec<DeviceOption>, Option<String>) {
     (Vec::new(), None)
 }
 
+/// `mic_device_select`/`render_device_select`'s one-shot `use_signal` initializer
+/// value: `saved` unchanged if it's still in `devices`, otherwise "システム既定"
+/// with a visible notice via `message` — see the call sites' doc comment on why
+/// silently keeping a stale id (with the `<select>` just happening to *display*
+/// "システム既定" because no `<option>` matches) is a trap for the next save.
+fn resolve_initial_device_selection(saved: Option<String>, devices: &[DeviceOption], mut message: Signal<Option<String>>, label: &str) -> String {
+    match saved {
+        Some(id) if devices.iter().any(|d| d.id == id) => id,
+        Some(_) => {
+            message.set(Some(format!(
+                "選択していた{label}が見つからないため、システム既定に切り替えました。必要であれば選び直して保存してください。"
+            )));
+            FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string()
+        }
+        None => FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string(),
+    }
+}
+
+/// `refresh_devices`'s live-signal counterpart of `resolve_initial_device_selection`
+/// — resets `select` back to "システム既定" if its current value has fallen out of
+/// `devices` (e.g. the device was unplugged since Settings was opened), and
+/// reports whether it did so (so the caller can fold that into one combined
+/// `device_message`, rather than this function's own message overwriting/being
+/// overwritten by the enumeration-error message `refresh_devices` also sets).
+fn reset_if_stale(mut select: Signal<String>, devices: &[DeviceOption]) -> bool {
+    let current = select();
+    if current != FOLLOW_SYSTEM_DEFAULT_DEVICE && !devices.iter().any(|d| d.id == current) {
+        select.set(FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string());
+        true
+    } else {
+        false
+    }
+}
+
 const STYLE: &str = r#"
 .settings-container {
   margin: 0;
@@ -660,17 +694,29 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
     let mut ollama_base_url_message = use_signal(|| None::<String>);
 
     // ---- 録音デバイスの選択(マイク/スピーカーが複数あるとき用、他の設定とは独立) ----
+    let mut device_message = use_signal(|| None::<String>);
     let mut mic_devices = use_signal(load_capture_devices);
     let mut render_devices = use_signal(load_render_devices);
+    // Falls back to "システム既定" (rather than the saved-but-now-missing id) when
+    // the saved device isn't in the freshly enumerated list — e.g. a USB headset
+    // unplugged since it was chosen. Without this, the `<select>` below displays
+    // "システム既定" (no `<option>` matches the stale id) while this signal still
+    // holds it, so an unrelated save silently re-persists a device id that no
+    // longer exists. See `resolve_initial_device_selection`'s doc comment.
     let mut mic_device_select = use_signal({
         let state = state.clone();
-        move || state.app_settings.lock().unwrap().microphone_device_id.clone().unwrap_or_else(|| FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string())
+        move || {
+            let saved = state.app_settings.lock().unwrap().microphone_device_id.clone();
+            resolve_initial_device_selection(saved, &mic_devices().0, device_message, "マイク")
+        }
     });
     let mut render_device_select = use_signal({
         let state = state.clone();
-        move || state.app_settings.lock().unwrap().render_device_id.clone().unwrap_or_else(|| FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string())
+        move || {
+            let saved = state.app_settings.lock().unwrap().render_device_id.clone();
+            resolve_initial_device_selection(saved, &render_devices().0, device_message, "スピーカー")
+        }
     });
-    let mut device_message = use_signal(|| None::<String>);
 
     // ---- 要約: プロンプトテンプレートの選択(プロバイダ・モデルの選択とは独立) ----
     let mut summary_template_select = use_signal({
@@ -951,12 +997,23 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
     let refresh_devices = move |_| {
         let (mic_list, mic_error) = load_capture_devices();
         let (render_list, render_error) = load_render_devices();
-        mic_devices.set((mic_list, mic_error.clone()));
-        render_devices.set((render_list, render_error.clone()));
+        mic_devices.set((mic_list.clone(), mic_error.clone()));
+        render_devices.set((render_list.clone(), render_error.clone()));
+
+        // See `reset_if_stale`'s doc comment: a device selected earlier in this
+        // Settings session can disappear from the list a refresh just fetched.
+        let mic_reset = reset_if_stale(mic_device_select, &mic_list);
+        let render_reset = reset_if_stale(render_device_select, &render_list);
+
         device_message.set(match (mic_error, render_error) {
             (Some(e), _) => Some(format!("マイク一覧の取得に失敗しました: {e}")),
             (None, Some(e)) => Some(format!("スピーカー一覧の取得に失敗しました: {e}")),
-            (None, None) => None,
+            (None, None) => match (mic_reset, render_reset) {
+                (true, true) => Some("選択していたマイクとスピーカーが見つからないため、システム既定に切り替えました。必要であれば選び直して保存してください。".to_string()),
+                (true, false) => Some("選択していたマイクが見つからないため、システム既定に切り替えました。必要であれば選び直して保存してください。".to_string()),
+                (false, true) => Some("選択していたスピーカーが見つからないため、システム既定に切り替えました。必要であれば選び直して保存してください。".to_string()),
+                (false, false) => None,
+            },
         });
     };
 

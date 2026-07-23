@@ -382,6 +382,21 @@ impl MacosSupervisor {
         // (design.md §5.2 step 1/2); for now every stream uses an unfiltered filter.
         let filter = unfiltered_display_filter()?;
 
+        // The pinned Microphone endpoint (if any) needs to reach
+        // `SCStreamConfiguration::set_microphone_capture_device_id` — `decide()`'s
+        // `ResolvedTarget` already carries it in `self.workers`, it just wasn't
+        // being read before.
+        let microphone_device_id = if outputs.microphone {
+            self.workers
+                .get(&BindingKind::Microphone)
+                .and_then(|w| match &w.target {
+                    ResolvedTarget::Endpoint(endpoint_id) => Some(endpoint_id.0.clone()),
+                    ResolvedTarget::Process { .. } => None,
+                })
+        } else {
+            None
+        };
+
         let stream = ScreenCaptureKitStream::new(
             filter,
             self.sample_rate_hz,
@@ -389,6 +404,7 @@ impl MacosSupervisor {
             outputs,
             system_audio_binding,
             capture_epoch,
+            microphone_device_id,
         );
         let stop = Arc::new(StopSignal::new());
         let join_handle =

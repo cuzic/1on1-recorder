@@ -134,6 +134,48 @@ pub async fn run_windows_capture_session(
     .await
 }
 
+/// Resolves a saved microphone pick against the live capture-device list, falling
+/// back to `default` (and logging a warning) when it's gone stale — e.g. a USB
+/// headset unplugged after it was chosen in Settings. Without this check,
+/// `WindowsSupervisor::pin_devices` would pin a `Microphone` binding to a device
+/// id `resolve_capture_device` can never resolve, and the resulting `StreamError`
+/// only aborts that one binding's worker (see `windows_supervisor.rs`), leaving
+/// the session's Self track silently empty instead of falling back like `None`
+/// already does.
+fn resolve_pinned_capture_endpoint(
+    device_id: Option<String>,
+    default: &EndpointId,
+) -> Result<EndpointId, capture_windows::CaptureError> {
+    let Some(id) = device_id else {
+        return Ok(default.clone());
+    };
+    let devices = capture_windows::device_select::enumerate_capture_devices()?;
+    if devices.iter().any(|d| d.id == id) {
+        Ok(EndpointId(id))
+    } else {
+        tracing::warn!(device_id = %id, "選択したマイクが見つからないため、システム既定にフォールバックします");
+        Ok(default.clone())
+    }
+}
+
+/// Render-device counterpart of `resolve_pinned_capture_endpoint` — same
+/// rationale, applied to `EndpointLoopback`'s saved device pick.
+fn resolve_pinned_render_endpoint(
+    device_id: Option<String>,
+    default: &EndpointId,
+) -> Result<EndpointId, capture_windows::CaptureError> {
+    let Some(id) = device_id else {
+        return Ok(default.clone());
+    };
+    let devices = capture_windows::device_select::enumerate_render_devices()?;
+    if devices.iter().any(|d| d.id == id) {
+        Ok(EndpointId(id))
+    } else {
+        tracing::warn!(device_id = %id, "選択したスピーカーが見つからないため、システム既定にフォールバックします");
+        Ok(default.clone())
+    }
+}
+
 fn latest_frame_end_ns(collected: &CollectedFrames, self_interval: u64, remote_interval: u64) -> u64 {
     let self_end = collected.self_frames.last().map(|f| f.host_time_ns + self_interval).unwrap_or(0);
     let remote_end = collected.remote_frames.last().map(|f| f.host_time_ns + remote_interval).unwrap_or(0);
@@ -162,18 +204,16 @@ fn run_capture_blocking(
     // and EndpointLoopback, then pin to those exact devices for the rest of the
     // session — not `FollowDefault`, which would auto-rebind on every later OS
     // default-device change while running. `mic_device_id`/`render_device_id`
-    // (the caller's saved device picker selection, if any) skip this
-    // resolve-current-default step for whichever track has an explicit choice.
-    let needs_defaults = mic_device_id.is_none() || render_device_id.is_none();
-    let defaults = if needs_defaults { Some(supervisor.resolve_current_defaults()?) } else { None };
-    let mic_endpoint_id = match mic_device_id {
-        Some(id) => EndpointId(id),
-        None => defaults.as_ref().expect("resolved when mic_device_id is None").0.clone(),
-    };
-    let render_endpoint_id = match render_device_id {
-        Some(id) => EndpointId(id),
-        None => defaults.as_ref().expect("resolved when render_device_id is None").1.clone(),
-    };
+    // (the caller's saved device picker selection, if any) are validated against
+    // the live device list before being pinned: a saved id can go stale (device
+    // unplugged since it was chosen), and pinning it anyway would only surface as
+    // an async `StreamError` on the capture thread later, silently leaving that
+    // track empty for the whole session (see `resolve_pinned_capture_endpoint`'s
+    // doc comment). Falls back to the current OS default in that case, same as
+    // `None`.
+    let (default_mic, default_render) = supervisor.resolve_current_defaults()?;
+    let mic_endpoint_id = resolve_pinned_capture_endpoint(mic_device_id, &default_mic)?;
+    let render_endpoint_id = resolve_pinned_render_endpoint(render_device_id, &default_render)?;
     supervisor.pin_devices(mic_endpoint_id, render_endpoint_id);
     supervisor.start_all()?;
 

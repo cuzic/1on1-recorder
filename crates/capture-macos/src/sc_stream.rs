@@ -51,6 +51,13 @@ pub struct ScreenCaptureKitStream {
     /// `BindingKind::Microphone`.
     system_audio_binding: BindingKind,
     capture_epoch: u64,
+    /// CoreAudio device UID to pin the `.microphone` output to, or `None` to use
+    /// whatever `SCStreamConfiguration` defaults to (the OS default input) — see
+    /// `set_microphone_capture_device_id`'s doc comment in the `screencapturekit`
+    /// crate. There is no render/output-device equivalent: ScreenCaptureKit's
+    /// `captures_audio` taps the system-wide audio mix, not a specific output
+    /// device, so a pinned `render_device_id` has nothing to bind to here.
+    microphone_device_id: Option<String>,
 }
 
 impl ScreenCaptureKitStream {
@@ -61,6 +68,7 @@ impl ScreenCaptureKitStream {
         outputs: StreamOutputs,
         system_audio_binding: BindingKind,
         capture_epoch: u64,
+        microphone_device_id: Option<String>,
     ) -> Self {
         Self {
             filter,
@@ -69,6 +77,7 @@ impl ScreenCaptureKitStream {
             outputs,
             system_audio_binding,
             capture_epoch,
+            microphone_device_id,
         }
     }
 }
@@ -90,11 +99,17 @@ impl CaptureStream for ScreenCaptureKitStream {
         tx: &crossbeam_channel::Sender<CaptureEvent>,
         stop: &StopSignal,
     ) -> Result<CaptureExit, CaptureError> {
-        let config = SCStreamConfiguration::new()
+        let mut config = SCStreamConfiguration::new()
             .with_captures_audio(self.outputs.system_audio)
             .with_captures_microphone(self.outputs.microphone)
             .with_sample_rate(self.sample_rate as i32)
             .with_channel_count(self.channels as i32);
+
+        if self.outputs.microphone {
+            if let Some(device_id) = &self.microphone_device_id {
+                config.set_microphone_capture_device_id(device_id);
+            }
+        }
 
         let mut stream = SCStream::new(&self.filter, &config);
 
