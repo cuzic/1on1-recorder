@@ -54,7 +54,9 @@ pub fn current(state: &AppState) -> Status {
     let elapsed = active.started_at.elapsed();
     #[cfg(windows)]
     let level: crate::level::LevelSnapshot = (*active.level.lock().unwrap()).into();
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let level: crate::level::LevelSnapshot = (*active.level.lock().unwrap()).into();
+    #[cfg(not(any(windows, target_os = "macos")))]
     let level = crate::level::dev_placeholder_level(elapsed);
 
     // #52: only Windows wires up live transcription at all (see
