@@ -140,8 +140,21 @@ pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
     // silently leaking every session-scoped background task (and skipping
     // auto-summary) on a capture-task panic, i.e. the precise failure this
     // whole redesign exists to prevent.
+    //
+    // `shutdown_tx.send`'s error is deliberately NOT `?`-propagated: a send
+    // failure means `shutdown_rx` was already dropped, i.e. the capture task
+    // already returned (successfully, or with a real error) *before* this
+    // call. The earlier version of this function treated that send failure
+    // itself as the stop error ("failed to signal shutdown: sending on a
+    // disconnected channel") and never awaited `join_handle` at all — masking
+    // whatever `app_service::run_windows_capture_session` actually failed
+    // with. Always awaiting `join_handle` (which resolves immediately in this
+    // case, since the task has already finished) surfaces the real result
+    // instead.
     let result = async {
-        active.shutdown_tx.send(()).map_err(|e| format!("failed to signal shutdown: {e}"))?;
+        if let Err(err) = active.shutdown_tx.send(()) {
+            tracing::warn!(%err, "shutdown signal not delivered (capture task already exited) — awaiting its result directly");
+        }
         active.join_handle.await.map_err(|e| format!("capture task panicked: {e}"))?.map_err(|e| e.to_string())
     }
     .await;
@@ -227,9 +240,12 @@ pub async fn stop(state: &AppState) -> Result<SessionSummary, String> {
     let session_id = active.session_id;
 
     // See the `#[cfg(windows)]` `stop` above's identical comment on why this
-    // is wrapped in a block rather than `?`-returning directly.
+    // is wrapped in a block rather than `?`-returning directly, and why the
+    // `shutdown_tx.send` error is deliberately not `?`-propagated.
     let result = async {
-        active.shutdown_tx.send(()).map_err(|e| format!("failed to signal shutdown: {e}"))?;
+        if let Err(err) = active.shutdown_tx.send(()) {
+            tracing::warn!(%err, "shutdown signal not delivered (capture task already exited) — awaiting its result directly");
+        }
         active.join_handle.await.map_err(|e| format!("capture task panicked: {e}"))?.map_err(|e| e.to_string())
     }
     .await;

@@ -210,6 +210,17 @@ jobs:
           [ "$count" -gt 0 ] || { echo "no session directories found under $sessions_root"; exit 1; }
           echo "Found $count session directory(ies)"
 
+      - name: Print desktop app.log (diagnostics)
+        # `desktop` is a GUI-subsystem exe with no console — `main.rs`'s
+        # `init_logging` writes everything (including any capture-task error
+        # surfaced by `recording::stop`'s `tracing::warn!`) to this file
+        # instead. `if: always()` so this is visible whether the E2E step
+        # above passed or failed.
+        if: always()
+        run: |
+          log_path="$HOME/Library/Application Support/1on1-recorder/app.log"
+          if [ -f "$log_path" ]; then cat "$log_path"; else echo "no app.log found at $log_path"; fi
+
       - name: Stop the desktop app
         # `desktop` hides to the tray rather than exiting on window close
         # (WindowCloseBehaviour::WindowHides) — kill it explicitly so it

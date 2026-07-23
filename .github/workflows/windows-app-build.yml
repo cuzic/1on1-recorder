@@ -298,6 +298,18 @@ jobs:
           if (-not $sessions -or $sessions.Count -eq 0) { throw "no session directories found under $sessionsRoot" }
           Write-Host "Found $($sessions.Count) session directory(ies): $($sessions.Name -join ', ')"
 
+      - name: Print desktop app.log (diagnostics)
+        # `desktop` is a GUI-subsystem exe with no console — `main.rs`'s
+        # `init_logging` writes everything (including any capture-task error
+        # surfaced by `recording::stop`'s `tracing::warn!`) to this file
+        # instead. `if: always()` so this is visible whether the E2E step
+        # above passed or failed.
+        if: always()
+        shell: pwsh
+        run: |
+          $logPath = Join-Path $env:APPDATA "1on1-recorder\app.log"
+          if (Test-Path $logPath) { Get-Content $logPath } else { Write-Host "no app.log found at $logPath" }
+
       - name: Stop the desktop app
         # `desktop` hides to the tray rather than exiting on window close
         # (WindowCloseBehaviour::WindowHides) — kill it explicitly so it
