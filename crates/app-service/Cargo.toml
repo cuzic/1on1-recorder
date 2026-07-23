@@ -34,7 +34,7 @@ thiserror = { workspace = true }
 # in), unlike stt-deepgram's websocket/TLS stack, so it stays unconditional rather
 # than living behind the `live-transcription` feature below.
 tokio = { version = "1", features = ["time", "sync"] }
-tracing = { version = "0.1", optional = true }
+tracing = "0.1"
 transcript-event = { path = "../transcript-event", optional = true }
 upload-client = { path = "../upload-client" }
 windows = { version = "0.58", features = ["Win32_Media_Audio", "Win32_System_Com"], optional = true }
@@ -61,7 +61,7 @@ upload-client = { path = "../upload-client", features = ["mock-server"] }
 # (capture-windows itself is Windows-only) — this crate's default (no-features)
 # build stays OS-independent for stage 1's pseudo-source pipeline and stage 3's
 # upload worker/session lifecycle.
-windows-supervisor = ["dep:capture-api", "dep:capture-windows", "dep:credential-store", "dep:crossbeam-channel", "dep:tracing", "dep:windows", "tokio/rt", "tokio/macros"]
+windows-supervisor = ["dep:capture-api", "dep:capture-windows", "dep:credential-store", "dep:crossbeam-channel", "dep:windows", "tokio/rt", "tokio/macros"]
 
 # The macOS analogue of windows-supervisor: connects capture-api's FSM to real
 # capture-macos (ScreenCaptureKit) capture threads via macos_supervisor, plus the
@@ -69,7 +69,7 @@ windows-supervisor = ["dep:capture-api", "dep:capture-windows", "dep:credential-
 # its frames into stage 1's pipeline. Only meaningful on macOS (capture-macos
 # itself is macOS-only, and — unlike capture-windows — has not yet been compiled or
 # run at all; see capture-macos's crate doc comment).
-macos-supervisor = ["dep:capture-api", "dep:capture-macos", "dep:crossbeam-channel", "dep:screencapturekit", "dep:tracing", "tokio/rt"]
+macos-supervisor = ["dep:capture-api", "dep:capture-macos", "dep:crossbeam-channel", "dep:screencapturekit", "tokio/rt"]
 
 # Real-time transcription during a Windows recording (design's "録音中にリアルタイム
 # で文字起こしを表示したい"): opens Deepgram streaming STT sessions and persists

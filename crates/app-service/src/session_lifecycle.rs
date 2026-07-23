@@ -19,14 +19,29 @@ use crate::upload_worker::run_until_drained;
 /// records exactly these two.
 const PHASE_1A_TRACKS: [TrackKind; 2] = [TrackKind::SelfMic, TrackKind::RemoteAudio];
 
-/// design.md §10: `Idle -> Preparing -> Recording`. Registers the session locally
-/// and with the remote API. Call once, before capture begins.
-pub async fn begin_session(store: &SessionStore, adapter: &dyn UploadAdapter, manifest: &SessionManifest) -> Result<RemoteSession, AppServiceError> {
+/// design.md §10: `Idle -> Preparing -> Recording`. Registers the session
+/// locally, and attempts to register it with the remote API too — but a
+/// credential/network failure on that second half is **not** fatal to local
+/// capture (unlike a `store.create_session` failure, which is a real local bug
+/// and still propagates): local recording has no dependency on the remote API
+/// being reachable, matching the resilience `commit_and_upload_track` already
+/// gives per-segment upload failures. Returns `None` in that case — the caller
+/// still proceeds to capture and commit segments locally, and `run_pipeline`
+/// gets one more chance to register a remote session before finalizing.
+pub async fn begin_session(store: &SessionStore, adapter: &dyn UploadAdapter, manifest: &SessionManifest) -> Result<Option<RemoteSession>, AppServiceError> {
     store.create_session(manifest)?; // starts in CaptureState::Preparing
-    let remote = adapter.create_session(manifest).await?;
-    store.set_remote_session_id(manifest.session_id, &remote.remote_session_id)?;
-    store.update_capture_state(manifest.session_id, &CaptureState::Recording)?;
-    Ok(remote)
+    match adapter.create_session(manifest).await {
+        Ok(remote) => {
+            store.set_remote_session_id(manifest.session_id, &remote.remote_session_id)?;
+            store.update_capture_state(manifest.session_id, &CaptureState::Recording)?;
+            Ok(Some(remote))
+        }
+        Err(err) => {
+            tracing::warn!(%err, "remote session registration failed; proceeding with local-only capture");
+            store.update_capture_state(manifest.session_id, &CaptureState::Recording)?;
+            Ok(None)
+        }
+    }
 }
 
 /// design.md §10: `Recording -> Stopping -> Finalizing -> Finalized`. Call once
