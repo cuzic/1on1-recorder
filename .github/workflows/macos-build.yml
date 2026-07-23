@@ -104,6 +104,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same reason as Tier 0's identical step: `desktop` (built later in this
+      # job) depends on stt-google, whose build.rs shells out to `protoc` —
+      # without this, "Build desktop + 1on1ctl" below fails with "Could not
+      # find `protoc`" (confirmed: this job doesn't inherit Tier 0's protoc
+      # setup, they're separate jobs/runners).
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
@@ -139,3 +148,83 @@ jobs:
 
       - name: Assert audio data was actually captured
         run: ./scripts/ci/assert-segment-written.sh /tmp/capture-macos-smoke-test.raw
+
+      # 1on1ctl (apps/desktop-cli) end-to-end pass — see the Windows
+      # workflow's identical comment for why this could never be verified
+      # before now (the dev sandbox this was built in can't launch
+      # dioxus-desktop's webview at all). Reuses this job's already-configured
+      # BlackHole default recording device and TCC seeding above, since
+      # `1on1ctl start` drives the same real ScreenCaptureKit capture path
+      # the smoke test above just proved works on this runner.
+      - name: Build desktop + 1on1ctl
+        run: |
+          cargo build -p desktop --target aarch64-apple-darwin
+          cargo build -p desktop-cli --target aarch64-apple-darwin
+
+      - name: 1on1ctl E2E — status/start/status/stop against a real running app
+        # `cargo build`'s own output layout (not `dx bundle`'s .app) puts
+        # `1on1ctl` and `desktop` side by side in the same
+        # target/aarch64-apple-darwin/debug/ directory — exactly what
+        # `1on1ctl`'s `locate_gui_binary` (a sibling-of-`current_exe()`
+        # lookup) expects, so no .app packaging step should be needed for the
+        # auto-launch below to find `desktop`. DYLD_LIBRARY_PATH: see Tier 0's
+        # "Test" step for why `desktop` (which links capture-macos) needs it.
+        env:
+          DYLD_LIBRARY_PATH: /usr/lib/swift
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          CTL=./target/aarch64-apple-darwin/debug/1on1ctl
+
+          # No `desktop` is running yet — this specifically exercises
+          # `1on1ctl`'s auto-launch-and-wait path, not just a plain connect.
+          "$CTL" status
+
+          # Consent is auto-confirmed by the control server for CLI-triggered
+          # starts (see control_server.rs's dispatch) — no extra step needed.
+          "$CTL" start
+
+          sleep 5
+
+          # `--json` rather than the human-readable output: both the
+          # recording and not-recording branches of the plain-text output
+          # literally start with the word "recording" (`recording: N経過` vs
+          # `recording: 停止中`), so a plain substring match on that word
+          # can't actually distinguish the two states.
+          status_json="$("$CTL" --json status)"
+          echo "$status_json"
+          echo "$status_json" | grep -q '"recording":true' || { echo "expected status to report recording:true"; exit 1; }
+
+          "$CTL" stop
+
+      - name: Assert a session was actually written to disk
+        # Confirms more than "the control socket answered" — that the full
+        # start -> real ScreenCaptureKit capture -> stop -> session-store
+        # pipeline ran to completion, the same way `assert-segment-written.sh`
+        # does for the lower-level smoke test above.
+        run: |
+          set -euo pipefail
+          sessions_root="$HOME/Library/Application Support/1on1-recorder/sessions"
+          [ -d "$sessions_root" ] || { echo "sessions root not found: $sessions_root"; exit 1; }
+          count=$(find "$sessions_root" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+          [ "$count" -gt 0 ] || { echo "no session directories found under $sessions_root"; exit 1; }
+          echo "Found $count session directory(ies)"
+
+      - name: Print desktop app.log (diagnostics)
+        # `desktop` is a GUI-subsystem exe with no console — `main.rs`'s
+        # `init_logging` writes everything (including any capture-task error
+        # surfaced by `recording::stop`'s `tracing::warn!`) to this file
+        # instead. `if: always()` so this is visible whether the E2E step
+        # above passed or failed.
+        if: always()
+        run: |
+          log_path="$HOME/Library/Application Support/1on1-recorder/app.log"
+          if [ -f "$log_path" ]; then cat "$log_path"; else echo "no app.log found at $log_path"; fi
+
+      - name: Stop the desktop app
+        # `desktop` hides to the tray rather than exiting on window close
+        # (WindowCloseBehaviour::WindowHides) — kill it explicitly so it
+        # doesn't linger past this job. `if: always()` so a failed assertion
+        # above still cleans up rather than leaving the runner mid-recording.
+        if: always()
+        run: pkill -f "target/aarch64-apple-darwin/debug/desktop" || true

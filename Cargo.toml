@@ -2,12 +2,14 @@
 resolver = "2"
 members = [
     "apps/desktop",
+    "apps/desktop-cli",
     "apps/hello-dioxus",
     "crates/app-service",
     "crates/audio-timeline",
     "crates/capture-api",
     "crates/capture-macos",
     "crates/capture-windows",
+    "crates/control-protocol",
     "crates/credential-store",
     "crates/local-broker",
     "crates/recorder-domain",
@@ -39,11 +41,13 @@ members = [
 # doesn't show up in every regular `desktop`-focused build/check.
 default-members = [
     "apps/desktop",
+    "apps/desktop-cli",
     "crates/app-service",
     "crates/audio-timeline",
     "crates/capture-api",
     "crates/capture-macos",
     "crates/capture-windows",
+    "crates/control-protocol",
     "crates/credential-store",
     "crates/local-broker",
     "crates/recorder-domain",

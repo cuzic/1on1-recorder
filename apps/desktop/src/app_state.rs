@@ -11,6 +11,7 @@ use upload_client::HttpUploadClient;
 
 use crate::app_settings::AppSettings;
 use crate::config::Config;
+use crate::hint_consumer::HintBuffer;
 use crate::summary_consumer::SummaryConsumer;
 use crate::ui_consumer::TranscriptBuffer;
 
@@ -53,6 +54,13 @@ pub struct ActiveRecording {
     pub manifest: SessionManifest,
     pub started_at: Instant,
     pub transcript_buffer: TranscriptBuffer,
+    /// Latest live hint from `plugins/default/hint.rhai`, populated by
+    /// `hint_consumer::spawn_hint_consumer` (spawned alongside the other
+    /// session consumers in `actions::start_recording`) — same
+    /// shared-buffer-plus-poll shape as `transcript_buffer` above, see
+    /// `hint_consumer`'s module doc comment for why hints don't go through
+    /// `transcript_event::EventEnvelope` the way transcript segments do.
+    pub hint_buffer: HintBuffer,
     /// Updated live by `app_service::windows_frame_collector`/
     /// `app_service::macos_frame_collector` as real capture happens — only exists
     /// on Windows/macOS. Other platforms report `level::dev_placeholder_level(elapsed)`

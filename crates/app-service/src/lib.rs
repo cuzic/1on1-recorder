@@ -56,6 +56,16 @@ pub mod windows_supervisor;
 pub use windows_frame_collector::LevelSnapshot;
 #[cfg(feature = "windows-supervisor")]
 pub use windows_session::run_windows_capture_session;
+// Same collision rationale as `LevelSnapshot` above: `capture_windows`/
+// `capture_macos`'s `device_select::DeviceInfo` are structurally identical (both
+// wrap `capture_api::rebinding::DeviceRole`) but distinct types, so only one is
+// re-exported at the root when both features happen to be enabled together.
+// `apps/desktop`'s settings screen calls these to list mics/speakers for its
+// device picker without depending on `capture-windows`/`capture-macos` directly.
+#[cfg(all(feature = "windows-supervisor", not(feature = "macos-supervisor")))]
+pub use capture_windows::device_select::{enumerate_capture_devices, enumerate_render_devices, DeviceInfo};
+#[cfg(feature = "macos-supervisor")]
+pub use capture_macos::device_select::{enumerate_capture_devices, enumerate_render_devices, DeviceInfo};
 // `live_transcription` (unlike `LevelSnapshot`) has no macOS-side equivalent type
 // to collide with (see that module's doc comment), so this re-export doesn't need
 // the same `not(feature = "macos-supervisor")` guard.

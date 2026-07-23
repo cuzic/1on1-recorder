@@ -20,12 +20,15 @@ use std::ptr::NonNull;
 
 use capture_api::rebinding::DeviceRole;
 use objc2_core_audio::{
+    kAudioDevicePropertyDeviceUID, kAudioDevicePropertyStreams,
     kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDefaultOutputDevice,
-    kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, AudioDeviceID,
+    kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain, kAudioObjectPropertyName,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, AudioDeviceID,
     AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
     AudioObjectPropertyAddress,
 };
+use objc2_core_foundation::{CFRetained, CFString};
 
 use crate::error::CaptureError;
 
@@ -74,11 +77,12 @@ pub struct RunningApplicationInfo {
 
 /// Enumerates every capture (input) device known to CoreAudio.
 ///
-/// **Not yet verified against a real build.** `objc2_core_audio`'s exact
+/// **Not yet run against real hardware.** `objc2_core_audio`'s
 /// `AudioObjectGetPropertyData`/`AudioObjectGetPropertyDataSize` signatures were
-/// researched from documentation only (no macOS host in this dev environment) — the
-/// unsafe call sites below are expected to need small signature fixes on first real
-/// compile (parameter order, pointer types, `Option`-wrapping of out-params).
+/// researched from documentation only (no macOS host in this dev environment) —
+/// they compile and pass this crate's own CI (`macos-build.yml`), but a real
+/// device enumeration pass is still only verified by that workflow's
+/// `e2e-best-effort` job, not locally.
 pub fn enumerate_capture_devices() -> Result<Vec<DeviceInfo>, CaptureError> {
     let default_input = default_device_uid(kAudioHardwarePropertyDefaultInputDevice)?;
     let device_ids = all_device_ids()?;
@@ -218,24 +222,74 @@ fn default_device_uid(selector: u32) -> Result<Option<String>, CaptureError> {
 // device_uid/device_name/device_has_input_streams/device_has_output_streams: thin
 // per-device property reads (kAudioDevicePropertyDeviceUID,
 // kAudioObjectPropertyName, kAudioDevicePropertyStreams on the input/output scopes
-// respectively). Left as a follow-up alongside task 3's mic-stream implementation
-// (task 6's device_watch.rs needs the same property-read plumbing, so it's more
-// efficient to build the shared helper once real code exercises it than to guess
-// the exact CFString-marshalling calls here with no way to compile-check them).
-fn device_uid(_device_id: AudioDeviceID) -> Result<String, CaptureError> {
-    unimplemented!("kAudioDevicePropertyDeviceUID read — implemented alongside task 3/6")
+// respectively), built on the two shared helpers below.
+
+/// Reads a `CFString`-valued property (`kAudioDevicePropertyDeviceUID`,
+/// `kAudioObjectPropertyName`) off any `AudioObjectID`. Both properties are
+/// documented (`AudioHardware.h`) to hand the caller an owned reference — no
+/// extra retain is needed before `CFRetained::from_raw`, and dropping the
+/// `CFRetained` below releases it.
+fn read_cfstring_property(object_id: AudioObjectID, selector: u32) -> Result<String, CaptureError> {
+    let mut address = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut value: *const CFString = std::ptr::null();
+    let mut size = std::mem::size_of::<*const CFString>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object_id,
+            NonNull::from(&mut address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut value).cast(),
+        )
+    };
+    check_status(status, "AudioObjectGetPropertyData(CFString)")?;
+    let ptr = NonNull::new(value as *mut CFString)
+        .ok_or_else(|| CaptureError::CoreAudio("CoreAudio returned a null CFString".to_string()))?;
+    let cf_string = unsafe { CFRetained::from_raw(ptr) };
+    Ok(cf_string.to_string())
 }
 
-fn device_name(_device_id: AudioDeviceID) -> Result<String, CaptureError> {
-    unimplemented!("kAudioObjectPropertyName read — implemented alongside task 3/6")
+/// Whether `device_id` has any streams in the given scope
+/// (`kAudioObjectPropertyScopeInput`/`kAudioObjectPropertyScopeOutput`) —
+/// `kAudioDevicePropertyStreams`'s data size is `0` when there are none, so the
+/// actual stream list never needs to be fetched.
+fn device_has_streams(device_id: AudioDeviceID, scope: u32) -> Result<bool, CaptureError> {
+    let mut address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let mut data_size: u32 = 0;
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(
+            device_id,
+            NonNull::from(&mut address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut data_size),
+        )
+    };
+    check_status(status, "AudioObjectGetPropertyDataSize(Streams)")?;
+    Ok(data_size > 0)
 }
 
-fn device_has_input_streams(_device_id: AudioDeviceID) -> Result<bool, CaptureError> {
-    unimplemented!("kAudioDevicePropertyStreams(input scope) read — implemented alongside task 3/6")
+fn device_uid(device_id: AudioDeviceID) -> Result<String, CaptureError> {
+    read_cfstring_property(device_id, kAudioDevicePropertyDeviceUID)
 }
 
-fn device_has_output_streams(_device_id: AudioDeviceID) -> Result<bool, CaptureError> {
-    unimplemented!(
-        "kAudioDevicePropertyStreams(output scope) read — implemented alongside task 3/6"
-    )
+fn device_name(device_id: AudioDeviceID) -> Result<String, CaptureError> {
+    read_cfstring_property(device_id, kAudioObjectPropertyName)
+}
+
+fn device_has_input_streams(device_id: AudioDeviceID) -> Result<bool, CaptureError> {
+    device_has_streams(device_id, kAudioObjectPropertyScopeInput)
+}
+
+fn device_has_output_streams(device_id: AudioDeviceID) -> Result<bool, CaptureError> {
+    device_has_streams(device_id, kAudioObjectPropertyScopeOutput)
 }

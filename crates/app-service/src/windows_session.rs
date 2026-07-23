@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use capture_api::rebinding::EndpointId;
 use capture_windows::device_watch::DeviceWatch;
 use local_broker::LocalBroker;
 use recorder_domain::{SessionManifest, SessionSummary, TrackKind, UploadAdapter};
@@ -52,6 +53,13 @@ use crate::windows_supervisor::WindowsSupervisor;
 /// it itself, it just plumbs the caller's (`apps/desktop`'s) resolved
 /// `AppSettings::silence_gate_enabled` value down to where the gate actually
 /// lives.
+///
+/// `mic_device_id`/`render_device_id`, if given, pin the Microphone/EndpointLoopback
+/// bindings to those exact `capture_windows::device_select::DeviceInfo::id` values
+/// instead of `run_capture_blocking`'s previous unconditional
+/// `WindowsSupervisor::resolve_current_defaults()` — the caller's (`apps/desktop`'s)
+/// resolved `AppSettings::microphone_device_id`/`render_device_id` selection, or
+/// `None` for "whatever's currently the OS default", the pre-existing behavior.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_windows_capture_session(
     manifest: &SessionManifest,
@@ -66,6 +74,8 @@ pub async fn run_windows_capture_session(
     transcription_status_sink: Option<Arc<Mutex<TranscriptionStatus>>>,
     silence_gate_enabled: bool,
     broker: Option<&LocalBroker>,
+    mic_device_id: Option<String>,
+    render_device_id: Option<String>,
 ) -> Result<SessionSummary, AppServiceError> {
     // Same shape as `level_sink`'s side channel (see `windows_frame_collector`'s doc
     // comment), but for raw PCM instead of RMS/peak. `stt_tx` is moved into
@@ -99,7 +109,8 @@ pub async fn run_windows_capture_session(
         broker,
     );
 
-    let capture_fut = tokio::task::spawn_blocking(move || run_capture_blocking(callback_timeout_ms, shutdown_rx, level_sink, stt_tx));
+    let capture_fut =
+        tokio::task::spawn_blocking(move || run_capture_blocking(callback_timeout_ms, shutdown_rx, level_sink, stt_tx, mic_device_id, render_device_id));
 
     let (collected, ()) = tokio::join!(capture_fut, live_transcription_fut);
     let collected = collected.expect("capture supervisor thread panicked").map_err(|e| AppServiceError::Capture(e.to_string()))?;
@@ -137,6 +148,8 @@ fn run_capture_blocking(
     shutdown_rx: crossbeam_channel::Receiver<()>,
     level_sink: Option<Arc<Mutex<LevelSnapshot>>>,
     stt_tx: Sender<(TrackKind, Vec<f32>, u32)>,
+    mic_device_id: Option<String>,
+    render_device_id: Option<String>,
 ) -> Result<CollectedFrames, capture_windows::CaptureError> {
     let mut supervisor = WindowsSupervisor::new(callback_timeout_ms);
     let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
@@ -148,8 +161,19 @@ fn run_capture_blocking(
     // design.md §16.5: use whatever's currently in use for each of Microphone
     // and EndpointLoopback, then pin to those exact devices for the rest of the
     // session — not `FollowDefault`, which would auto-rebind on every later OS
-    // default-device change while running.
-    let (mic_endpoint_id, render_endpoint_id) = supervisor.resolve_current_defaults()?;
+    // default-device change while running. `mic_device_id`/`render_device_id`
+    // (the caller's saved device picker selection, if any) skip this
+    // resolve-current-default step for whichever track has an explicit choice.
+    let needs_defaults = mic_device_id.is_none() || render_device_id.is_none();
+    let defaults = if needs_defaults { Some(supervisor.resolve_current_defaults()?) } else { None };
+    let mic_endpoint_id = match mic_device_id {
+        Some(id) => EndpointId(id),
+        None => defaults.as_ref().expect("resolved when mic_device_id is None").0.clone(),
+    };
+    let render_endpoint_id = match render_device_id {
+        Some(id) => EndpointId(id),
+        None => defaults.as_ref().expect("resolved when render_device_id is None").1.clone(),
+    };
     supervisor.pin_devices(mic_endpoint_id, render_endpoint_id);
     supervisor.start_all()?;
 

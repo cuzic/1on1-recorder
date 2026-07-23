@@ -391,6 +391,13 @@ fn summary_provider_is_configured(state: &AppState, provider: SummaryProvider) -
     }
 }
 
+/// Same "設定済み"/"未設定" badge pattern as `summary_provider_is_configured`,
+/// for the Cloudflare AI Search credential `plugins/default/hint.rhai`'s
+/// `rag_search("cloudflare", ...)` reads via `crates/rhai-engine/src/rag/cloudflare.rs`.
+fn hint_cloudflare_is_configured(state: &AppState) -> bool {
+    state.credential_store.load(rhai_engine::CLOUDFLARE_CREDENTIAL_SERVICE, rhai_engine::CLOUDFLARE_AI_SEARCH_ACCOUNT).is_ok()
+}
+
 /// Status text for the "資格情報の登録" section when `provider` is CLI-based
 /// (#59) — replaces the API key form, since these providers have nothing to save.
 /// `available` is the latest [`summarize::cli_backend::CliBackend::is_available`]
@@ -414,6 +421,74 @@ fn summary_cli_status_text(provider: SummaryProvider, available: Option<bool>) -
         };
     }
     String::new()
+}
+
+/// `<select>` sentinel meaning "follow whatever the OS reports as its current
+/// default device" — `AppSettings::microphone_device_id`/`render_device_id`'s
+/// `None`. Not a real `DeviceInfo::id` (those are opaque WASAPI/CoreAudio
+/// endpoint IDs, never this literal string), so it can't collide with one.
+const FOLLOW_SYSTEM_DEFAULT_DEVICE: &str = "__system_default__";
+
+/// Platform-agnostic view of `app_service::DeviceInfo` for the `<select>` options
+/// below — built once per list load so the `rsx!` markup doesn't need its own
+/// `#[cfg(windows)]`/`#[cfg(target_os = "macos")]` branches (device enumeration
+/// itself is real capture backend territory; this file only renders the result).
+/// `is_default` is kept as its own field (rather than baked into a `label`
+/// string) so it can also drive the "現在のシステム既定" hint line below each
+/// `<select>` — that hint has to stay visible even while "システム既定" itself
+/// is the selected option, i.e. even when no single `<option>`'s own label is
+/// showing.
+#[derive(Debug, Clone)]
+struct DeviceOption {
+    id: String,
+    friendly_name: String,
+    is_default: bool,
+}
+
+impl DeviceOption {
+    fn option_label(&self) -> String {
+        if self.is_default { format!("{} (既定)", self.friendly_name) } else { self.friendly_name.clone() }
+    }
+}
+
+/// `true` only where a real capture backend (and therefore real device
+/// enumeration) exists at all — see `recording.rs`'s three-way `#[cfg]` split.
+/// Everywhere else, `load_capture_devices`/`load_render_devices` return an empty
+/// list and the settings UI shows a hint instead of a picker with nothing but
+/// "システム既定" in it.
+fn device_selection_supported() -> bool {
+    cfg!(any(windows, target_os = "macos"))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn to_device_option(d: app_service::DeviceInfo) -> DeviceOption {
+    DeviceOption { id: d.id, friendly_name: d.friendly_name, is_default: d.is_default_for_role.is_some() }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn load_capture_devices() -> (Vec<DeviceOption>, Option<String>) {
+    match app_service::enumerate_capture_devices() {
+        Ok(devices) => (devices.into_iter().map(to_device_option).collect(), None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn load_render_devices() -> (Vec<DeviceOption>, Option<String>) {
+    match app_service::enumerate_render_devices() {
+        Ok(devices) => (devices.into_iter().map(to_device_option).collect(), None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn load_capture_devices() -> (Vec<DeviceOption>, Option<String>) {
+    (Vec::new(), None)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn load_render_devices() -> (Vec<DeviceOption>, Option<String>) {
+    (Vec::new(), None)
 }
 
 const STYLE: &str = r#"
@@ -590,6 +665,37 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
         move || state.app_settings.lock().unwrap().ollama_base_url.clone().unwrap_or_default()
     });
     let mut ollama_base_url_message = use_signal(|| None::<String>);
+
+    // ---- 録音デバイスの選択(マイク/スピーカーが複数あるとき用、他の設定とは独立) ----
+    let mut mic_devices = use_signal(load_capture_devices);
+    let mut render_devices = use_signal(load_render_devices);
+    let mut mic_device_select = use_signal({
+        let state = state.clone();
+        move || state.app_settings.lock().unwrap().microphone_device_id.clone().unwrap_or_else(|| FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string())
+    });
+    let mut render_device_select = use_signal({
+        let state = state.clone();
+        move || state.app_settings.lock().unwrap().render_device_id.clone().unwrap_or_else(|| FOLLOW_SYSTEM_DEFAULT_DEVICE.to_string())
+    });
+    let mut device_message = use_signal(|| None::<String>);
+
+    // ---- 会話ヒント (RAG): 有効化・プロバイダ・デバウンス秒数・Cloudflare資格情報(他の設定とは独立) ----
+    let mut hint_enabled_select = use_signal({
+        let state = state.clone();
+        move || state.app_settings.lock().unwrap().hint_enabled.unwrap_or(false)
+    });
+    let mut hint_provider_select = use_signal({
+        let state = state.clone();
+        move || state.app_settings.lock().unwrap().hint_provider.clone().unwrap_or_else(|| "cloudflare".to_string())
+    });
+    let mut hint_debounce_input = use_signal({
+        let state = state.clone();
+        move || state.app_settings.lock().unwrap().hint_debounce_seconds.map(|s| s.to_string()).unwrap_or_else(|| "15".to_string())
+    });
+    let mut hint_cloudflare_account_id_input = use_signal(String::new);
+    let mut hint_cloudflare_api_token_input = use_signal(String::new);
+    let mut hint_cloudflare_instance_input = use_signal(String::new);
+    let mut hint_message = use_signal(|| None::<String>);
 
     // ---- 要約: プロンプトテンプレートの選択(プロバイダ・モデルの選択とは独立) ----
     let mut summary_template_select = use_signal({
@@ -862,6 +968,150 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
         }
     };
 
+    // ==== 録音デバイスハンドラ ====
+
+    // Re-runs `enumerate_capture_devices`/`enumerate_render_devices` — lets a
+    // device plugged in (or unplugged) after Settings opened show up without
+    // restarting the app.
+    let refresh_devices = move |_| {
+        let (mic_list, mic_error) = load_capture_devices();
+        let (render_list, render_error) = load_render_devices();
+        mic_devices.set((mic_list, mic_error.clone()));
+        render_devices.set((render_list, render_error.clone()));
+        device_message.set(match (mic_error, render_error) {
+            (Some(e), _) => Some(format!("マイク一覧の取得に失敗しました: {e}")),
+            (None, Some(e)) => Some(format!("スピーカー一覧の取得に失敗しました: {e}")),
+            (None, None) => None,
+        });
+    };
+
+    let onchange_mic_device = move |evt: FormEvent| {
+        mic_device_select.set(evt.value());
+        device_message.set(None);
+    };
+    let onchange_render_device = move |evt: FormEvent| {
+        render_device_select.set(evt.value());
+        device_message.set(None);
+    };
+
+    // Persists `AppSettings::microphone_device_id`/`render_device_id` —
+    // `FOLLOW_SYSTEM_DEFAULT_DEVICE` maps back to `None` ("follow whatever the OS
+    // reports as current default", the pre-existing behavior before this picker
+    // existed). Same rollback-on-failed-save pattern as `save_ollama_base_url`
+    // above.
+    let save_devices = {
+        let state = state.clone();
+        move |_| {
+            let mic = mic_device_select();
+            let render = render_device_select();
+            let new_mic = if mic == FOLLOW_SYSTEM_DEFAULT_DEVICE { None } else { Some(mic) };
+            let new_render = if render == FOLLOW_SYSTEM_DEFAULT_DEVICE { None } else { Some(render) };
+
+            let save_result = {
+                let mut settings = state.app_settings.lock().unwrap();
+                let previous_mic = settings.microphone_device_id.clone();
+                let previous_render = settings.render_device_id.clone();
+                settings.microphone_device_id = new_mic;
+                settings.render_device_id = new_render;
+                let result = settings.save(&state.app_data_dir);
+                if result.is_err() {
+                    settings.microphone_device_id = previous_mic;
+                    settings.render_device_id = previous_render;
+                }
+                result
+            };
+            match save_result {
+                Ok(()) => device_message.set(Some("保存しました。次回の録音開始時から反映されます".to_string())),
+                Err(e) => device_message.set(Some(format!("保存に失敗しました: {e}"))),
+            }
+        }
+    };
+
+    // ==== 会話ヒント (RAG) ハンドラ ====
+
+    let onchange_hint_enabled = move |evt: FormEvent| {
+        hint_enabled_select.set(evt.checked());
+        hint_message.set(None);
+    };
+    let onchange_hint_provider = move |evt: FormEvent| {
+        hint_provider_select.set(evt.value());
+        hint_message.set(None);
+    };
+
+    // Persists `AppSettings::hint_enabled`/`hint_provider`/`hint_debounce_seconds`
+    // — same rollback-on-failed-save pattern as `save_devices` above. An empty
+    // or unparseable debounce input falls back to 15 (matching
+    // `spawn_hint_debounce_driver`'s own fallback when the setting is unset)
+    // rather than saving garbage.
+    let save_hint_settings = {
+        let state = state.clone();
+        move |_| {
+            let enabled = hint_enabled_select();
+            let provider = hint_provider_select();
+            let debounce_seconds = hint_debounce_input().trim().parse::<u32>().ok().filter(|s| *s > 0).unwrap_or(15);
+            hint_debounce_input.set(debounce_seconds.to_string());
+
+            let save_result = {
+                let mut settings = state.app_settings.lock().unwrap();
+                let previous_enabled = settings.hint_enabled;
+                let previous_provider = settings.hint_provider.clone();
+                let previous_debounce = settings.hint_debounce_seconds;
+                settings.hint_enabled = Some(enabled);
+                settings.hint_provider = Some(provider);
+                settings.hint_debounce_seconds = Some(debounce_seconds);
+                let result = settings.save(&state.app_data_dir);
+                if result.is_err() {
+                    settings.hint_enabled = previous_enabled;
+                    settings.hint_provider = previous_provider;
+                    settings.hint_debounce_seconds = previous_debounce;
+                }
+                result
+            };
+            match save_result {
+                Ok(()) => hint_message.set(Some("保存しました。次回の録音開始時から反映されます".to_string())),
+                Err(e) => hint_message.set(Some(format!("保存に失敗しました: {e}"))),
+            }
+        }
+    };
+
+    // Saves the Cloudflare AI Search credential as one JSON blob under
+    // `rhai_engine::{CLOUDFLARE_CREDENTIAL_SERVICE, CLOUDFLARE_AI_SEARCH_ACCOUNT}`
+    // — same "collect several plain `<input>`s into a typed struct, serialize,
+    // `credential_store.save`" shape as the summary Vertex AI credential above,
+    // via the shared `rhai_engine::CloudflareCredentials` type so this can
+    // never drift from the field names `rag/cloudflare.rs` actually reads.
+    let save_hint_cloudflare_credential = {
+        let state = state.clone();
+        move |_| {
+            let account_id = hint_cloudflare_account_id_input().trim().to_string();
+            let api_token = hint_cloudflare_api_token_input().trim().to_string();
+            let instance_name = hint_cloudflare_instance_input().trim().to_string();
+            if account_id.is_empty() || api_token.is_empty() || instance_name.is_empty() {
+                hint_message.set(Some("アカウントID・APIトークン・インスタンス名をすべて入力してください".to_string()));
+                return;
+            }
+
+            let credentials = rhai_engine::CloudflareCredentials { account_id, api_token, instance_name };
+            let serialized = match serde_json::to_string(&credentials) {
+                Ok(s) => s,
+                Err(e) => {
+                    hint_message.set(Some(format!("資格情報のシリアライズに失敗しました: {e}")));
+                    return;
+                }
+            };
+
+            match state.credential_store.save(rhai_engine::CLOUDFLARE_CREDENTIAL_SERVICE, rhai_engine::CLOUDFLARE_AI_SEARCH_ACCOUNT, &serialized) {
+                Ok(()) => {
+                    hint_cloudflare_account_id_input.set(String::new());
+                    hint_cloudflare_api_token_input.set(String::new());
+                    hint_cloudflare_instance_input.set(String::new());
+                    hint_message.set(Some("Cloudflareの資格情報を保存しました".to_string()));
+                }
+                Err(e) => hint_message.set(Some(format!("保存に失敗しました: {e}"))),
+            }
+        }
+    };
+
     // ==== 要約プロンプトテンプレートハンドラ ====
 
     let onchange_summary_template = move |evt: FormEvent| {
@@ -929,6 +1179,132 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
             div { class: "settings-header",
                 button { onclick: move |_| screen.set(Screen::Main), "← 戻る" }
                 h1 { "設定" }
+            }
+
+            section { class: "settings-section",
+                h2 { "録音デバイス" }
+                if device_selection_supported() {
+                    p { class: "hint", "マイクやスピーカーが複数ある場合、録音に使うデバイスを選べます。「システム既定」を選ぶとOSの既定デバイスに追従します。" }
+                    label {
+                        "マイク(自分の音声)"
+                        select {
+                            onchange: onchange_mic_device,
+                            option {
+                                value: FOLLOW_SYSTEM_DEFAULT_DEVICE,
+                                selected: mic_device_select() == FOLLOW_SYSTEM_DEFAULT_DEVICE,
+                                "システム既定"
+                            }
+                            for d in mic_devices().0 {
+                                option { value: "{d.id}", selected: mic_device_select() == d.id, "{d.option_label()}" }
+                            }
+                        }
+                    }
+                    // Shown regardless of which option is selected above — "シ
+                    // ステム既定" itself doesn't reveal which physical device
+                    // that resolves to, and even when a specific device is
+                    // already pinned, it's useful to see whether the OS
+                    // default has since drifted away from it.
+                    if let Some(current) = mic_devices().0.iter().find(|d| d.is_default) {
+                        p { class: "hint", "現在のシステム既定のマイク: {current.friendly_name}" }
+                    }
+                    label {
+                        "スピーカー(相手の音声・ループバック)"
+                        select {
+                            onchange: onchange_render_device,
+                            option {
+                                value: FOLLOW_SYSTEM_DEFAULT_DEVICE,
+                                selected: render_device_select() == FOLLOW_SYSTEM_DEFAULT_DEVICE,
+                                "システム既定"
+                            }
+                            for d in render_devices().0 {
+                                option { value: "{d.id}", selected: render_device_select() == d.id, "{d.option_label()}" }
+                            }
+                        }
+                    }
+                    if let Some(current) = render_devices().0.iter().find(|d| d.is_default) {
+                        p { class: "hint", "現在のシステム既定のスピーカー: {current.friendly_name}" }
+                    }
+                    div { style: "display: flex; gap: 0.5em;",
+                        button { class: "primary", onclick: save_devices, "この設定を保存" }
+                        button { onclick: refresh_devices, "デバイス一覧を更新" }
+                    }
+                } else {
+                    p { class: "hint", "このプラットフォームでは実際のマイク/スピーカー録音に対応していないため、デバイス選択はできません(開発用のスタブ録音のみ)。" }
+                }
+                if let Some(msg) = device_message() {
+                    p { class: "status-badge", "{msg}" }
+                }
+            }
+
+            section { class: "settings-section",
+                h2 { "会話ヒント (RAG)" }
+                p { class: "hint", "録音中の会話をもとに、RAGサービスから「今話すと良さそうなこと」のヒントをリアルタイムで表示します。BYOAI(ユーザー自身のアカウント)方式です。既定では無効 — 資格情報を設定してから有効にしてください。" }
+                label { class: "consent",
+                    input {
+                        r#type: "checkbox",
+                        checked: hint_enabled_select(),
+                        onchange: onchange_hint_enabled,
+                    }
+                    "会話ヒントを有効にする"
+                }
+
+                if hint_enabled_select() {
+                    label {
+                        "使用するRAGプロバイダ"
+                        select {
+                            onchange: onchange_hint_provider,
+                            option { value: "cloudflare", selected: hint_provider_select() == "cloudflare", "Cloudflare AI Search" }
+                            option { value: "vertex", selected: hint_provider_select() == "vertex", "Google Vertex AI (要約用の資格情報を流用)" }
+                            option { value: "bedrock", selected: hint_provider_select() == "bedrock", "AWS Bedrock (⚠️ 既知の問題により現在利用不可)" }
+                        }
+                    }
+                    label {
+                        "ヒント生成までの静寂時間(秒、最後の発話からこの秒数、会話が途切れたら生成)"
+                        input {
+                            r#type: "number",
+                            min: "1",
+                            value: "{hint_debounce_input}",
+                            oninput: move |e| hint_debounce_input.set(e.value()),
+                        }
+                    }
+                    if hint_provider_select() == "cloudflare" {
+                        h3 { "Cloudflare AI Search の資格情報" }
+                        p { class: "status-badge", if hint_cloudflare_is_configured(&state) { "設定済み" } else { "未設定" } }
+                        label {
+                            "アカウントID"
+                            input {
+                                r#type: "text",
+                                value: "{hint_cloudflare_account_id_input}",
+                                oninput: move |e| hint_cloudflare_account_id_input.set(e.value()),
+                            }
+                        }
+                        label {
+                            "APIトークン"
+                            input {
+                                r#type: "password",
+                                value: "{hint_cloudflare_api_token_input}",
+                                oninput: move |e| hint_cloudflare_api_token_input.set(e.value()),
+                            }
+                        }
+                        label {
+                            "インスタンス名"
+                            input {
+                                r#type: "text",
+                                value: "{hint_cloudflare_instance_input}",
+                                oninput: move |e| hint_cloudflare_instance_input.set(e.value()),
+                            }
+                        }
+                        button { class: "primary", onclick: save_hint_cloudflare_credential, "資格情報を保存" }
+                    } else if hint_provider_select() == "vertex" {
+                        p { class: "hint", "要約機能の「Google Vertex AI」用に設定済みの資格情報をそのまま使用します。追加の設定は不要です。" }
+                    } else {
+                        p { class: "hint", "AWS Bedrock RAGは、要約機能のBedrock APIキーと資格情報の形式が競合する既知の問題により、現時点では動作しません。" }
+                    }
+                }
+                button { class: "primary", onclick: save_hint_settings, "この設定を保存" }
+                if let Some(msg) = hint_message() {
+                    p { class: "status-badge", "{msg}" }
+                }
             }
 
             section { class: "settings-section",

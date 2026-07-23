@@ -2,8 +2,10 @@ mod actions;
 mod app_settings;
 mod app_state;
 mod config;
+mod control_server;
 mod export;
 mod gap_retranscription;
+mod hint_consumer;
 mod history;
 mod level;
 mod recording;
@@ -166,6 +168,8 @@ fn main() {
         last_summary: Mutex::new(None),
     });
 
+    control_server::spawn(state.clone());
+
     let window = WindowBuilder::new().with_title("1on1 Recorder").with_inner_size(LogicalSize::new(480.0, 640.0));
 
     let mut desktop_config = DesktopConfig::new().with_window(window).with_close_behaviour(WindowCloseBehaviour::WindowHides);
@@ -194,6 +198,12 @@ impl rhai_engine::SettingsProvider for AppSettingsProvider {
             "summary_provider_key" => self.credential_store
                 .load(summarize::CREDENTIAL_SERVICE, summarize::SELECTED_PROVIDER_ACCOUNT)
                 .ok(),
+            // `hint_debounce_seconds` deliberately has no case here anymore —
+            // `RhaiEngine::spawn_hint_debounce_driver` (`crates/rhai-engine`)
+            // reads `AppSettings::hint_debounce_seconds` directly now (it
+            // drives a real Rust-side timer via `timed-fsm`, not something
+            // `hint.rhai` polls via `get_setting`).
+            "hint_provider" => self.app_settings.lock().unwrap().hint_provider.clone(),
             _ => None,
         }
     }
