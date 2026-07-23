@@ -135,26 +135,33 @@ pub async fn run_windows_capture_session(
 }
 
 /// Resolves a saved microphone pick against the live capture-device list, falling
-/// back to `default` (and logging a warning) when it's gone stale — e.g. a USB
-/// headset unplugged after it was chosen in Settings. Without this check,
+/// back to calling `default` (and logging a warning) when it's gone stale — e.g. a
+/// USB headset unplugged after it was chosen in Settings. Without this check,
 /// `WindowsSupervisor::pin_devices` would pin a `Microphone` binding to a device
 /// id `resolve_capture_device` can never resolve, and the resulting `StreamError`
 /// only aborts that one binding's worker (see `windows_supervisor.rs`), leaving
 /// the session's Self track silently empty instead of falling back like `None`
 /// already does.
+///
+/// `default` is a closure rather than an already-resolved `EndpointId` so the
+/// caller can make `WindowsSupervisor::resolve_current_defaults`'s COM round-trip
+/// lazy: calling it unconditionally (regardless of whether either track actually
+/// needs a fallback) would turn a perfectly valid pair of explicit device picks
+/// into a hard session-start failure on any machine with no OS-designated default
+/// device (e.g. no microphone currently set as default).
 fn resolve_pinned_capture_endpoint(
     device_id: Option<String>,
-    default: &EndpointId,
+    default: impl FnOnce() -> Result<EndpointId, capture_windows::CaptureError>,
 ) -> Result<EndpointId, capture_windows::CaptureError> {
     let Some(id) = device_id else {
-        return Ok(default.clone());
+        return default();
     };
     let devices = capture_windows::device_select::enumerate_capture_devices()?;
     if devices.iter().any(|d| d.id == id) {
         Ok(EndpointId(id))
     } else {
         tracing::warn!(device_id = %id, "選択したマイクが見つからないため、システム既定にフォールバックします");
-        Ok(default.clone())
+        default()
     }
 }
 
@@ -162,17 +169,17 @@ fn resolve_pinned_capture_endpoint(
 /// rationale, applied to `EndpointLoopback`'s saved device pick.
 fn resolve_pinned_render_endpoint(
     device_id: Option<String>,
-    default: &EndpointId,
+    default: impl FnOnce() -> Result<EndpointId, capture_windows::CaptureError>,
 ) -> Result<EndpointId, capture_windows::CaptureError> {
     let Some(id) = device_id else {
-        return Ok(default.clone());
+        return default();
     };
     let devices = capture_windows::device_select::enumerate_render_devices()?;
     if devices.iter().any(|d| d.id == id) {
         Ok(EndpointId(id))
     } else {
         tracing::warn!(device_id = %id, "選択したスピーカーが見つからないため、システム既定にフォールバックします");
-        Ok(default.clone())
+        default()
     }
 }
 
@@ -211,9 +218,24 @@ fn run_capture_blocking(
     // track empty for the whole session (see `resolve_pinned_capture_endpoint`'s
     // doc comment). Falls back to the current OS default in that case, same as
     // `None`.
-    let (default_mic, default_render) = supervisor.resolve_current_defaults()?;
-    let mic_endpoint_id = resolve_pinned_capture_endpoint(mic_device_id, &default_mic)?;
-    let render_endpoint_id = resolve_pinned_render_endpoint(render_device_id, &default_render)?;
+    //
+    // `resolve_current_defaults` itself only runs when at least one track actually
+    // needs it — eagerly on the common "neither pinned" path (`needs_defaults`,
+    // same one-COM-round-trip cost as before this staleness check existed), or
+    // lazily via `default()` for the rarer case where an explicit pick turned out
+    // stale. Calling it unconditionally up front (regardless of whether it's ever
+    // used) would make a perfectly valid pair of explicit picks fail the whole
+    // session on any machine with no OS-designated default device.
+    let needs_defaults = mic_device_id.is_none() || render_device_id.is_none();
+    let defaults = if needs_defaults { Some(supervisor.resolve_current_defaults()?) } else { None };
+    let mic_endpoint_id = resolve_pinned_capture_endpoint(mic_device_id, || match &defaults {
+        Some((mic, _)) => Ok(mic.clone()),
+        None => supervisor.resolve_current_defaults().map(|(mic, _)| mic),
+    })?;
+    let render_endpoint_id = resolve_pinned_render_endpoint(render_device_id, || match &defaults {
+        Some((_, render)) => Ok(render.clone()),
+        None => supervisor.resolve_current_defaults().map(|(_, render)| render),
+    })?;
     supervisor.pin_devices(mic_endpoint_id, render_endpoint_id);
     supervisor.start_all()?;
 

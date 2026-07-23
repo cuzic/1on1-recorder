@@ -71,37 +71,42 @@ pub async fn run_macos_capture_session(
 
 /// macOS counterpart of `windows_session::resolve_pinned_capture_endpoint` — same
 /// rationale (a saved pick can go stale between Settings and recording), applied
-/// to CoreAudio's `enumerate_capture_devices` instead of WASAPI's.
+/// to CoreAudio's `enumerate_capture_devices` instead of WASAPI's. `default` is a
+/// closure (not an already-resolved `EndpointId`) for the same reason as the
+/// Windows counterpart's doc comment: it makes `MacosSupervisor::resolve_current_defaults`
+/// lazy, so a perfectly valid pair of explicit device picks never fails the whole
+/// session just because the OS happens to report no default input/output device
+/// right now.
 fn resolve_pinned_capture_endpoint(
     device_id: Option<String>,
-    default: &EndpointId,
+    default: impl FnOnce() -> Result<EndpointId, capture_macos::CaptureError>,
 ) -> Result<EndpointId, capture_macos::CaptureError> {
     let Some(id) = device_id else {
-        return Ok(default.clone());
+        return default();
     };
     let devices = capture_macos::device_select::enumerate_capture_devices()?;
     if devices.iter().any(|d| d.id == id) {
         Ok(EndpointId(id))
     } else {
         tracing::warn!(device_id = %id, "選択したマイクが見つからないため、システム既定にフォールバックします");
-        Ok(default.clone())
+        default()
     }
 }
 
 /// Render-device counterpart — see `resolve_pinned_capture_endpoint`.
 fn resolve_pinned_render_endpoint(
     device_id: Option<String>,
-    default: &EndpointId,
+    default: impl FnOnce() -> Result<EndpointId, capture_macos::CaptureError>,
 ) -> Result<EndpointId, capture_macos::CaptureError> {
     let Some(id) = device_id else {
-        return Ok(default.clone());
+        return default();
     };
     let devices = capture_macos::device_select::enumerate_render_devices()?;
     if devices.iter().any(|d| d.id == id) {
         Ok(EndpointId(id))
     } else {
         tracing::warn!(device_id = %id, "選択したスピーカーが見つからないため、システム既定にフォールバックします");
-        Ok(default.clone())
+        default()
     }
 }
 
@@ -148,10 +153,19 @@ fn run_capture_blocking(
     // `render_device_id` are validated against the live device list before being
     // pinned — see `windows_session::resolve_pinned_capture_endpoint`'s doc
     // comment on why a stale saved id must fall back to the current default
-    // rather than being pinned as-is.
-    let (default_mic, default_render) = supervisor.resolve_current_defaults()?;
-    let mic_endpoint_id = resolve_pinned_capture_endpoint(mic_device_id, &default_mic)?;
-    let render_endpoint_id = resolve_pinned_render_endpoint(render_device_id, &default_render)?;
+    // rather than being pinned as-is. That fallback is resolved lazily (only when
+    // a track actually needs it) for the same reason as the Windows counterpart —
+    // see `resolve_pinned_capture_endpoint`'s doc comment here.
+    let needs_defaults = mic_device_id.is_none() || render_device_id.is_none();
+    let defaults = if needs_defaults { Some(supervisor.resolve_current_defaults()?) } else { None };
+    let mic_endpoint_id = resolve_pinned_capture_endpoint(mic_device_id, || match &defaults {
+        Some((mic, _)) => Ok(mic.clone()),
+        None => supervisor.resolve_current_defaults().map(|(mic, _)| mic),
+    })?;
+    let render_endpoint_id = resolve_pinned_render_endpoint(render_device_id, || match &defaults {
+        Some((_, render)) => Ok(render.clone()),
+        None => supervisor.resolve_current_defaults().map(|(_, render)| render),
+    })?;
     supervisor.pin_devices(mic_endpoint_id, render_endpoint_id);
     supervisor.start_all()?;
 
