@@ -1086,6 +1086,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "control-protocol"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "interprocess",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1471,11 +1481,13 @@ version = "0.1.0"
 dependencies = [
  "app-service",
  "chrono",
+ "control-protocol",
  "credential-store",
  "crossbeam-channel",
  "dioxus",
  "dirs",
  "genai",
+ "interprocess",
  "local-broker",
  "recorder-domain",
  "rhai",
@@ -1494,6 +1506,15 @@ dependencies = [
  "tracing-subscriber",
  "transcript-event",
  "upload-client",
+]
+
+[[package]]
+name = "desktop-cli"
+version = "0.1.0"
+dependencies = [
+ "control-protocol",
+ "interprocess",
+ "serde_json",
 ]
 
 [[package]]
@@ -1972,6 +1993,12 @@ dependencies = [
  "quote",
  "syn 2.0.118",
 ]
+
+[[package]]
+name = "doctest-file"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
 
 [[package]]
 name = "doom-fish-utils"
@@ -3385,6 +3412,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "interprocess"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b"
+dependencies = [
+ "doctest-file",
+ "futures-core",
+ "libc",
+ "recvmsg",
+ "tokio",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5472,6 +5514,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "recvmsg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5686,11 +5734,14 @@ dependencies = [
  "recorder-domain",
  "reqwest 0.12.28",
  "rhai",
+ "serde",
  "serde_json",
  "session-store",
  "sha2",
  "summarize",
+ "tempfile",
  "thiserror 1.0.69",
+ "timed-fsm",
  "tokio",
  "tracing",
  "transcript-event",
@@ -6894,6 +6945,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "timed-fsm"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcca28185d88c0c7ac8bc1d6cda6528c76d8a203373baa111729248f481bf41d"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "tiny-keccak"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7862,6 +7922,12 @@ dependencies = [
  "fs_extra",
  "semver",
 ]
+
+[[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "winapi"

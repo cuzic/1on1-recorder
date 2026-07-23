@@ -1,0 +1,16 @@
+[package]
+name = "desktop-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "1on1ctl: start/stop/status control for the 1on1 Recorder desktop app over its local control socket, auto-launching the app if it isn't running."
+
+[[bin]]
+name = "1on1ctl"
+path = "src/main.rs"
+
+[dependencies]
+control-protocol = { path = "../../crates/control-protocol" }
+interprocess = "2"
+serde_json = { workspace = true }
