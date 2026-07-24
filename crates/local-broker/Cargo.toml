@@ -13,3 +13,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["sync"] }
 transcript-event = { path = "../transcript-event" }
+
+[dev-dependencies]
+# For `#[tokio::test]` in `subscription.rs`'s tests.
+tokio = { version = "1", features = ["sync", "rt", "macros"] }

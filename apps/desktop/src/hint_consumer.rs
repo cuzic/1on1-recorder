@@ -13,7 +13,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use local_broker::LocalBroker;
+use local_broker::{session_stopped_subject, LocalBroker, RecvOutcome, Subscription};
 use recorder_domain::SessionId;
 use serde::Deserialize;
 
@@ -64,22 +64,20 @@ pub fn spawn_hint_consumer(broker: LocalBroker, session_id: SessionId, buffer: H
 
 async fn run_hint_consumer(broker: LocalBroker, session_id: SessionId, buffer: HintBuffer) {
     let subject = format!("hints.{session_id}.updated");
-    let stop_subject = format!("session.{session_id}.stopped");
-    let mut rx = broker.subscribe(&subject);
-    let mut stop_rx = broker.subscribe(&stop_subject);
+    let mut sub = Subscription::new(broker.clone(), subject);
+    let mut stop_sub = Subscription::new(broker, session_stopped_subject(session_id));
 
     loop {
         let payload = tokio::select! {
-            result = rx.recv() => match result {
-                Ok(p) => p,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+            outcome = sub.recv() => match outcome {
+                RecvOutcome::Message(p) => p,
+                RecvOutcome::Lagged(n) => {
                     tracing::warn!(n, %session_id, "hint_consumer: lagged, skipping to latest");
-                    rx = broker.subscribe(&subject);
                     continue;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                RecvOutcome::Closed => break,
             },
-            _ = stop_rx.recv() => break,
+            _ = stop_sub.recv() => break,
         };
 
         let parsed: HintPayload = match serde_json::from_slice(&payload) {

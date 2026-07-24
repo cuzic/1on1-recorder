@@ -7,16 +7,16 @@
 //!
 //! See `docs/decouple-summary-transcription.md` §6.2.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use credential_store::CredentialStore;
-use local_broker::LocalBroker;
+use local_broker::{session_stopped_subject, LocalBroker, RecvOutcome, Subscription};
 use recorder_domain::SessionId;
 use session_store::{SessionStore, Summary};
 use summarize::{Summarizer, TranscriptTurn};
 use transcript_event::{
-    EventEnvelope, ProtocolValidator, SummaryEvent, TranscriptEvent, UtteranceEndReason,
+    EventEnvelope, FinalizedTurns, ProtocolValidator, SummaryEvent, TranscriptEvent,
+    UtteranceEndReason,
 };
 
 use crate::app_settings::AppSettings;
@@ -63,30 +63,14 @@ impl SummaryConsumer {
     async fn run_auto_summary(&self, session_id: SessionId) {
         let segment_subject = format!("transcription.{session_id}.segment.finalized");
         let utterance_subject = format!("transcription.{session_id}.utterance.ended");
-        let stop_subject = format!("session.{session_id}.stopped");
 
-        let mut segment_rx = self.broker.subscribe(&segment_subject);
-        let mut utterance_rx = self.broker.subscribe(&utterance_subject);
-        let mut stop_rx = self.broker.subscribe(&stop_subject);
+        let mut segment_sub = Subscription::new(self.broker.clone(), segment_subject);
+        let mut utterance_sub = Subscription::new(self.broker.clone(), utterance_subject);
+        let mut stop_sub = Subscription::new(self.broker.clone(), session_stopped_subject(session_id));
 
         // 1. Load existing finalized segments from SessionStore (late-join support)
-        let existing = self.store.list_transcript_segments(session_id).unwrap_or_default();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut turns: Vec<TranscriptTurn> = Vec::new();
-
-        for seg in &existing {
-            if seg.is_final {
-                let sid = transcript_event::segment_id_for_segment(
-                    seg.session_id, seg.track, seg.start_ms, seg.end_ms,
-                );
-                if seen.insert(sid) {
-                    turns.push(TranscriptTurn {
-                        speaker: Some(transcript::speaker_label(seg.track, seg.speaker)),
-                        text: seg.text.clone(),
-                    });
-                }
-            }
-        }
+        let mut turns: FinalizedTurns<TranscriptTurn> = FinalizedTurns::new();
+        load_finalized_from_store(&self.store, session_id, &mut turns);
 
         // 2. Initialize protocol validator
         let mut validator = ProtocolValidator::new(session_id);
@@ -94,9 +78,9 @@ impl SummaryConsumer {
         // 3. Subscribe to broker events
         loop {
             tokio::select! {
-                result = segment_rx.recv() => {
-                    match result {
-                        Ok(payload) => {
+                outcome = segment_sub.recv() => {
+                    match outcome {
+                        RecvOutcome::Message(payload) => {
                             let envelope: EventEnvelope<TranscriptEvent> = match serde_json::from_slice(&payload) {
                                 Ok(e) => e,
                                 Err(err) => {
@@ -109,25 +93,22 @@ impl SummaryConsumer {
                                 if let Err(err) = validator.validate(&envelope.body) {
                                     tracing::warn!(%session_id, %err, "summary_consumer: protocol validation error");
                                 }
-                                if seen.insert(data.segment_id.clone()) {
-                                    turns.push(TranscriptTurn {
-                                        speaker: Some(data.speaker_label.clone()),
-                                        text: data.text.clone(),
-                                    });
-                                }
+                                turns.insert_if_new(data.segment_id.clone(), TranscriptTurn {
+                                    speaker: Some(data.speaker_label.clone()),
+                                    text: data.text.clone(),
+                                });
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        RecvOutcome::Lagged(n) => {
                             tracing::warn!(n, %session_id, "summary_consumer: lagged, reloading from store");
-                            recover_turns(&self.store, session_id, &mut seen, &mut turns);
-                            segment_rx = self.broker.subscribe(&segment_subject);
+                            load_finalized_from_store(&self.store, session_id, &mut turns);
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        RecvOutcome::Closed => break,
                     }
                 }
-                result = utterance_rx.recv() => {
-                    match result {
-                        Ok(payload) => {
+                outcome = utterance_sub.recv() => {
+                    match outcome {
+                        RecvOutcome::Message(payload) => {
                             let envelope: EventEnvelope<TranscriptEvent> = match serde_json::from_slice(&payload) {
                                 Ok(e) => e,
                                 Err(err) => {
@@ -143,10 +124,8 @@ impl SummaryConsumer {
                                 break; // Session ended → generate summary
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            utterance_rx = self.broker.subscribe(&utterance_subject);
-                        }
+                        RecvOutcome::Closed => break,
+                        RecvOutcome::Lagged(_) => {}
                     }
                 }
                 // See `spawn_auto_summary`'s doc comment — whichever of this
@@ -154,7 +133,7 @@ impl SummaryConsumer {
                 // summary from whatever `turns` have been collected so far;
                 // the other, if it still arrives afterward, is simply never
                 // observed once this task has already exited.
-                _ = stop_rx.recv() => break,
+                _ = stop_sub.recv() => break,
             }
         }
 
@@ -163,7 +142,7 @@ impl SummaryConsumer {
             return;
         }
 
-        self.generate_and_publish(session_id, &turns).await;
+        self.generate_and_publish(session_id, turns.turns()).await;
     }
 
     /// Manual summary generation (user-triggered "要約を生成" button).
@@ -316,11 +295,15 @@ impl SummaryConsumer {
     }
 }
 
-fn recover_turns(
+/// Reads all finalized segments for `session_id` from `store` and appends
+/// whichever aren't already in `turns` (deduplicated via
+/// `FinalizedTurns::insert_if_new`). Used both for the initial late-join load and
+/// for lagged-recovery — both cases are "some finalized segments may already be
+/// known, load everything and let dedup sort out what's new."
+fn load_finalized_from_store(
     store: &SessionStore,
     session_id: SessionId,
-    seen: &mut HashSet<String>,
-    turns: &mut Vec<TranscriptTurn>,
+    turns: &mut FinalizedTurns<TranscriptTurn>,
 ) {
     let segments = store.list_transcript_segments(session_id).unwrap_or_default();
     for seg in &segments {
@@ -328,12 +311,10 @@ fn recover_turns(
             let sid = transcript_event::segment_id_for_segment(
                 seg.session_id, seg.track, seg.start_ms, seg.end_ms,
             );
-            if seen.insert(sid) {
-                turns.push(TranscriptTurn {
-                    speaker: Some(transcript::speaker_label(seg.track, seg.speaker)),
-                    text: seg.text.clone(),
-                });
-            }
+            turns.insert_if_new(sid, TranscriptTurn {
+                speaker: Some(transcript::speaker_label(seg.track, seg.speaker)),
+                text: seg.text.clone(),
+            });
         }
     }
 }

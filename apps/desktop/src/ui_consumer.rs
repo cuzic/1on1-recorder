@@ -3,13 +3,14 @@
 //!
 //! See `docs/decouple-summary-transcription.md` §6.1.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use local_broker::LocalBroker;
+use local_broker::{session_stopped_subject, LocalBroker, RecvOutcome, Subscription};
 use recorder_domain::SessionId;
 use session_store::{SessionStore, TranscriptSegment};
-use transcript_event::{EventEnvelope, Finality, ProtocolValidator, SegmentData, TranscriptEvent};
+use transcript_event::{
+    EventEnvelope, Finality, ProtocolValidator, SegmentData, SegmentSnapshot, TranscriptEvent,
+};
 
 /// A shared buffer that the UI Consumer writes to and the UI polling loop reads from.
 #[derive(Clone, Default)]
@@ -54,31 +55,29 @@ async fn run_ui_consumer(
     buffer: TranscriptBuffer,
 ) {
     let subject = format!("transcription.{session_id}.segment.updated");
-    let stop_subject = format!("session.{session_id}.stopped");
-    let mut rx = broker.subscribe(&subject);
-    let mut stop_rx = broker.subscribe(&stop_subject);
+    let mut sub = Subscription::new(broker.clone(), subject);
+    let mut stop_sub = Subscription::new(broker, session_stopped_subject(session_id));
 
-    let mut segment_map: BTreeMap<String, TranscriptSegment> = BTreeMap::new();
+    let mut snapshot = SegmentSnapshot::new();
     let mut validator = ProtocolValidator::new(session_id);
 
     loop {
         let payload = tokio::select! {
-            result = rx.recv() => match result {
-                Ok(p) => p,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+            outcome = sub.recv() => match outcome {
+                RecvOutcome::Message(p) => p,
+                RecvOutcome::Lagged(n) => {
                     tracing::warn!(n, %session_id, "ui_consumer: lagged, reloading from store");
                     if let Ok(segments) = store.list_transcript_segments(session_id) {
                         if let Ok(mut guard) = buffer.segments.lock() {
                             *guard = segments;
                         }
                     }
-                    rx = broker.subscribe(&subject);
-                    segment_map.clear();
+                    snapshot.clear();
                     continue;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                RecvOutcome::Closed => break,
             },
-            _ = stop_rx.recv() => break,
+            _ = stop_sub.recv() => break,
         };
 
         let envelope: EventEnvelope<TranscriptEvent> = match serde_json::from_slice(&payload) {
@@ -103,11 +102,13 @@ async fn run_ui_consumer(
             tracing::warn!(%session_id, %err, "ui_consumer: protocol validation error");
         }
 
-        let segment = data_to_transcript_segment(&data, finality);
-        segment_map.insert(data.segment_id, segment);
+        snapshot.apply(data, finality);
 
-        let mut segments: Vec<TranscriptSegment> = segment_map.values().cloned().collect();
-        segments.sort_by_key(|s| s.start_ms.unwrap_or(0));
+        let segments: Vec<TranscriptSegment> = snapshot
+            .ordered_by_start()
+            .into_iter()
+            .map(|(data, finality)| data_to_transcript_segment(data, finality, session_id))
+            .collect();
 
         if let Ok(mut guard) = buffer.segments.lock() {
             *guard = segments;
@@ -115,11 +116,15 @@ async fn run_ui_consumer(
     }
 }
 
-fn data_to_transcript_segment(data: &SegmentData, finality: Finality) -> TranscriptSegment {
+fn data_to_transcript_segment(
+    data: &SegmentData,
+    finality: Finality,
+    session_id: SessionId,
+) -> TranscriptSegment {
     let is_final = matches!(finality, Finality::Final);
     let speaker = parse_speaker_from_label(&data.speaker_label);
     TranscriptSegment {
-        session_id: SessionId::new(),
+        session_id,
         track: Some(data.track),
         speaker,
         text: data.text.clone(),

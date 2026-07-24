@@ -15,6 +15,10 @@
 //! - When all receivers for a subject are dropped, the sender is removed from the
 //!   map on the next `publish()` or `subscribe()` call to that subject.
 
+mod subscription;
+
+pub use subscription::{session_stopped_subject, RecvOutcome, Subscription};
+
 use std::sync::Arc;
 
 use dashmap::DashMap;

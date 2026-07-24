@@ -49,7 +49,9 @@ fn build_manifest(mic_device_id: &str, render_device_id: &str) -> SessionManifes
 /// session, or whether some of them have already ended via a real
 /// `SessionEnd` broadcast by the time this runs.
 fn publish_session_stopped(state: &AppState, session_id: SessionId) {
-    let _ = state.broker.publish_bytes(&format!("session.{session_id}.stopped"), Vec::new());
+    let _ = state
+        .broker
+        .publish_bytes(&local_broker::session_stopped_subject(session_id), Vec::new());
 }
 
 #[cfg(windows)]

@@ -14,8 +14,10 @@
 //! Protocol validation is provided by [`ProtocolValidator`] — see the [`validator`]
 //! module for the canonicality rules.
 
+pub mod aggregator;
 pub mod validator;
 
+pub use aggregator::{FinalizedTurns, SegmentSnapshot};
 pub use validator::{ProtocolValidator, ValidationError, ValidationWarning};
 
 use chrono::{DateTime, Utc};
