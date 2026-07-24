@@ -40,6 +40,15 @@ pub enum DeviceWatchEvent {
     DeviceRemoved {
         device_uid: String,
     },
+    /// `kAudioHardwarePropertyDevices` fired — the device list changed somehow,
+    /// but CoreAudio's listener alone can't say what (added vs. removed, which
+    /// device). The consumer re-enumerates and diffs against its own last-seen
+    /// snapshot (`capture_api::device_diff`) to recover real added/removed facts —
+    /// see `macos_supervisor::MacosSupervisor::reconcile_device_list`. Replaces an
+    /// earlier placeholder that reported this as `DeviceAdded { device_uid:
+    /// String::new() }`, which claimed an identity this listener never actually
+    /// has.
+    DeviceListChanged,
     DefaultInputDeviceChanged {
         device_uid: Option<String>,
     },
@@ -209,15 +218,7 @@ unsafe extern "C-unwind" fn property_changed(
     let address = unsafe { in_addresses.as_ref() };
 
     let event = match address.mSelector {
-        s if s == kAudioHardwarePropertyDevices => {
-            // The listener alone can't tell added from removed; the consumer
-            // re-enumerates and diffs (see `DeviceWatch::start`'s doc comment).
-            // Reported as `DeviceAdded` with an empty UID as a re-enumerate-me
-            // trigger — refine once real behavior is observed on a Mac.
-            DeviceWatchEvent::DeviceAdded {
-                device_uid: String::new(),
-            }
-        }
+        s if s == kAudioHardwarePropertyDevices => DeviceWatchEvent::DeviceListChanged,
         s if s == kAudioHardwarePropertyDefaultInputDevice => {
             DeviceWatchEvent::DefaultInputDeviceChanged { device_uid: None }
         }

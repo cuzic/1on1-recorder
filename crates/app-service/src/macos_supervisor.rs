@@ -113,6 +113,10 @@ pub struct MacosSupervisor {
     pending_joins: usize,
     frame_tx: Option<Sender<FrameSinkEvent>>,
     health_sink: Option<Arc<Mutex<CaptureHealth>>>,
+    /// Last-seen union of capture+render device ids, seeded in `start_all` and
+    /// rolled forward by `reconcile_device_list` on every
+    /// `DeviceWatchEvent::DeviceListChanged` — see that method's doc comment.
+    device_snapshot: capture_api::device_diff::DeviceSnapshot,
 }
 
 impl MacosSupervisor {
@@ -139,6 +143,7 @@ impl MacosSupervisor {
             pending_joins: 0,
             frame_tx: None,
             health_sink: None,
+            device_snapshot: capture_api::device_diff::DeviceSnapshot::default(),
         }
     }
 
@@ -221,12 +226,64 @@ impl MacosSupervisor {
     /// exactly one shared stream covering both, instead of restarting once per
     /// binding.
     pub fn start_all(&mut self) -> Result<(), CaptureError> {
+        // Seeds `device_snapshot` so the first `DeviceListChanged` after this only
+        // reports what actually changed since session start, not every currently-
+        // present device as freshly "added". A failed enumeration here just leaves
+        // the snapshot empty (logged, not fatal) — the very next successful
+        // `reconcile_device_list` self-heals it, at the cost of that one round
+        // reporting spurious `EndpointAdded`s for everything already present,
+        // which `decide()` no-ops for any binding not currently `Waiting`.
+        match self.enumerate_device_snapshot() {
+            Ok(snapshot) => self.device_snapshot = snapshot,
+            Err(err) => tracing::warn!(%err, "failed to seed initial macOS device snapshot"),
+        }
+
         let mut effects = Vec::new();
         for binding in [BindingKind::Microphone, BindingKind::EndpointLoopback] {
             effects.extend(decide(
                 &mut self.state,
                 DecisionInput::UserIntent(UserIntent::Start { binding }),
             ));
+        }
+        self.execute(effects)
+    }
+
+    /// The union of capture+render device ids right now — see `device_snapshot`'s
+    /// doc comment on why one merged set (not two per-flow sets) is correct.
+    fn enumerate_device_snapshot(&self) -> Result<capture_api::device_diff::DeviceSnapshot, CaptureError> {
+        let capture_devices = capture_macos::device_select::enumerate_capture_devices()?;
+        let render_devices = capture_macos::device_select::enumerate_render_devices()?;
+        let ids = capture_devices
+            .into_iter()
+            .map(|d| EndpointId(d.id))
+            .chain(render_devices.into_iter().map(|d| EndpointId(d.id)));
+        Ok(capture_api::device_diff::DeviceSnapshot::from_ids(ids))
+    }
+
+    /// Turns a `DeviceWatchEvent::DeviceListChanged` notification (which by itself
+    /// only says "something changed", not what — see that variant's doc comment)
+    /// into real `EndpointAdded`/`EndpointRemoved` observations, by re-enumerating
+    /// both device lists and diffing against `device_snapshot`. This is what lets
+    /// a *non-default* pinned device's disconnect/reconnect recover via the same
+    /// `Waiting`/retry path a default-device change already gets — the gap this
+    /// module's doc comment used to flag as unimplemented. Always runs on this
+    /// supervisor's own thread (never the CoreAudio callback thread), matching
+    /// `DeviceWatch::start`'s "the consumer re-enumerates in response" contract.
+    fn reconcile_device_list(&mut self) -> Result<(), CaptureError> {
+        let next = self.enumerate_device_snapshot()?;
+        let delta = self.device_snapshot.diff_and_update(next);
+
+        let mut effects = Vec::new();
+        // Removed before added: mirrors the order a device physically
+        // disappearing-then-reappearing would naturally produce, and ensures a
+        // binding that's simultaneously losing one pinned device and gaining
+        // another (a rare but possible single-diff scenario) processes the loss
+        // first.
+        for endpoint_id in delta.removed {
+            effects.extend(decide(&mut self.state, DecisionInput::Observation(Observation::EndpointRemoved { endpoint_id })));
+        }
+        for endpoint_id in delta.added {
+            effects.extend(decide(&mut self.state, DecisionInput::Observation(Observation::EndpointAdded { endpoint_id })));
         }
         self.execute(effects)
     }
@@ -502,16 +559,13 @@ impl MacosSupervisor {
     }
 
     fn handle_device_watch_event(&mut self, event: DeviceWatchEvent) -> Result<(), CaptureError> {
-        // `capture_macos::device_watch`'s listener deliberately does not resolve
-        // device identity inline (see its own doc comment) — for now, any device
-        // list/default change is treated as a signal to re-check current defaults
-        // rather than a directly-actionable EndpointId, unlike Windows's richer
-        // `DeviceWatchEvent` (which carries a resolved endpoint id from
-        // `IMMNotificationClient` directly). This is a known gap: only default-
-        // device changes are actionable today; a *non-default* pinned device
-        // reappearing/disappearing needs `device_select::enumerate_*` polling to
-        // detect, which `macos_supervisor` does not yet do — tracked as follow-up
-        // once this is exercised against real hardware.
+        // Default-device changes carry a resolved endpoint id directly from
+        // CoreAudio and are turned into an `Observation` below like Windows'
+        // `IMMNotificationClient` events are. `DeviceListChanged` is different —
+        // CoreAudio's listener can't say what changed, only that something did —
+        // so it's routed to `reconcile_device_list`'s enumerate-and-diff instead
+        // of being mapped to a single `Observation` here (see that method's doc
+        // comment, and `DeviceWatchEvent::DeviceListChanged`'s).
         let observation = match event {
             DeviceWatchEvent::DefaultInputDeviceChanged { device_uid } => {
                 device_uid.map(|id| Observation::DefaultEndpointChanged {
@@ -527,6 +581,14 @@ impl MacosSupervisor {
                     endpoint_id: Some(EndpointId(id)),
                 })
             }
+            DeviceWatchEvent::DeviceListChanged => {
+                self.reconcile_device_list()?;
+                None
+            }
+            // Not emitted by `capture_macos::device_watch` today (superseded by
+            // `DeviceListChanged` above) — kept as accepted-but-inert variants
+            // for symmetry with Windows' richer per-event `DeviceWatchEvent`,
+            // should a future revision resolve identity inline after all.
             DeviceWatchEvent::DeviceAdded { device_uid } if !device_uid.is_empty() => {
                 Some(Observation::EndpointAdded {
                     endpoint_id: EndpointId(device_uid),
