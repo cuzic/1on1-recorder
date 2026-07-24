@@ -11,8 +11,10 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::capture_health::CaptureHealth;
 
 use capture_api::rebinding::{
     decide, BindingKind, CaptureBinding, BindingSelection, DataFlow, DecisionInput, DecisionState,
@@ -82,6 +84,7 @@ pub struct WindowsSupervisor {
     /// for this to reach 0 before returning.
     pending_joins: usize,
     frame_tx: Option<Sender<FrameSinkEvent>>,
+    health_sink: Option<Arc<Mutex<CaptureHealth>>>,
 }
 
 impl WindowsSupervisor {
@@ -114,6 +117,7 @@ impl WindowsSupervisor {
             callback_timeout_ms,
             pending_joins: 0,
             frame_tx: None,
+            health_sink: None,
         }
     }
 
@@ -125,6 +129,32 @@ impl WindowsSupervisor {
     /// only cares about capture lifecycle management.
     pub fn set_frame_sink(&mut self, tx: Sender<FrameSinkEvent>) {
         self.frame_tx = Some(tx);
+    }
+
+    /// Registers where this session's per-track health (see [`CaptureHealth`]) gets
+    /// published on every `run_until_shutdown` loop iteration — `apps/desktop`'s
+    /// recording screen is the intended consumer, polling it the same way it
+    /// already polls `LevelSnapshot`. Not calling this just means no one observes
+    /// health; capture lifecycle management itself is unaffected either way.
+    pub fn set_health_sink(&mut self, sink: Arc<Mutex<CaptureHealth>>) {
+        self.health_sink = Some(sink);
+    }
+
+    /// Snapshot of both tracks' current health, derived from `self.state`'s
+    /// per-binding lifecycle — see `capture_api::rebinding::CaptureBindingState::health`.
+    /// A binding not present in `self.state.bindings` yet (before `pin_devices`) or
+    /// no longer present reads as `Ok` rather than an unhealthy state: "no binding"
+    /// isn't itself an unhealthy condition here, it's a session that hasn't started.
+    pub fn capture_health(&self) -> CaptureHealth {
+        let self_health = self.state.bindings.get(&BindingKind::Microphone).map(|b| b.lifecycle.health().into()).unwrap_or_default();
+        let remote_health = self.state.bindings.get(&BindingKind::EndpointLoopback).map(|b| b.lifecycle.health().into()).unwrap_or_default();
+        CaptureHealth { self_health, remote_health }
+    }
+
+    fn publish_health(&self) {
+        if let Some(sink) = &self.health_sink {
+            *sink.lock().unwrap() = self.capture_health();
+        }
     }
 
     /// Queries whatever the OS's current Console-role default capture/render
@@ -217,6 +247,7 @@ impl WindowsSupervisor {
                 self.drain_pending_joins();
                 return Ok(());
             }
+            self.publish_health();
         }
     }
 

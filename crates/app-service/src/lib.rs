@@ -7,6 +7,7 @@
 //! upload worker and `CaptureState`/`UploadState` lifecycle management
 //! (`upload_worker`, `session_lifecycle`), including force-quit crash recovery.
 
+pub mod capture_health;
 mod error;
 mod normalize;
 mod pipeline;
@@ -95,6 +96,7 @@ pub mod macos_supervisor;
 #[cfg(feature = "macos-supervisor")]
 pub use macos_session::run_macos_capture_session;
 
+pub use capture_health::{CaptureHealth, TrackHealth};
 pub use error::AppServiceError;
 pub use normalize::normalize_to_mono;
 pub use pipeline::run_pipeline;

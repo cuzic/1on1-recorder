@@ -45,7 +45,7 @@
 //! constructs a `FollowDefault` binding.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use capture_api::rebinding::{
@@ -53,6 +53,7 @@ use capture_api::rebinding::{
     DeviceRole, Effect, EndpointId, EndpointSelection, Observation, OperationId, ResolvedTarget,
     StreamEpoch, UserIntent,
 };
+use crate::capture_health::CaptureHealth;
 use capture_macos::device_watch::DeviceWatchEvent;
 use capture_macos::sc_stream::{ScreenCaptureKitStream, StreamOutputs};
 use capture_macos::{
@@ -111,6 +112,7 @@ pub struct MacosSupervisor {
     channels: u16,
     pending_joins: usize,
     frame_tx: Option<Sender<FrameSinkEvent>>,
+    health_sink: Option<Arc<Mutex<CaptureHealth>>>,
 }
 
 impl MacosSupervisor {
@@ -136,6 +138,7 @@ impl MacosSupervisor {
             channels,
             pending_joins: 0,
             frame_tx: None,
+            health_sink: None,
         }
     }
 
@@ -143,6 +146,26 @@ impl MacosSupervisor {
     /// identical rationale.
     pub fn set_frame_sink(&mut self, tx: Sender<FrameSinkEvent>) {
         self.frame_tx = Some(tx);
+    }
+
+    /// See `windows_supervisor::WindowsSupervisor::set_health_sink`'s doc comment —
+    /// identical rationale.
+    pub fn set_health_sink(&mut self, sink: Arc<Mutex<CaptureHealth>>) {
+        self.health_sink = Some(sink);
+    }
+
+    /// See `windows_supervisor::WindowsSupervisor::capture_health`'s doc comment —
+    /// identical rationale.
+    pub fn capture_health(&self) -> CaptureHealth {
+        let self_health = self.state.bindings.get(&BindingKind::Microphone).map(|b| b.lifecycle.health().into()).unwrap_or_default();
+        let remote_health = self.state.bindings.get(&BindingKind::EndpointLoopback).map(|b| b.lifecycle.health().into()).unwrap_or_default();
+        CaptureHealth { self_health, remote_health }
+    }
+
+    fn publish_health(&self) {
+        if let Some(sink) = &self.health_sink {
+            *sink.lock().unwrap() = self.capture_health();
+        }
     }
 
     /// Resolves "whatever's currently the default" for both bindings, mirroring
@@ -251,6 +274,7 @@ impl MacosSupervisor {
                 self.drain_pending_joins();
                 return Ok(());
             }
+            self.publish_health();
         }
     }
 

@@ -15,6 +15,7 @@ use recorder_domain::{SessionManifest, SessionSummary, TrackKind, UploadAdapter}
 use session_store::SessionStore;
 use tokio::sync::mpsc::Sender;
 
+use crate::capture_health::CaptureHealth;
 use crate::error::AppServiceError;
 use crate::live_transcription::{run_live_transcription, TranscriptionStatus};
 use crate::pipeline::run_pipeline;
@@ -60,6 +61,11 @@ use crate::windows_supervisor::WindowsSupervisor;
 /// `WindowsSupervisor::resolve_current_defaults()` — the caller's (`apps/desktop`'s)
 /// resolved `AppSettings::microphone_device_id`/`render_device_id` selection, or
 /// `None` for "whatever's currently the OS default", the pre-existing behavior.
+///
+/// `health_sink`, if given, is kept up to date with both tracks' rebinding-FSM
+/// health (see `WindowsSupervisor::set_health_sink`) — same shape as `level_sink`,
+/// so the caller (`apps/desktop`) can show a warning instead of a silently
+/// flatlined meter when a track goes `Waiting`/`Failed` mid-session.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_windows_capture_session(
     manifest: &SessionManifest,
@@ -76,6 +82,7 @@ pub async fn run_windows_capture_session(
     broker: Option<&LocalBroker>,
     mic_device_id: Option<String>,
     render_device_id: Option<String>,
+    health_sink: Option<Arc<Mutex<CaptureHealth>>>,
 ) -> Result<SessionSummary, AppServiceError> {
     // Same shape as `level_sink`'s side channel (see `windows_frame_collector`'s doc
     // comment), but for raw PCM instead of RMS/peak. `stt_tx` is moved into
@@ -109,8 +116,9 @@ pub async fn run_windows_capture_session(
         broker,
     );
 
-    let capture_fut =
-        tokio::task::spawn_blocking(move || run_capture_blocking(callback_timeout_ms, shutdown_rx, level_sink, stt_tx, mic_device_id, render_device_id));
+    let capture_fut = tokio::task::spawn_blocking(move || {
+        run_capture_blocking(callback_timeout_ms, shutdown_rx, level_sink, stt_tx, mic_device_id, render_device_id, health_sink)
+    });
 
     let (collected, ()) = tokio::join!(capture_fut, live_transcription_fut);
     let collected = collected.expect("capture supervisor thread panicked").map_err(|e| AppServiceError::Capture(e.to_string()))?;
@@ -199,10 +207,14 @@ fn run_capture_blocking(
     stt_tx: Sender<(TrackKind, Vec<f32>, u32)>,
     mic_device_id: Option<String>,
     render_device_id: Option<String>,
+    health_sink: Option<Arc<Mutex<CaptureHealth>>>,
 ) -> Result<CollectedFrames, capture_windows::CaptureError> {
     let mut supervisor = WindowsSupervisor::new(callback_timeout_ms);
     let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
     supervisor.set_frame_sink(frame_tx);
+    if let Some(sink) = health_sink {
+        supervisor.set_health_sink(sink);
+    }
 
     let (watch_tx, watch_rx) = crossbeam_channel::unbounded();
     let _device_watch = DeviceWatch::start(watch_tx)?;

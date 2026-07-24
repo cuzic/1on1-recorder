@@ -11,6 +11,7 @@ use capture_macos::device_watch::DeviceWatch;
 use recorder_domain::{SessionManifest, SessionSummary, UploadAdapter};
 use session_store::SessionStore;
 
+use crate::capture_health::CaptureHealth;
 use crate::error::AppServiceError;
 use crate::macos_frame_collector::{collect_frames, CollectedFrames, LevelSnapshot};
 use crate::macos_supervisor::MacosSupervisor;
@@ -27,6 +28,9 @@ use crate::pipeline::run_pipeline;
 /// `mic_device_id`/`render_device_id` — see `run_windows_capture_session`'s doc
 /// comment on the same two parameters; identical contract here.
 ///
+/// `health_sink` — see `run_windows_capture_session`'s doc comment on the same
+/// parameter; identical contract here.
+///
 /// **Not yet run on real macOS hardware or verified against a real build at all**
 /// — see `capture-macos`'s crate doc comment and this crate's README.
 #[allow(clippy::too_many_arguments)]
@@ -42,9 +46,10 @@ pub async fn run_macos_capture_session(
     level_sink: Option<Arc<Mutex<LevelSnapshot>>>,
     mic_device_id: Option<String>,
     render_device_id: Option<String>,
+    health_sink: Option<Arc<Mutex<CaptureHealth>>>,
 ) -> Result<SessionSummary, AppServiceError> {
     let collected = tokio::task::spawn_blocking(move || {
-        run_capture_blocking(sample_rate_hz, channels, shutdown_rx, level_sink, mic_device_id, render_device_id)
+        run_capture_blocking(sample_rate_hz, channels, shutdown_rx, level_sink, mic_device_id, render_device_id, health_sink)
     })
     .await
     .expect("capture supervisor thread panicked")
@@ -140,10 +145,14 @@ fn run_capture_blocking(
     level_sink: Option<Arc<Mutex<LevelSnapshot>>>,
     mic_device_id: Option<String>,
     render_device_id: Option<String>,
+    health_sink: Option<Arc<Mutex<CaptureHealth>>>,
 ) -> Result<CollectedFrames, capture_macos::CaptureError> {
     let mut supervisor = MacosSupervisor::new(sample_rate_hz, channels);
     let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
     supervisor.set_frame_sink(frame_tx);
+    if let Some(sink) = health_sink {
+        supervisor.set_health_sink(sink);
+    }
 
     let (watch_tx, watch_rx) = crossbeam_channel::unbounded();
     let _device_watch = DeviceWatch::start(watch_tx)?;
