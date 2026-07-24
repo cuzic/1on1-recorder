@@ -877,6 +877,126 @@ fn worker_failed_while_running_is_handled_same_as_while_starting() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// (e) A FollowDefault binding parked in Waiting (no default device was set)
+//     recovers once a default device is actually announced — regression test
+//     for a bug where DefaultEndpointChanged only ever re-resolved a Running
+//     binding, leaving a Waiting FollowDefault binding stuck forever (unlike a
+//     Pinned binding, which EndpointAdded can resurrect).
+// ---------------------------------------------------------------------------
+#[test]
+fn follow_default_binding_waiting_for_no_default_recovers_once_a_default_appears() {
+    let mut state = DecisionState::new().with_binding(CaptureBinding::new(
+        BindingKind::Microphone,
+        BindingSelection::Endpoint(EndpointSelection::FollowDefault {
+            flow: DataFlow::Capture,
+            role: DeviceRole::Console,
+        }),
+    ));
+
+    // No default_routes entry at all yet: Start must park the binding in
+    // Waiting rather than produce a StartCapture with nothing to target.
+    let effects = decide(
+        &mut state,
+        DecisionInput::UserIntent(UserIntent::Start {
+            binding: BindingKind::Microphone,
+        }),
+    );
+    assert_eq!(effects, vec![]);
+    assert_eq!(
+        state.bindings[&BindingKind::Microphone].lifecycle,
+        CaptureBindingState::Waiting {
+            reason: WaitReason::DeviceUnavailable,
+        }
+    );
+
+    // A default capture device is announced for the first time.
+    let effects = decide(
+        &mut state,
+        DecisionInput::Observation(Observation::DefaultEndpointChanged {
+            flow: DataFlow::Capture,
+            role: DeviceRole::Console,
+            endpoint_id: Some(endpoint("MicA")),
+        }),
+    );
+    let (op0, epoch0) = match effects.as_slice() {
+        [Effect::StartCapture {
+            operation_id,
+            proposed_epoch,
+            target,
+            ..
+        }] => {
+            assert_eq!(*target, ResolvedTarget::Endpoint(endpoint("MicA")));
+            (*operation_id, *proposed_epoch)
+        }
+        other => panic!("expected StartCapture once a default appears, got {other:?}"),
+    };
+    assert!(matches!(
+        state.bindings[&BindingKind::Microphone].lifecycle,
+        CaptureBindingState::Starting { .. }
+    ));
+
+    decide(
+        &mut state,
+        DecisionInput::Observation(Observation::WorkerStarted {
+            binding: BindingKind::Microphone,
+            operation_id: op0,
+            epoch: epoch0,
+            target: ResolvedTarget::Endpoint(endpoint("MicA")),
+        }),
+    );
+    assert_eq!(
+        state.bindings[&BindingKind::Microphone].lifecycle,
+        CaptureBindingState::Running {
+            operation_id: op0,
+            epoch: epoch0,
+            target: ResolvedTarget::Endpoint(endpoint("MicA")),
+        }
+    );
+}
+
+#[test]
+fn default_endpoint_changed_to_none_leaves_a_waiting_follow_default_binding_waiting() {
+    let mut state = DecisionState::new().with_binding(CaptureBinding::new(
+        BindingKind::Microphone,
+        BindingSelection::Endpoint(EndpointSelection::FollowDefault {
+            flow: DataFlow::Capture,
+            role: DeviceRole::Console,
+        }),
+    ));
+    decide(
+        &mut state,
+        DecisionInput::UserIntent(UserIntent::Start {
+            binding: BindingKind::Microphone,
+        }),
+    );
+    assert_eq!(
+        state.bindings[&BindingKind::Microphone].lifecycle,
+        CaptureBindingState::Waiting {
+            reason: WaitReason::DeviceUnavailable,
+        }
+    );
+
+    // The OS explicitly reports "no default device" (endpoint_id: None) — must
+    // not produce a StartCapture with nothing to target, and must remain
+    // Waiting rather than erroring or panicking.
+    let effects = decide(
+        &mut state,
+        DecisionInput::Observation(Observation::DefaultEndpointChanged {
+            flow: DataFlow::Capture,
+            role: DeviceRole::Console,
+            endpoint_id: None,
+        }),
+    );
+    assert_eq!(effects, vec![]);
+    assert_eq!(
+        state.bindings[&BindingKind::Microphone].lifecycle,
+        CaptureBindingState::Waiting {
+            reason: WaitReason::DeviceUnavailable,
+        }
+    );
+}
+
 #[test]
 fn shutdown_prevents_new_start_capture() {
     let mut state = DecisionState::new().with_binding(CaptureBinding::new(
