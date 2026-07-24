@@ -1,3 +1,5 @@
 /spikes/target/
 **/target/
 .env
+mutants.out/
+mutants.out.old/

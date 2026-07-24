@@ -34,6 +34,20 @@ fn device_unplugged_then_replugged_round_trips() {
 }
 
 #[test]
+fn is_empty_is_false_when_only_added_is_non_empty() {
+    let mut snapshot = DeviceSnapshot::default();
+    let delta = snapshot.diff_and_update(DeviceSnapshot::from_ids([endpoint("MicA")]));
+    assert!(!delta.is_empty());
+}
+
+#[test]
+fn is_empty_is_false_when_only_removed_is_non_empty() {
+    let mut snapshot = DeviceSnapshot::from_ids([endpoint("MicA")]);
+    let delta = snapshot.diff_and_update(DeviceSnapshot::default());
+    assert!(!delta.is_empty());
+}
+
+#[test]
 fn a_different_device_appearing_does_not_mask_another_disappearing() {
     let mut snapshot = DeviceSnapshot::from_ids([endpoint("MicA")]);
     let delta = snapshot.diff_and_update(DeviceSnapshot::from_ids([endpoint("MicB")]));
