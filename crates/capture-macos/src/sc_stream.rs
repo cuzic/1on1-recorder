@@ -15,13 +15,15 @@
 //! **Not yet verified against a real build** — see `lib.rs`'s top-level doc comment.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use capture_api::rebinding::BindingKind;
 use screencapturekit::cm::{CMSampleBuffer, CMSampleBufferExt};
+use screencapturekit::error::SCError;
 use screencapturekit::stream::configuration::SCStreamConfiguration;
 use screencapturekit::stream::content_filter::SCContentFilter;
+use screencapturekit::stream::delegate_trait::SCStreamDelegateTrait;
 use screencapturekit::stream::output_trait::SCStreamOutputTrait;
 use screencapturekit::stream::output_type::SCStreamOutputType;
 use screencapturekit::stream::SCStream;
@@ -111,7 +113,12 @@ impl CaptureStream for ScreenCaptureKitStream {
             }
         }
 
-        let mut stream = SCStream::new(&self.filter, &config);
+        // See `StreamErrorDelegate`'s doc comment for why this needs its own
+        // owned signal rather than reusing `stop`.
+        let stream_dead = Arc::new(StopSignal::new());
+        let delegate_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let delegate = StreamErrorDelegate { error: delegate_error.clone(), stream_dead: stream_dead.clone() };
+        let mut stream = SCStream::new_with_delegate(&self.filter, &config, delegate);
 
         if self.outputs.microphone {
             let handler = FrameForwarder::new(
@@ -162,11 +169,60 @@ impl CaptureStream for ScreenCaptureKitStream {
         })?;
 
         // ScreenCaptureKit is callback-driven (see module doc comment) — this
-        // thread's only remaining job is to block until told to stop.
-        while !stop.wait_timeout(Duration::from_millis(200)) {}
+        // thread's only remaining job is to block until told to stop, whether
+        // that's `stop` (the caller, e.g. `reconcile_active_stream`, tearing this
+        // stream down to rebuild it) or `stream_dead` (the delegate observing
+        // ScreenCaptureKit stopping the stream on its own — see
+        // `StreamErrorDelegate`'s doc comment).
+        while !stop.wait_timeout(Duration::from_millis(200)) && !stream_dead.is_signaled() {}
+
+        // `stop` takes priority when both happen to be signaled at once (a
+        // caller-requested teardown racing a delegate error is treated as the
+        // clean stop it was): only report the delegate's error as this run's
+        // outcome when the caller never asked to stop at all. Returning `Err`
+        // here (rather than `Ok(CaptureExit::DeviceLost)`) matters —
+        // `spawn_capture_thread` turns an `Err` into a real
+        // `CaptureEvent::StreamError` per binding this stream serves, which is
+        // what actually reaches the rebinding FSM; an `Ok` exit only produces
+        // `CaptureEvent::StreamStopped`, which `MacosSupervisor::handle_capture_event`
+        // treats as informational-only.
+        if !stop.is_signaled() && stream_dead.is_signaled() {
+            let message = delegate_error.lock().unwrap().take().unwrap_or_else(|| "stream stopped unexpectedly".to_string());
+            return Err(CaptureError::ScreenCaptureKit(message));
+        }
 
         let _ = stream.stop_capture();
         Ok(CaptureExit::StoppedByRequest)
+    }
+}
+
+/// `SCStreamDelegateTrait` implementation that turns Apple's
+/// `stream(_:didStopWithError:)` callback — the only way `ScreenCaptureKit`
+/// reports the shared stream stopping unexpectedly (captured content going away,
+/// screen-recording/microphone permission revoked mid-session, the system tearing
+/// the stream down, …) — into something `run()`'s blocking wait loop can observe.
+/// Without this, `run()` had no way to detect that kind of stop at all: only a
+/// caller-requested `stop_capture` (observed via `stop`, the `StopSignal` `run()`
+/// is already given) or a CoreAudio device/default-device change (observed
+/// indirectly via `capture-macos::device_watch`) could end a session — a stream
+/// dying entirely on its own (no CoreAudio device event involved) would otherwise
+/// hang `run()` forever, never feeding the rebinding FSM.
+///
+/// `error`/`stream_dead` are a separate `Arc<Mutex<Option<String>>>`/`Arc<StopSignal>`
+/// pair rather than reusing `run()`'s own `stop: &StopSignal` parameter: that
+/// parameter is a borrowed reference tied to `run()`'s call frame, but
+/// `SCStream::new_with_delegate` requires `delegate: impl SCStreamDelegateTrait +
+/// 'static` — the delegate can outlive this stack frame (it's owned by the
+/// `SCStream`/GCD, not `run()`), so it needs its own owned, `'static` signal.
+struct StreamErrorDelegate {
+    error: Arc<Mutex<Option<String>>>,
+    stream_dead: Arc<StopSignal>,
+}
+
+impl SCStreamDelegateTrait for StreamErrorDelegate {
+    fn did_stop_with_error(&self, error: SCError) {
+        *self.error.lock().unwrap() = Some(error.to_string());
+        self.stream_dead.signal();
     }
 }
 
