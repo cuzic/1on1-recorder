@@ -1,6 +1,7 @@
 mod actions;
 mod app_settings;
 mod app_state;
+mod capture_health;
 mod config;
 mod control_server;
 mod export;

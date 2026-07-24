@@ -12,6 +12,7 @@ use session_store::{TranscriptSegment, TranscriptionGap};
 
 use crate::actions;
 use crate::app_state::AppState;
+use crate::capture_health;
 use crate::export;
 use crate::gap_retranscription::{self, GapRetranscribeState};
 use crate::hint_consumer::HintState;
@@ -128,6 +129,13 @@ button:disabled {
   font-size: 0.9em;
   max-width: 360px;
   text-align: center;
+}
+.warning {
+  color: #d97706;
+  font-size: 0.85em;
+  max-width: 360px;
+  text-align: center;
+  margin: 0;
 }
 .header-row {
   width: 100%;
@@ -736,6 +744,10 @@ pub fn App() -> Element {
     // ambiguous "nobody has spoken yet" vs. "STT is broken" — see
     // `transcription_status::describe`'s doc comment.
     let transcription_status_line = transcription_status::describe(&current.transcription_status);
+    // See `capture_health::describe`'s doc comment — a mic/system-audio track
+    // stuck `Waiting`/`Failed` mid-session otherwise only shows as a silently
+    // flatlined level meter.
+    let capture_health_line = capture_health::describe(&current.capture_health);
     let last_session_line = current.last_session_id.clone().map(|session_id| match current.last_total_duration_ms {
         Some(duration_ms) => format!("Last session: {session_id} ({})", format_elapsed(duration_ms)),
         None => format!("Last session: {session_id}"),
@@ -830,6 +842,10 @@ pub fn App() -> Element {
                             div { class: "meter-fill", style: "width: {remote_rms_pct}%;" }
                             div { class: "meter-peak", style: "left: {remote_peak_pct}%;" }
                         }
+                    }
+
+                    if let Some(msg) = capture_health_line {
+                        p { class: "warning", "⚠ {msg}" }
                     }
 
                     p { class: "stats", "Uploaded segments: {uploaded_segments} · Pending: {pending_segments}" }

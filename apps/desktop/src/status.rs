@@ -23,6 +23,11 @@ pub struct Status {
     /// #52's STT connection visibility — `crate::transcription_status::describe`
     /// turns this into the transcript panel's status line.
     pub transcription_status: crate::transcription_status::TranscriptionStatus,
+    /// The rebinding FSM's per-track health — `crate::capture_health::describe`
+    /// turns this into the recording screen's warning banner. Defaults to both
+    /// tracks `Ok` (see `app_service::CaptureHealth`'s `Default`), same as when no
+    /// session is active or on a platform with no real capture backend.
+    pub capture_health: app_service::CaptureHealth,
 }
 
 fn segment_progress(state: &AppState, session_id: SessionId) -> (usize, usize) {
@@ -68,6 +73,11 @@ pub fn current(state: &AppState) -> Status {
     #[cfg(not(windows))]
     let transcription_status = crate::transcription_status::TranscriptionStatus::unavailable();
 
+    #[cfg(any(windows, target_os = "macos"))]
+    let capture_health = active.capture_health.lock().unwrap().clone();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let capture_health = app_service::CaptureHealth::default();
+
     let (uploaded_segments, pending_segments) = segment_progress(state, active.session_id);
 
     Status {
@@ -84,5 +94,6 @@ pub fn current(state: &AppState) -> Status {
         last_session_id: Some(active.session_id.to_string()),
         last_total_duration_ms: None,
         transcription_status,
+        capture_health,
     }
 }

@@ -69,6 +69,9 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
     // Task #52: same side-channel shape as `level`, for the Deepgram connection
     // status `run_windows_capture_session` -> `live_transcription` maintains.
     let transcription_status = std::sync::Arc::new(std::sync::Mutex::new(app_service::TranscriptionStatus::default()));
+    // Same side-channel shape as `level`, for the rebinding FSM's per-track health
+    // — see `app_service::CaptureHealth`'s doc comment.
+    let capture_health = std::sync::Arc::new(std::sync::Mutex::new(app_service::CaptureHealth::default()));
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::unbounded();
 
     let store = state.store.clone();
@@ -78,6 +81,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
     let manifest_for_task = manifest.clone();
     let level_for_task = level.clone();
     let transcription_status_for_task = transcription_status.clone();
+    let capture_health_for_task = capture_health.clone();
     // `state.credential_store` also backs the settings screen (`settings.rs`) —
     // `run_windows_capture_session`'s `live_transcription` wiring reads the
     // Deepgram key from it, if any was ever saved there. No key configured just
@@ -110,6 +114,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
             Some(&broker_for_task),
             mic_device_id,
             render_device_id,
+            Some(capture_health_for_task),
         )
         .await
     });
@@ -120,6 +125,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
         started_at: Instant::now(),
         level,
         transcription_status,
+        capture_health,
         shutdown_tx,
         join_handle,
         transcript_buffer: TranscriptBuffer::new(),
@@ -189,6 +195,9 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
     let level = std::sync::Arc::new(std::sync::Mutex::new(
         app_service::macos_frame_collector::LevelSnapshot::default(),
     ));
+    // Same side-channel shape as `level`, for the rebinding FSM's per-track health
+    // — see `app_service::CaptureHealth`'s doc comment.
+    let capture_health = std::sync::Arc::new(std::sync::Mutex::new(app_service::CaptureHealth::default()));
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::unbounded();
 
     let store = state.store.clone();
@@ -197,6 +206,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
     let bitrate_bps = state.config.bitrate_bps;
     let manifest_for_task = manifest.clone();
     let level_for_task = level.clone();
+    let capture_health_for_task = capture_health.clone();
     let sample_rate_hz = manifest.audio.sample_rate;
 
     // SCStreamConfiguration takes channel count as an explicit request (unlike
@@ -217,6 +227,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
             Some(level_for_task),
             mic_device_id,
             render_device_id,
+            Some(capture_health_for_task),
         )
         .await
     });
@@ -226,6 +237,7 @@ pub fn start(state: &AppState) -> Result<SessionId, String> {
         manifest,
         started_at: Instant::now(),
         level,
+        capture_health,
         shutdown_tx,
         join_handle,
         transcript_buffer: TranscriptBuffer::new(),

@@ -80,6 +80,13 @@ pub struct ActiveRecording {
     /// platform instead.
     #[cfg(windows)]
     pub transcription_status: Arc<Mutex<app_service::TranscriptionStatus>>,
+    /// Updated live by `app_service::windows_supervisor`/`macos_supervisor` as the
+    /// rebinding FSM's per-track state changes — see `app_service::CaptureHealth`'s
+    /// doc comment. Unlike `level`/`transcription_status` above, this type carries
+    /// no platform-specific content, so it's a single unconditionally-exported type
+    /// rather than a per-platform pair.
+    #[cfg(any(windows, target_os = "macos"))]
+    pub capture_health: Arc<Mutex<app_service::CaptureHealth>>,
     #[cfg(any(windows, target_os = "macos"))]
     pub shutdown_tx: crossbeam_channel::Sender<()>,
     #[cfg(any(windows, target_os = "macos"))]
