@@ -209,6 +209,7 @@ fn pinned_mic_waits_for_recovery_without_falling_back_to_default() {
             reason: WaitReason::DeviceUnavailable,
         }
     );
+    assert_eq!(state.bindings[&BindingKind::Microphone].lifecycle.health(), BindingHealth::Unavailable);
 
     // A is reconnected.
     let effects = decide(
@@ -247,6 +248,7 @@ fn pinned_mic_waits_for_recovery_without_falling_back_to_default() {
         },
         "must recover to MicA (not fall back to MicB)"
     );
+    assert_eq!(state.bindings[&BindingKind::Microphone].lifecycle.health(), BindingHealth::Ok);
 }
 
 // ---------------------------------------------------------------------------
@@ -558,7 +560,11 @@ fn worker_failed_gives_up_after_max_retry_attempts() {
             }),
         );
         match effects.as_slice() {
-            [Effect::ScheduleRetry { retry_id, .. }] => {
+            [Effect::ScheduleRetry { retry_id, attempt, .. }] => {
+                assert_eq!(
+                    state.bindings[&BindingKind::Microphone].lifecycle.health(),
+                    BindingHealth::Retrying { attempt: *attempt }
+                );
                 last_effects = decide(
                     &mut state,
                     DecisionInput::RetryTimerFired {
@@ -572,6 +578,10 @@ fn worker_failed_gives_up_after_max_retry_attempts() {
                 assert!(matches!(
                     state.bindings[&BindingKind::Microphone].lifecycle,
                     CaptureBindingState::Failed { .. }
+                ));
+                assert!(matches!(
+                    state.bindings[&BindingKind::Microphone].lifecycle.health(),
+                    BindingHealth::Failed { .. }
                 ));
                 return;
             }

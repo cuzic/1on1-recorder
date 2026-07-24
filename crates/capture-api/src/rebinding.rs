@@ -142,6 +142,38 @@ impl CaptureBindingState {
     pub fn accepts_epoch(&self, epoch: StreamEpoch) -> bool {
         matches!(self, CaptureBindingState::Running { epoch: e, .. } if *e == epoch)
     }
+
+    /// Collapses the full lifecycle into the coarse classification a caller outside
+    /// this crate (e.g. a UI) actually needs — "is this track's audio flowing right
+    /// now, and if not, why." `Starting`/`Stopping`/`Resolving`/`Stopped` are all
+    /// transient, expected states on the way to `Running` (or a deliberate stop), so
+    /// they map to `Ok` rather than a spurious "unhealthy" flicker on every
+    /// start/stop.
+    pub fn health(&self) -> BindingHealth {
+        match self {
+            CaptureBindingState::Stopped
+            | CaptureBindingState::Resolving { .. }
+            | CaptureBindingState::Starting { .. }
+            | CaptureBindingState::Running { .. }
+            | CaptureBindingState::Stopping { .. } => BindingHealth::Ok,
+            CaptureBindingState::Waiting { reason } => match reason {
+                WaitReason::DeviceUnavailable | WaitReason::ProcessNotFound => BindingHealth::Unavailable,
+                WaitReason::RetryableFailure { attempt } => BindingHealth::Retrying { attempt: *attempt },
+            },
+            CaptureBindingState::Failed { cause } => BindingHealth::Failed { reason: cause.clone() },
+        }
+    }
+}
+
+/// A UI-facing classification of [`CaptureBindingState`], collapsing the full
+/// lifecycle into "is this binding's audio flowing, and if not, why" — see
+/// [`CaptureBindingState::health`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingHealth {
+    Ok,
+    Unavailable,
+    Retrying { attempt: u32 },
+    Failed { reason: String },
 }
 
 #[derive(Debug, Clone)]

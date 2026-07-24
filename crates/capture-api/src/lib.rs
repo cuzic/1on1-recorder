@@ -13,4 +13,5 @@
 //! (`capture-windows`) is implemented, so its shape is grounded in an actual
 //! implementation rather than designed speculatively.
 
+pub mod device_diff;
 pub mod rebinding;
