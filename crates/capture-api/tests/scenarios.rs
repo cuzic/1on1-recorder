@@ -647,6 +647,60 @@ fn effect_ids_are_allocated_uniquely() {
 }
 
 #[test]
+fn default_endpoint_changed_to_the_endpoint_already_in_use_is_a_noop() {
+    let mut state = DecisionState::new().with_binding(CaptureBinding::new(
+        BindingKind::Microphone,
+        BindingSelection::Endpoint(EndpointSelection::FollowDefault {
+            flow: DataFlow::Capture,
+            role: DeviceRole::Console,
+        }),
+    ));
+    decide(
+        &mut state,
+        DecisionInput::Observation(Observation::DefaultEndpointChanged {
+            flow: DataFlow::Capture,
+            role: DeviceRole::Console,
+            endpoint_id: Some(endpoint("MicA")),
+        }),
+    );
+    let effects = decide(
+        &mut state,
+        DecisionInput::UserIntent(UserIntent::Start { binding: BindingKind::Microphone }),
+    );
+    let (op0, epoch0) = match effects.as_slice() {
+        [Effect::StartCapture { operation_id, proposed_epoch, .. }] => (*operation_id, *proposed_epoch),
+        other => panic!("unexpected effects: {other:?}"),
+    };
+    decide(
+        &mut state,
+        DecisionInput::Observation(Observation::WorkerStarted {
+            binding: BindingKind::Microphone,
+            operation_id: op0,
+            epoch: epoch0,
+            target: ResolvedTarget::Endpoint(endpoint("MicA")),
+        }),
+    );
+
+    // The OS re-announces the SAME default device (a redundant/duplicate
+    // notification) — must not tear down and restart a stream that's already
+    // connected to it.
+    let effects = decide(
+        &mut state,
+        DecisionInput::Observation(Observation::DefaultEndpointChanged {
+            flow: DataFlow::Capture,
+            role: DeviceRole::Console,
+            endpoint_id: Some(endpoint("MicA")),
+        }),
+    );
+    assert_eq!(effects, vec![], "must not restart when already connected to the new default");
+    assert_eq!(
+        state.bindings[&BindingKind::Microphone].lifecycle,
+        CaptureBindingState::Running { operation_id: op0, epoch: epoch0, target: ResolvedTarget::Endpoint(endpoint("MicA")) }
+    );
+}
+
+
+#[test]
 fn endpoint_removed_does_not_affect_a_binding_pinned_to_a_different_endpoint() {
     let mut state = DecisionState::new().with_binding(CaptureBinding::new(
         BindingKind::Microphone,

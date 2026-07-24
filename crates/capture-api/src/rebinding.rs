@@ -354,16 +354,23 @@ fn resolve_target(
 
 /// Whether `selection` currently points at `target` (used to detect a no-op default
 /// change: the binding is already connected to what just became the new default).
-fn selection_targets(selection: &BindingSelection, target: &ResolvedTarget) -> bool {
-    match (selection, target) {
-        (BindingSelection::Endpoint(_), ResolvedTarget::Endpoint(id)) => {
-            resolve_target_id(selection).as_ref() == Some(id)
-        }
-        (BindingSelection::Process { pid: Some(p), .. }, ResolvedTarget::Process { pid }) => {
-            p == pid
-        }
-        _ => false,
-    }
+///
+/// Must resolve `selection` the same way `resolve_target` does (including
+/// `FollowDefault`, via `default_routes`) rather than only recognizing a pinned
+/// id: this function's only real caller ever passes a `FollowDefault` selection
+/// (`handle_observation`'s `DefaultEndpointChanged` arm filters to exactly that),
+/// so an earlier version of this function that special-cased `Pinned` identity
+/// alone made the "already connected to the new default" no-op permanently
+/// unreachable — every redundant/duplicate default-device notification (which
+/// `IMMNotificationClient` can genuinely emit for a device that hasn't actually
+/// changed) caused an unnecessary stop-and-restart cycle instead of the no-op
+/// this function's own doc comment promised.
+fn selection_targets(
+    selection: &BindingSelection,
+    target: &ResolvedTarget,
+    default_routes: &HashMap<(DataFlow, DeviceRole), Option<EndpointId>>,
+) -> bool {
+    resolve_target(selection, default_routes).as_ref() == Some(target)
 }
 
 fn resolve_target_id(selection: &BindingSelection) -> Option<EndpointId> {
@@ -517,7 +524,7 @@ fn handle_observation(state: &mut DecisionState, obs: Observation) -> Vec<Effect
             for kind in affected {
                 let binding = state.bindings.get(&kind).unwrap();
                 if let CaptureBindingState::Running { target, .. } = &binding.lifecycle {
-                    if selection_targets(&binding.selection, target) {
+                    if selection_targets(&binding.selection, target, &state.default_routes) {
                         continue; // Already connected to the new default; no-op.
                     }
                     if let Some(effect) = stop_binding(state, kind, AfterStop::ResolveAndStart) {
