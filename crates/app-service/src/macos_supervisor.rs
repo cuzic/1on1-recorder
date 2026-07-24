@@ -270,7 +270,20 @@ impl MacosSupervisor {
     /// supervisor's own thread (never the CoreAudio callback thread), matching
     /// `DeviceWatch::start`'s "the consumer re-enumerates in response" contract.
     fn reconcile_device_list(&mut self) -> Result<(), CaptureError> {
-        let next = self.enumerate_device_snapshot()?;
+        // A transient enumeration failure (e.g. CoreAudio queried mid-disconnect)
+        // must not tear down the whole session over what's ultimately routine
+        // device-list churn — same non-fatal treatment as `start_all`'s seeding.
+        // Skipping this round (rather than rolling `device_snapshot` forward on a
+        // partial/failed read) leaves it self-healing: the next successful
+        // `DeviceListChanged` diffs against the last known-good snapshot instead
+        // of a corrupted one.
+        let next = match self.enumerate_device_snapshot() {
+            Ok(next) => next,
+            Err(err) => {
+                tracing::warn!(%err, "failed to re-enumerate macOS devices after a device-list-changed notification; skipping this reconcile round");
+                return Ok(());
+            }
+        };
         let delta = self.device_snapshot.diff_and_update(next);
 
         let mut effects = Vec::new();
