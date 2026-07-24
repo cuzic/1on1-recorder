@@ -39,6 +39,8 @@ pub mod pseudo_source;
 #[cfg(feature = "windows-supervisor")]
 pub mod live_transcription;
 #[cfg(feature = "windows-supervisor")]
+pub mod windows_device_watch;
+#[cfg(feature = "windows-supervisor")]
 pub mod windows_frame_collector;
 #[cfg(feature = "windows-supervisor")]
 pub mod windows_session;
@@ -66,6 +68,13 @@ pub use windows_session::run_windows_capture_session;
 pub use capture_windows::device_select::{enumerate_capture_devices, enumerate_render_devices, DeviceInfo};
 #[cfg(feature = "macos-supervisor")]
 pub use capture_macos::device_select::{enumerate_capture_devices, enumerate_render_devices, DeviceInfo};
+// Same collision rationale as `DeviceInfo` above: a session-independent
+// device-change watcher for `apps/desktop`'s Settings screen to auto-refresh its
+// device list (see `windows_device_watch`/`macos_device_watch`'s doc comments).
+#[cfg(all(feature = "windows-supervisor", not(feature = "macos-supervisor")))]
+pub use windows_device_watch::DeviceChangeWatcher;
+#[cfg(feature = "macos-supervisor")]
+pub use macos_device_watch::DeviceChangeWatcher;
 // `live_transcription` (unlike `LevelSnapshot`) has no macOS-side equivalent type
 // to collide with (see that module's doc comment), so this re-export doesn't need
 // the same `not(feature = "macos-supervisor")` guard.
@@ -74,6 +83,8 @@ pub use live_transcription::{TrackTranscriptionStatus, TranscriptionStatus};
 #[cfg(feature = "live-transcription")]
 pub use retranscribe::{retranscribe_gap, supports_batch_retranscription, RetranscribeError};
 
+#[cfg(feature = "macos-supervisor")]
+pub mod macos_device_watch;
 #[cfg(feature = "macos-supervisor")]
 pub mod macos_frame_collector;
 #[cfg(feature = "macos-supervisor")]

@@ -491,6 +491,44 @@ fn load_render_devices() -> (Vec<DeviceOption>, Option<String>) {
     (Vec::new(), None)
 }
 
+/// Starts `app_service::DeviceChangeWatcher` on a blocking thread and, for as
+/// long as this component stays mounted, calls `on_device_change` whenever the
+/// OS reports a device add/remove/default-change (e.g. a Bluetooth headset
+/// connecting or disconnecting) — so the device list picked up by
+/// `load_capture_devices`/`load_render_devices` at mount time doesn't otherwise
+/// go stale until the user notices and presses "デバイス一覧を更新" themselves.
+/// If the watcher fails to start (feature unsupported on this build, or the OS
+/// call itself fails), this silently does nothing — the manual refresh button
+/// still works either way, this is purely a convenience on top of it.
+#[cfg(any(windows, target_os = "macos"))]
+fn spawn_device_change_watcher(on_device_change: impl FnMut() + Clone + 'static) {
+    // `use_future`'s factory closure is itself `FnMut` (it may run again on
+    // restart), so it needs to hand its inner `async move` block a fresh clone of
+    // `on_device_change` each time rather than moving the one shared copy in —
+    // `do_refresh_devices` only captures `Copy` `Signal`s, so cloning it is cheap.
+    use_future(move || {
+        let mut on_device_change = on_device_change.clone();
+        async move {
+            let watcher = match tokio::task::spawn_blocking(app_service::DeviceChangeWatcher::start).await {
+                Ok(Ok(watcher)) => watcher,
+                _ => return,
+            };
+            let mut last_generation = watcher.generation();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let generation = watcher.generation();
+                if generation != last_generation {
+                    last_generation = generation;
+                    on_device_change();
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn spawn_device_change_watcher(_on_device_change: impl FnMut() + Clone + 'static) {}
+
 /// `mic_device_select`/`render_device_select`'s one-shot initial value: `saved`
 /// unchanged if it's still in `devices`, otherwise "システム既定" plus `true` in
 /// the second element. Returns the stale flag instead of setting a message signal
@@ -1023,8 +1061,11 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
 
     // Re-runs `enumerate_capture_devices`/`enumerate_render_devices` — lets a
     // device plugged in (or unplugged) after Settings opened show up without
-    // restarting the app.
-    let refresh_devices = move |_| {
+    // restarting the app. Factored out of the button's `onclick` (which needs a
+    // `move |_evt|` closure) so `spawn_device_change_watcher` below can also call
+    // it, without either call site fighting over which one "owns" the closure's
+    // event-argument shape.
+    let mut do_refresh_devices = move || {
         let (mic_list, mic_error) = load_capture_devices();
         let (render_list, render_error) = load_render_devices();
         mic_devices.set((mic_list.clone(), mic_error.clone()));
@@ -1046,6 +1087,11 @@ pub fn Settings(mut screen: Signal<Screen>) -> Element {
             },
         });
     };
+    let refresh_devices = move |_| do_refresh_devices();
+
+    // OSからのデバイス着脱通知(Bluetoothヘッドセットの接続/切断など)を受け取り、
+    // 手動でボタンを押さなくても一覧が更新されるようにする。
+    spawn_device_change_watcher(do_refresh_devices);
 
     let onchange_mic_device = move |evt: FormEvent| {
         mic_device_select.set(evt.value());
