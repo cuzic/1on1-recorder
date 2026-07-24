@@ -523,16 +523,37 @@ fn handle_observation(state: &mut DecisionState, obs: Observation) -> Vec<Effect
                 .collect();
             for kind in affected {
                 let binding = state.bindings.get(&kind).unwrap();
-                if let CaptureBindingState::Running { target, .. } = &binding.lifecycle {
-                    if selection_targets(&binding.selection, target, &state.default_routes) {
-                        continue; // Already connected to the new default; no-op.
+                match &binding.lifecycle {
+                    CaptureBindingState::Running { target, .. } => {
+                        if selection_targets(&binding.selection, target, &state.default_routes) {
+                            continue; // Already connected to the new default; no-op.
+                        }
+                        if let Some(effect) = stop_binding(state, kind, AfterStop::ResolveAndStart) {
+                            effects.push(effect);
+                        }
                     }
-                    if let Some(effect) = stop_binding(state, kind, AfterStop::ResolveAndStart) {
-                        effects.push(effect);
+                    CaptureBindingState::Waiting { .. } => {
+                        // The "Waiting-triggered re-resolve" this used to only
+                        // promise in a comment: a FollowDefault binding parked in
+                        // Waiting (typically WaitReason::DeviceUnavailable, because
+                        // no default was set when it last tried to start) has no
+                        // other way back to Running. EndpointAdded can't do it —
+                        // resolve_target_id only resolves Pinned selections, so a
+                        // FollowDefault binding never matches its candidate filter
+                        // — which left this binding stuck in Waiting forever, even
+                        // after a real default device showed up. start_binding
+                        // re-resolves against the just-updated default_routes; if
+                        // endpoint_id was None (still no default), it harmlessly
+                        // re-sets the same Waiting state with no effect.
+                        if let Some(effect) = start_binding(state, kind) {
+                            effects.push(effect);
+                        }
                     }
+                    // Stopping/Starting/Resolving: just record the new default and
+                    // wait for WorkerStopped (ResolveAndStart) or WorkerStarted to
+                    // land before reacting further.
+                    _ => {}
                 }
-                // While Stopping/Starting/Waiting, just record the new default and
-                // wait for WorkerStopped or a Waiting-triggered re-resolve.
             }
             effects
         }
