@@ -87,6 +87,11 @@ pub struct StatusDto {
     pub last_session_id: Option<String>,
     pub last_total_duration_ms: Option<u64>,
     pub transcription_status: TranscriptionStatusDto,
+    /// Serde-friendly mirror of `app_service::CaptureHealth` — lets an external
+    /// observer (a device connect/disconnect E2E test driving `1on1ctl --json
+    /// status`, or a future UI) see the rebinding FSM's per-track health without
+    /// this crate depending on `app_service`'s supervisor features.
+    pub capture_health: CaptureHealthDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -103,6 +108,28 @@ pub enum TrackStatusDto {
     Connected,
     Error(String),
     Unavailable,
+}
+
+/// See `StatusDto::capture_health`'s doc comment.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CaptureHealthDto {
+    pub self_health: TrackHealthDto,
+    pub remote_health: TrackHealthDto,
+}
+
+/// Mirrors `app_service::TrackHealth`, which itself mirrors
+/// `capture_api::rebinding::BindingHealth` — see those types' doc comments.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub enum TrackHealthDto {
+    #[default]
+    Ok,
+    Unavailable,
+    Retrying {
+        attempt: u32,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 #[cfg(test)]

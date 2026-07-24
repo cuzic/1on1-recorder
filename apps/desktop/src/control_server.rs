@@ -9,7 +9,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use control_protocol::{Command, Response, StatusDto, TrackStatusDto, TranscriptionStatusDto};
+use control_protocol::{
+    CaptureHealthDto, Command, Response, StatusDto, TrackHealthDto, TrackStatusDto,
+    TranscriptionStatusDto,
+};
 use interprocess::local_socket::tokio::{prelude::*, Listener, Stream};
 use interprocess::local_socket::{ListenerOptions, Name};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -164,6 +167,10 @@ impl From<crate::status::Status> for StatusDto {
                 self_status: s.transcription_status.self_status.into(),
                 remote_status: s.transcription_status.remote_status.into(),
             },
+            capture_health: CaptureHealthDto {
+                self_health: track_health_dto(s.capture_health.self_health),
+                remote_health: track_health_dto(s.capture_health.remote_health),
+            },
         }
     }
 }
@@ -178,6 +185,19 @@ impl From<crate::transcription_status::TrackTranscriptionStatus> for TrackStatus
             T::Error(m) => Self::Error(m),
             T::Unavailable => Self::Unavailable,
         }
+    }
+}
+
+/// Neither `app_service::TrackHealth` nor `control_protocol::TrackHealthDto` is
+/// local to this crate, so a `From` impl would violate the orphan rule — a plain
+/// function does the same job.
+fn track_health_dto(h: app_service::TrackHealth) -> TrackHealthDto {
+    use app_service::TrackHealth as H;
+    match h {
+        H::Ok => TrackHealthDto::Ok,
+        H::Unavailable => TrackHealthDto::Unavailable,
+        H::Retrying { attempt } => TrackHealthDto::Retrying { attempt },
+        H::Failed { reason } => TrackHealthDto::Failed { reason },
     }
 }
 

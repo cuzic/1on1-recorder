@@ -12,6 +12,15 @@ name: macOS Build & Test
 # CI doesn't attempt this. Confident end-to-end verification still depends on a
 # manual real-Mac pass (see the project's task list — the macOS analogue of
 # Windows's task #9).
+#
+# Tier 1 also includes a device disconnect/reconnect pass ("Device
+# disconnect/reconnect E2E" steps): it uninstalls/reinstalls the BlackHole
+# virtual audio device mid-recording to exercise
+# `MacosSupervisor::reconcile_device_list` (a6d66e9) against a real CoreAudio
+# device-list-changed notification, and asserts the rebinding FSM's health
+# (surfaced via `1on1ctl --json status`'s `capture_health` field) actually
+# degrades to `Unavailable` and recovers back to `Ok` — not just that the
+# process didn't crash.
 
 on:
   push:
@@ -122,12 +131,29 @@ jobs:
       - name: Install BlackHole (virtual audio loopback, no kext required)
         run: brew install blackhole-2ch
 
+      - name: Install switchaudio-osx (deterministic default-device selection)
+        # The runner is a real Mac (built-in speakers exist), so BlackHole never
+        # becomes the default output on its own the way it might on a device-less
+        # headless box. `SwitchAudioSource` lets the device-disconnect/reconnect
+        # steps below pin BlackHole as the default *before* `1on1ctl start` runs,
+        # so `MacosSupervisor::resolve_current_defaults` actually binds
+        # `EndpointLoopback` to it instead of the real speakers.
+        run: brew install switchaudio-osx
+
       - name: Restart coreaudiod so BlackHole is picked up
         # BlackHole's own install docs describe a "restart when prompted" step,
         # which doesn't translate directly to a headless CI runner. Restarting
         # coreaudiod is the commonly-suggested non-reboot substitute — not yet
         # confirmed to reliably work in this specific CI environment.
         run: sudo killall coreaudiod || true
+
+      - name: Set BlackHole as the default output device
+        # Needed for both the plain smoke test below (a stable, controllable
+        # output rather than whatever real hardware the runner happens to have)
+        # and, more importantly, for the device-disconnect/reconnect steps
+        # further down: `EndpointLoopback` only gets pinned to BlackHole if it's
+        # the OS default *at the moment `1on1ctl start` resolves defaults*.
+        run: SwitchAudioSource -s "BlackHole 2ch"
 
       - name: Pre-seed TCC permissions (best-effort, version-fragile)
         run: ./scripts/ci/seed-tcc-permissions.sh
@@ -161,7 +187,7 @@ jobs:
           cargo build -p desktop --target aarch64-apple-darwin
           cargo build -p desktop-cli --target aarch64-apple-darwin
 
-      - name: 1on1ctl E2E — status/start/status/stop against a real running app
+      - name: 1on1ctl E2E — status/start against a real running app
         # `cargo build`'s own output layout (not `dx bundle`'s .app) puts
         # `1on1ctl` and `desktop` side by side in the same
         # target/aarch64-apple-darwin/debug/ directory — exactly what
@@ -169,6 +195,10 @@ jobs:
         # lookup) expects, so no .app packaging step should be needed for the
         # auto-launch below to find `desktop`. DYLD_LIBRARY_PATH: see Tier 0's
         # "Test" step for why `desktop` (which links capture-macos) needs it.
+        #
+        # Left running (no `stop` here) — the device-disconnect/reconnect
+        # steps below need a live session to observe `capture_health` against,
+        # and the final "1on1ctl E2E — stop" step below tears it down.
         env:
           DYLD_LIBRARY_PATH: /usr/lib/swift
         timeout-minutes: 3
@@ -194,7 +224,70 @@ jobs:
           status_json="$("$CTL" --json status)"
           echo "$status_json"
           echo "$status_json" | grep -q '"recording":true' || { echo "expected status to report recording:true"; exit 1; }
+          echo "$status_json" | grep -q '"remote_health":"Ok"' || { echo "expected remote_health to start Ok (was BlackHole actually pinned as the default output?)"; exit 1; }
 
+      # The next two steps exercise a6d66e9's fix directly: a *pinned* (not
+      # necessarily still-default) device disappearing mid-session. BlackHole is
+      # pinned as `EndpointLoopback`'s target at session start above (it was the
+      # default output at that moment); uninstalling it now is the closest a
+      # headless CI runner can get to physically unplugging that device, and is
+      # the same "restart coreaudiod to make the HAL plugin list change" trick
+      # already used to install it — see that step's comment for the same
+      # not-yet-confirmed-reliable caveat. `capture_api::rebinding`'s own
+      # scenario tests (`crates/capture-api/tests/scenarios.rs`) already cover
+      # this FSM transition in isolation; what only a real Mac can prove is that
+      # `capture_macos::device_watch`'s CoreAudio listener actually fires and
+      # `MacosSupervisor::reconcile_device_list` actually reacts to it.
+      - name: Device disconnect E2E — uninstall BlackHole mid-recording
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          brew uninstall blackhole-2ch
+          sudo killall coreaudiod || true
+
+      - name: Device disconnect E2E — expect remote_health to report Unavailable
+        # Per `crates/capture-api/src/rebinding.rs`'s `EndpointRemoved` handler,
+        # a pinned endpoint disappearing moves that binding straight to
+        # `Waiting { reason: DeviceUnavailable }`, i.e. `TrackHealth::Unavailable`
+        # — no retry countdown, since there's nothing to retry until the device
+        # (or a fresh `EndpointAdded`) is observed again.
+        run: |
+          set -euo pipefail
+          CTL=./target/aarch64-apple-darwin/debug/1on1ctl
+          ./scripts/ci/poll-capture-health.sh "$CTL" remote_health '"Unavailable"' 60
+
+      - name: Device reconnect E2E — reinstall BlackHole
+        # BlackHole's driver embeds a fixed device UID, so reinstalling hands
+        # back the exact same `EndpointId` `MacosSupervisor` pinned at session
+        # start — this is what lets `Observation::EndpointAdded` match it back
+        # to the `Waiting` binding above instead of looking like an unrelated
+        # new device. Re-selecting it as the default output isn't required for
+        # that id-based match, but keeps the runner's audio state consistent
+        # with what "Set BlackHole as the default output device" set up earlier.
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          brew install blackhole-2ch
+          sudo killall coreaudiod || true
+          SwitchAudioSource -s "BlackHole 2ch" || true
+
+      - name: Device reconnect E2E — expect remote_health to recover to Ok
+        # Longer timeout than the disconnect check: recovery goes through a real
+        # `StartCapture` -> shared-`SCStream`-rebuild -> `WorkerStarted` round
+        # trip (see macos_supervisor.rs's "Shared-stream reconciliation" doc
+        # comment), not just an immediate state flip.
+        run: |
+          set -euo pipefail
+          CTL=./target/aarch64-apple-darwin/debug/1on1ctl
+          ./scripts/ci/poll-capture-health.sh "$CTL" remote_health '"Ok"' 90
+
+      - name: 1on1ctl E2E — stop
+        env:
+          DYLD_LIBRARY_PATH: /usr/lib/swift
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          CTL=./target/aarch64-apple-darwin/debug/1on1ctl
           "$CTL" stop
 
       - name: Assert a session was actually written to disk
