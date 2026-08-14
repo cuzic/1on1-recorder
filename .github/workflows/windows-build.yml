@@ -50,6 +50,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: 14
           name: spike-windows-msvc-binaries
           path: spikes/dist/*.exe
           if-no-files-found: error

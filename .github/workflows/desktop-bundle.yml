@@ -123,7 +123,7 @@ jobs:
           name: 1on1-recorder-windows
           path: dist/1on1-recorder-windows-x64.exe
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
 
   # Diagnostic-only job (see apps/hello-dioxus's own Cargo.toml description): a
   # minimal dioxus-desktop app with no app-specific startup code (no
@@ -182,7 +182,7 @@ jobs:
           name: hello-dioxus-windows
           path: dist/hello-dioxus-windows-x64.exe
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
 
   bundle-macos:
     runs-on: macos-latest
@@ -233,4 +233,4 @@ jobs:
             target/**/*.app
             target/**/*.dmg
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
