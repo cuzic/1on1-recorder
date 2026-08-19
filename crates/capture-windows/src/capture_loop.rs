@@ -373,7 +373,11 @@ pub fn run_capture_loop(
             }
             WaitResult::Signaled(_) => unreachable!(),
             WaitResult::Timeout => {
-                let _ = tx.send(CaptureEvent::StreamError {
+                // The stream is still alive and this loop keeps running (`continue`
+                // below) — send `StreamStalled`, not `StreamError`. `StreamError`
+                // means "this worker is dead, reap it"; sending it here would make
+                // the supervisor tear down a thread that is, in fact, still capturing.
+                let _ = tx.send(CaptureEvent::StreamStalled {
                     stream: stream_id,
                     error: format!("callback timeout({callback_timeout_ms}ms)"),
                 });

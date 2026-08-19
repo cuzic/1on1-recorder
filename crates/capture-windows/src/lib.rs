@@ -65,6 +65,16 @@ pub enum CaptureEvent {
         stream: BindingKind,
         error: String,
     },
+    /// A transient stall (e.g. a WASAPI callback that didn't fire within the
+    /// configured timeout) that the capture thread noticed but recovered from on its
+    /// own — the thread keeps running and capture continues. Unlike [`StreamError`],
+    /// this must never be treated as "the worker died": there is no corresponding
+    /// `JoinHandle` completion to reap, and reaping the still-live worker here would
+    /// orphan its thread while a retry spins up a second one for the same binding.
+    StreamStalled {
+        stream: BindingKind,
+        error: String,
+    },
     /// `mmcss_applied`: whether this stream's capture thread was successfully
     /// registered with MMCSS.
     StreamStopped {

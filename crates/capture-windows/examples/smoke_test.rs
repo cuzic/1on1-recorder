@@ -78,6 +78,16 @@ fn main() {
                 eprintln!("FAIL: stream reported an error: {error}");
                 std::process::exit(1);
             }
+            Ok(CaptureEvent::StreamStalled { error, .. }) => {
+                // Non-fatal (see `CaptureEvent::StreamStalled`'s doc comment — the
+                // capture thread is still running) but worth surfacing here: this
+                // smoke test previously treated *any* callback timeout as a hard
+                // `StreamError` failure before `StreamStalled` existed as a
+                // separate, non-fatal variant. Print it instead of silently
+                // dropping it into the wildcard arm below, so a stall is still
+                // visible in this test's output even though it no longer aborts.
+                eprintln!("WARN: stream stalled (worker still running): {error}");
+            }
             Ok(CaptureEvent::StreamStarted { device_friendly_name, .. }) => {
                 println!("stream started on device: {device_friendly_name}");
             }
