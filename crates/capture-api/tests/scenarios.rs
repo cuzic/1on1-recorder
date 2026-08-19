@@ -622,6 +622,39 @@ fn accepts_epoch_only_matches_a_running_binding_with_the_same_epoch() {
     assert!(!CaptureBindingState::Stopped.accepts_epoch(StreamEpoch(7)));
 }
 
+// ---------------------------------------------------------------------------
+// `DecisionState::accepts_epoch` is the entry point OS-specific supervisors
+// actually call (they hold a `DecisionState`, not a bare `CaptureBindingState`)
+// to filter stale-epoch frames before forwarding them downstream. It must agree
+// with `CaptureBindingState::accepts_epoch` for a known binding, and reject
+// (not panic on) a binding the state doesn't know about at all.
+// ---------------------------------------------------------------------------
+#[test]
+fn decision_state_accepts_epoch_matches_a_running_bindings_current_epoch() {
+    let mut state = DecisionState::new().with_binding(CaptureBinding::new(
+        BindingKind::Microphone,
+        BindingSelection::Endpoint(EndpointSelection::Pinned { endpoint_id: endpoint("MicA") }),
+    ));
+    let effects = decide(&mut state, DecisionInput::UserIntent(UserIntent::Start { binding: BindingKind::Microphone }));
+    let (operation_id, epoch, target) = match effects.as_slice() {
+        [Effect::StartCapture { operation_id, proposed_epoch, target, .. }] => (*operation_id, *proposed_epoch, target.clone()),
+        other => panic!("unexpected effects: {other:?}"),
+    };
+    decide(
+        &mut state,
+        DecisionInput::Observation(Observation::WorkerStarted { binding: BindingKind::Microphone, operation_id, epoch, target }),
+    );
+
+    assert!(state.accepts_epoch(BindingKind::Microphone, epoch));
+    assert!(!state.accepts_epoch(BindingKind::Microphone, StreamEpoch(epoch.0 + 1)));
+}
+
+#[test]
+fn decision_state_accepts_epoch_rejects_a_binding_it_does_not_know_about() {
+    let state = DecisionState::new();
+    assert!(!state.accepts_epoch(BindingKind::Microphone, StreamEpoch(0)));
+}
+
 #[test]
 fn effect_ids_are_allocated_uniquely() {
     let mut state = DecisionState::new()

@@ -227,6 +227,18 @@ impl DecisionState {
         self
     }
 
+    /// Whether a frame carrying `epoch` for `binding` should be accepted right now —
+    /// a thin wrapper around [`CaptureBindingState::accepts_epoch`] for callers (the
+    /// OS-specific supervisors) that only have a `DecisionState` and a `(BindingKind,
+    /// StreamEpoch)` pair, not a `CaptureBindingState` in hand. Returns `false` for an
+    /// unknown binding, matching "reject anything we can't positively admit."
+    pub fn accepts_epoch(&self, binding: BindingKind, epoch: StreamEpoch) -> bool {
+        self.bindings
+            .get(&binding)
+            .map(|b| b.lifecycle.accepts_epoch(epoch))
+            .unwrap_or(false)
+    }
+
     fn alloc_operation_id(&mut self) -> OperationId {
         let id = OperationId(self.next_operation_id);
         self.next_operation_id += 1;
