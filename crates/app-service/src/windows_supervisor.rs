@@ -24,7 +24,7 @@ use capture_api::rebinding::{
 use capture_windows::device_watch::DeviceWatchEvent;
 use capture_windows::loopback_stream::EndpointLoopbackStream;
 use capture_windows::mic_stream::MicCaptureStream;
-use capture_windows::{spawn_capture_thread, CaptureError, CaptureEvent, CaptureStream, CaptureThreadOutcome, StopSignal};
+use capture_windows::{spawn_capture_thread, CaptureError, CaptureEvent, CaptureExit, CaptureStream, CaptureThreadOutcome, StopSignal};
 use crossbeam_channel::{Receiver, Select, Sender};
 use windows::Win32::Media::Audio::{
     eCapture, eCommunications, eConsole, eMultimedia, eRender, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
@@ -258,7 +258,25 @@ impl WindowsSupervisor {
                     let stream = build_stream(binding, &target, proposed_epoch, self.pipeline_drop_counter.clone(), self.callback_timeout_ms);
                     let stop = Arc::new(StopSignal::new()?);
                     let join_handle = spawn_capture_thread(stream, self.capture_tx.clone(), stop.clone());
-                    self.workers.insert(binding, WorkerHandle { operation_id, epoch: proposed_epoch, target, stop, join_handle });
+                    let previous = self.workers.insert(binding, WorkerHandle { operation_id, epoch: proposed_epoch, target, stop, join_handle });
+                    // Every path that removes a binding from `self.workers`
+                    // (`Effect::StopCapture` below, `reap_dead_worker`) does so before
+                    // `decide()` can produce a fresh `Effect::StartCapture` for that
+                    // same binding — so this should never observe a live previous
+                    // entry. If it ever does, that entry's `JoinHandle` is about to be
+                    // silently dropped without being joined (never reaped, thread
+                    // potentially still running) — surface it loudly rather than let
+                    // it happen quietly, since a defensive check here is cheap and a
+                    // future refactor of the ordering above is exactly the kind of
+                    // change that could reintroduce this.
+                    if let Some(previous) = previous {
+                        tracing::error!(
+                            binding = ?binding,
+                            previous_operation_id = ?previous.operation_id,
+                            new_operation_id = ?operation_id,
+                            "StartCapture overwrote a still-registered worker; its JoinHandle was dropped without being joined (possible leaked/orphaned thread)"
+                        );
+                    }
                 }
                 Effect::StopCapture { binding, operation_id, epoch, .. } => {
                     if let Some(worker) = self.workers.remove(&binding) {
@@ -291,8 +309,15 @@ impl WindowsSupervisor {
     fn handle_capture_event(&mut self, event: CaptureEvent) -> Result<(), CaptureError> {
         match event {
             CaptureEvent::Frame { record, samples } => {
-                if let Some(tx) = &self.frame_tx {
-                    let _ = tx.send(FrameSinkEvent::Frame { record, samples });
+                // Reject frames from a stale epoch — a worker that was told to stop
+                // (rebind, retry, shutdown) but whose thread hadn't yet noticed can
+                // still have frames in flight. Without this check they'd be
+                // forwarded and mixed into the timeline as if they belonged to the
+                // binding's *current* generation.
+                if self.state.accepts_epoch(record.stream, StreamEpoch(record.capture_epoch)) {
+                    if let Some(tx) = &self.frame_tx {
+                        let _ = tx.send(FrameSinkEvent::Frame { record, samples });
+                    }
                 }
             }
             CaptureEvent::StreamStarted { stream, ref format, nominal_frame_interval_ns, .. } => {
@@ -319,14 +344,65 @@ impl WindowsSupervisor {
                 if let Some(operation_id) = self.workers.get(&stream).map(|w| w.operation_id) {
                     let effects = decide(&mut self.state, DecisionInput::Observation(Observation::WorkerFailed { binding: stream, operation_id, error }));
                     self.execute(effects)?;
+                    self.reap_dead_worker(stream, operation_id);
                 }
-                self.reap_dead_worker(stream);
             }
-            CaptureEvent::StreamStopped { .. } => {
-                // Informational only. The authoritative "this worker is completely
-                // done" signal is the join() result in `handle_join_result`, not this
-                // channel event — see this module's doc comment on
-                // `run_until_shutdown` and Codex's review of task #1.
+            CaptureEvent::StreamStalled { stream, error } => {
+                // Non-fatal: the capture thread noticed a stall (e.g. a WASAPI
+                // callback timeout) and kept running. Unlike `StreamError`, this
+                // worker is still alive — feeding it into `decide()`/`reap_dead_worker`
+                // would tear down (and orphan the thread of) a worker that never
+                // actually died, and a retry would then spin up a second capture
+                // thread for the same binding. Surface it for observability only.
+                tracing::warn!(binding = ?stream, %error, "capture stream stalled (worker still running)");
+            }
+            CaptureEvent::StreamStopped { stream, exit, .. } => {
+                // Usually informational: when *we* initiate a stop (`Effect::StopCapture`),
+                // the worker is already removed from `self.workers` before `stop.signal()`
+                // is called, so by the time this event arrives `self.workers.get(&stream)`
+                // is `None` here and the authoritative completion signal is the join()
+                // result in `handle_join_result`, not this channel event.
+                //
+                // But when the worker exits *on its own* (`exit == DeviceLost`, e.g.
+                // WASAPI's `AUDCLNT_E_DEVICE_INVALIDATED`) — see `capture_loop::run_capture_loop`
+                // — nobody has removed it from `self.workers` and nobody will ever
+                // `join()` its thread, since no `Effect::StopCapture` was issued for
+                // it. Left alone, the binding stays `Running` in `decide()`'s state
+                // forever: `capture_health()` keeps reporting `Ok` while the thread
+                // that was supplying frames is gone. Route it through the same
+                // `WorkerFailed` path a `StreamError` would take.
+                //
+                // The `exit == CaptureExit::DeviceLost` guard below is required, not
+                // cosmetic: `CaptureEvent` carries no operation_id/epoch, so a
+                // `StreamStopped{StoppedByRequest}` from a worker *we* just told to
+                // stop can still arrive after `handle_join_result` has already
+                // processed that same stop's join result and (for a rebind,
+                // `AfterStop::ResolveAndStart`) started a *new* worker under the same
+                // `BindingKind` key — `self.workers.get(&stream)` would then return
+                // that brand-new, healthy worker's `operation_id`, and without this
+                // guard every ordinary rebind would have a real chance (both events
+                // race through independent channels via `Select`) of immediately
+                // killing the worker it just started. `StoppedByRequest` never needs
+                // supervisor action either way: it only happens in response to our
+                // own `Effect::StopCapture`, whose completion is already handled by
+                // `handle_join_result`. (A residual, much narrower race — two
+                // independent generation changes for the same binding interleaving —
+                // isn't closed by this; closing it fully needs `CaptureEvent` to
+                // carry the epoch it belongs to. Not attempted in this pass.)
+                if exit == CaptureExit::DeviceLost {
+                    if let Some(operation_id) = self.workers.get(&stream).map(|w| w.operation_id) {
+                        let effects = decide(
+                            &mut self.state,
+                            DecisionInput::Observation(Observation::WorkerFailed {
+                                binding: stream,
+                                operation_id,
+                                error: format!("worker stopped unexpectedly (exit={exit:?})"),
+                            }),
+                        );
+                        self.execute(effects)?;
+                        self.reap_dead_worker(stream, operation_id);
+                    }
+                }
             }
             CaptureEvent::SessionDisconnected { stream, reason_raw } => {
                 if let Some(operation_id) = self.workers.get(&stream).map(|w| w.operation_id) {
@@ -339,20 +415,30 @@ impl WindowsSupervisor {
                         }),
                     );
                     self.execute(effects)?;
+                    self.reap_dead_worker(stream, operation_id);
                 }
-                self.reap_dead_worker(stream);
             }
         }
         Ok(())
     }
 
-    /// A worker that failed on its own (`WorkerFailed`/`SessionDisconnected`) is
-    /// already dying without a `StopCapture` effect (`decide()` moves straight to
-    /// `Waiting`/`Failed`) — its `JoinHandle` still needs reclaiming so it isn't
-    /// leaked. The eventual join result is still fed through `decide()` (see
-    /// `handle_join_result`); its own staleness guard (the binding is no longer
-    /// `Stopping` by then) makes that a safe no-op.
-    fn reap_dead_worker(&mut self, binding: BindingKind) {
+    /// A worker that failed on its own (`WorkerFailed`/`SessionDisconnected`/an
+    /// unsolicited `StreamStopped`) is already dying without a `StopCapture` effect
+    /// (`decide()` moves straight to `Waiting`/`Failed`) — its `JoinHandle` still
+    /// needs reclaiming so it isn't leaked. The eventual join result is still fed
+    /// through `decide()` (see `handle_join_result`); its own staleness guard (the
+    /// binding is no longer `Stopping` by then) makes that a safe no-op.
+    ///
+    /// `operation_id` must match the entry currently in `self.workers` before it's
+    /// removed: a caller passes the id it read *before* calling `decide()`, and
+    /// `decide()`'s own effects (e.g. a fresh `StartCapture` for a retry) can install
+    /// a *new* `WorkerHandle` under the same `BindingKind` key before this runs. Without
+    /// this check, reaping unconditionally by `binding` alone would rip out and join
+    /// that brand-new worker's thread instead of the dead one's.
+    fn reap_dead_worker(&mut self, binding: BindingKind, operation_id: OperationId) {
+        if self.workers.get(&binding).map(|w| w.operation_id) != Some(operation_id) {
+            return;
+        }
         if let Some(worker) = self.workers.remove(&binding) {
             self.spawn_joiner(binding, worker.operation_id, worker.epoch, worker.join_handle);
         }
