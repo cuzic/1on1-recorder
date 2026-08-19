@@ -100,6 +100,13 @@ jobs:
   e2e-best-effort:
     runs-on: macos-latest
     needs: build
+    # Job-level `permissions:` replaces (not adds to) the default token scopes —
+    # `contents: read` must be listed explicitly or `actions/checkout` below (which
+    # needs it to clone this private repo) fails with 403, silently, since this
+    # whole job is `continue-on-error: true`.
+    permissions:
+      contents: read
+      issues: write
     # This job is allowed to fail without turning the overall check red — real
     # ScreenCaptureKit capture requires TCC (Screen & System Audio Recording +
     # Microphone) permissions that cannot be granted through any documented,
@@ -321,3 +328,38 @@ jobs:
         # above still cleans up rather than leaving the runner mid-recording.
         if: always()
         run: pkill -f "target/aarch64-apple-darwin/debug/desktop" || true
+
+      - name: File an issue on failure (this job is continue-on-error, so nothing else surfaces this)
+        # This job's own `continue-on-error: true` (see the comment at the top of
+        # this job) means a real regression here produces no red check on the
+        # PR/push — only a job log nobody opens unless they go looking. See
+        # docs/adr/0002-macos-e2e-best-effort-job-silently-non-blocking.md for why
+        # that's a problem this step exists to fix. Skipped on `pull_request`
+        # (including from forks, where `GITHUB_TOKEN` is read-only anyway) to
+        # avoid filing from untrusted/duplicate PR runs; `push`/`workflow_dispatch`
+        # only. `poll-capture-health.sh`'s own FAIL message (in the job log this
+        # issue links to) already distinguishes "ctl exited non-zero" from "health
+        # never reached the expected value" — this step doesn't re-derive that,
+        # it just makes sure someone looks.
+        if: failure() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Fixed (no date suffix) so repeated failures dedupe against this exact
+          # title instead of relying on a `--label` this repo doesn't have (and
+          # this step deliberately doesn't create one — a missing/misspelled label
+          # makes `gh issue create --label` fail outright, which is worse than not
+          # labeling at all) or on GitHub's search-index-backed `gh issue list
+          # --search`, which can lag.
+          ISSUE_TITLE: "macOS e2e-best-effort job is failing"
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --json title \
+            --jq --arg title "$ISSUE_TITLE" '[.[] | select(.title == $title)] | length')
+          if [ "$existing" -gt 0 ]; then
+            echo "\"$ISSUE_TITLE\" is already open; not filing another."
+            exit 0
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$ISSUE_TITLE" \
+            --body "The \`e2e-best-effort\` job in \`macos-build.yml\` failed on [this run]($run_url) ($(date -u +%Y-%m-%dT%H:%MZ)). This job is \`continue-on-error: true\`, so it did not block the PR/push. Could be a real regression (device disconnect/reconnect health handling) or CI-environment flake (TCC seeding, BlackHole install/uninstall timing) — check the run log, especially any \`poll-capture-health.sh\` \`FAIL:\` line, to tell which. Close this issue once triaged; a future failure will only file a new one once this title is no longer open."
