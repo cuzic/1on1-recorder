@@ -76,9 +76,22 @@ impl DeviceChangeWatcher {
 
 impl Drop for DeviceChangeWatcher {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(());
+        // Detach the shutdown-signal-and-join onto its own thread rather than
+        // doing either synchronously here. `DeviceChangeWatcher` values are
+        // commonly dropped from an async runtime worker thread — e.g. when a
+        // Dioxus `use_future` holding one is cancelled on component unmount (see
+        // apps/desktop/src/settings.rs's `spawn_device_change_watcher`, which
+        // `spawn_blocking`s `start()` but not the eventual `drop`) — not from a
+        // thread that was itself `spawn_blocking`'d. Both `shutdown_tx.send(())`
+        // (a rendezvous channel — it blocks until the watcher thread's `select!`
+        // picks it up) and `handle.join()` are blocking calls that don't belong on
+        // that thread. See docs/adr/0005-macos-duplicate-device-enumeration-listeners.md.
         if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+            let shutdown_tx = self.shutdown_tx.clone();
+            std::thread::spawn(move || {
+                let _ = shutdown_tx.send(());
+                let _ = handle.join();
+            });
         }
     }
 }
