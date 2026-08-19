@@ -74,6 +74,16 @@ struct WorkerHandle {
 /// [`BindingKind`] at once. See this module's doc comment.
 struct SharedStream {
     bindings: Vec<BindingKind>,
+    /// Snapshot, at the moment this `SharedStream` was built, of which
+    /// `operation_id` each of `bindings` was being served under — see
+    /// `handle_capture_event`'s `StreamError` arm, which uses this (not just
+    /// "is this binding's key still present in `self.workers`") to tell "a sibling
+    /// this exact dead stream was serving hasn't reported its `StreamError` yet"
+    /// apart from "that key now holds an unrelated, already-retried worker from a
+    /// completely different failure". Without this distinction, a retry racing
+    /// ahead of a slower sibling's `StreamError` could make the wait-for-siblings
+    /// check below block forever.
+    operation_ids: HashMap<BindingKind, OperationId>,
     stop: Arc<StopSignal>,
     join_handle: std::thread::JoinHandle<CaptureThreadOutcome>,
 }
@@ -452,13 +462,6 @@ impl MacosSupervisor {
             return Ok(());
         }
 
-        let capture_epoch = desired
-            .iter()
-            .filter_map(|b| self.workers.get(b))
-            .map(|w| w.epoch.0)
-            .max()
-            .unwrap_or(0);
-
         let outputs = StreamOutputs {
             microphone: desired.contains(&BindingKind::Microphone),
             system_audio: desired.contains(&BindingKind::EndpointLoopback)
@@ -469,6 +472,22 @@ impl MacosSupervisor {
         } else {
             BindingKind::EndpointLoopback
         };
+
+        // Each binding gets *its own* epoch — `decide()` allocates a fresh
+        // `StreamEpoch` per binding independently (`start_all` starting Microphone
+        // then EndpointLoopback in two separate `decide()` calls means they land on
+        // consecutive-but-distinct values), even though both outputs are about to
+        // share one `SCStream`/thread. A single stream-wide epoch (this used to take
+        // `desired`'s *maximum* worker epoch) tags every frame from *both* outputs
+        // with the same value, which `capture_api::rebinding::DecisionState::accepts_epoch`
+        // then checks per-binding against each binding's own `Running.epoch` — so
+        // whichever binding didn't happen to hold the max would have every one of
+        // its frames rejected as stale, permanently, the moment both bindings were
+        // ever started in the same `reconcile_active_stream` generation (i.e. every
+        // normal session with both Microphone and EndpointLoopback active). See
+        // docs/adr/0012-accepts-epoch-guard-never-called.md.
+        let microphone_epoch = self.workers.get(&BindingKind::Microphone).map(|w| w.epoch.0);
+        let system_audio_epoch = self.workers.get(&system_audio_binding).map(|w| w.epoch.0);
 
         // Phase 1A only ever pins endpoints (see `pin_devices`) — `ProcessLoopback`'s
         // app-filtered SCContentFilter construction (`capture_macos::app_filter`)
@@ -497,14 +516,20 @@ impl MacosSupervisor {
             self.channels,
             outputs,
             system_audio_binding,
-            capture_epoch,
+            microphone_epoch,
+            system_audio_epoch,
             microphone_device_id,
         );
+        let operation_ids = desired
+            .iter()
+            .filter_map(|b| self.workers.get(b).map(|w| (*b, w.operation_id)))
+            .collect();
         let stop = Arc::new(StopSignal::new());
         let join_handle =
             spawn_capture_thread(Box::new(stream), self.capture_tx.clone(), stop.clone());
         self.active_stream = Some(SharedStream {
             bindings: desired,
+            operation_ids,
             stop,
             join_handle,
         });
@@ -514,8 +539,15 @@ impl MacosSupervisor {
     fn handle_capture_event(&mut self, event: CaptureEvent) -> Result<(), CaptureError> {
         match event {
             CaptureEvent::Frame { record, samples } => {
-                if let Some(tx) = &self.frame_tx {
-                    let _ = tx.send(FrameSinkEvent::Frame { record, samples });
+                // See `windows_supervisor::WindowsSupervisor::handle_capture_event`'s
+                // identical check — reject frames from a stale epoch (e.g. still in
+                // flight from a shared SCStream `reconcile_active_stream` just tore
+                // down to rebuild) rather than forwarding them as if they belonged
+                // to the binding's current generation.
+                if self.state.accepts_epoch(record.stream, StreamEpoch(record.capture_epoch)) {
+                    if let Some(tx) = &self.frame_tx {
+                        let _ = tx.send(FrameSinkEvent::Frame { record, samples });
+                    }
                 }
             }
             CaptureEvent::StreamStarted {
@@ -559,7 +591,39 @@ impl MacosSupervisor {
                     );
                     self.workers.remove(&stream);
                     self.execute(effects)?;
-                    self.reconcile_active_stream()?;
+
+                    // The one shared `SCStream` behind `self.active_stream` dies as a
+                    // whole and serves every binding in `active_stream.bindings` at
+                    // once — `capture-macos`'s `lib.rs` sends one `StreamError` per
+                    // binding it was serving, in quick succession (see that crate's
+                    // `spawn_capture_thread` doc comment). Reconciling right after the
+                    // *first* one alone would compute a transient desired set (still
+                    // including the sibling binding(s) whose `StreamError` hasn't been
+                    // processed yet), spawning a brand-new `SCStream` just to tear it
+                    // down again moments later once the sibling's `StreamError` does
+                    // arrive. Wait until every sibling this dead stream's
+                    // `operation_ids` snapshot recorded has reported in before
+                    // reconciling, collapsing that churn into a single rebuild.
+                    //
+                    // Checked against `SharedStream::operation_ids` (each sibling's
+                    // operation_id *as of this stream's construction*), not merely
+                    // "is the binding's key still present in `self.workers`": if a
+                    // sibling's own retry (a completely independent failure/backoff
+                    // timeline) raced ahead and already re-inserted a *new* worker
+                    // under that same `BindingKind` key before its `StreamError` for
+                    // *this* dead generation arrived, `contains_key` alone would
+                    // read that as "still waiting" forever — this binding would
+                    // never reconcile out of `Starting`. Comparing operation_ids
+                    // tells the two apart: a re-inserted worker has a different
+                    // operation_id than the one this dead stream was serving.
+                    let still_awaiting_siblings = self.active_stream.as_ref().is_some_and(|s| {
+                        s.operation_ids.iter().any(|(binding, operation_id)| {
+                            self.workers.get(binding).map(|w| w.operation_id) == Some(*operation_id)
+                        })
+                    });
+                    if !still_awaiting_siblings {
+                        self.reconcile_active_stream()?;
+                    }
                 }
             }
             CaptureEvent::StreamStopped { .. } => {
