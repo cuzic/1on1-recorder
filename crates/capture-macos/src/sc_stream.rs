@@ -52,7 +52,17 @@ pub struct ScreenCaptureKitStream {
     /// `.audio` output's frames. The `.microphone` output always tags
     /// `BindingKind::Microphone`.
     system_audio_binding: BindingKind,
-    capture_epoch: u64,
+    /// Per-binding epochs, not one shared value — the `.microphone` and `.audio`
+    /// outputs share this one `SCStream`/thread, but each is tagged with its own
+    /// binding's own epoch (see `MacosSupervisor::reconcile_active_stream`'s doc
+    /// comment on why: `decide()` allocates a fresh `StreamEpoch` independently per
+    /// binding, so a single stream-wide epoch would only ever match one of the two
+    /// bindings' `Running.epoch`, permanently starving the other of accepted
+    /// frames). `None` when that output isn't enabled (`outputs.microphone`/
+    /// `outputs.system_audio` is `false`) — `run()` only reads the epoch for an
+    /// output it's actually turning on.
+    microphone_epoch: Option<u64>,
+    system_audio_epoch: Option<u64>,
     /// CoreAudio device UID to pin the `.microphone` output to, or `None` to use
     /// whatever `SCStreamConfiguration` defaults to (the OS default input) — see
     /// `set_microphone_capture_device_id`'s doc comment in the `screencapturekit`
@@ -69,7 +79,8 @@ impl ScreenCaptureKitStream {
         channels: u16,
         outputs: StreamOutputs,
         system_audio_binding: BindingKind,
-        capture_epoch: u64,
+        microphone_epoch: Option<u64>,
+        system_audio_epoch: Option<u64>,
         microphone_device_id: Option<String>,
     ) -> Self {
         Self {
@@ -78,7 +89,8 @@ impl ScreenCaptureKitStream {
             channels,
             outputs,
             system_audio_binding,
-            capture_epoch,
+            microphone_epoch,
+            system_audio_epoch,
             microphone_device_id,
         }
     }
@@ -125,7 +137,10 @@ impl CaptureStream for ScreenCaptureKitStream {
                 tx.clone(),
                 BindingKind::Microphone,
                 self.sample_rate,
-                self.capture_epoch,
+                self.channels,
+                self.microphone_epoch.expect(
+                    "outputs.microphone is true but ScreenCaptureKitStream::new wasn't given a microphone_epoch",
+                ),
             );
             stream.add_output_handler(handler, SCStreamOutputType::Microphone);
             tx.send(CaptureEvent::StreamStarted {
@@ -141,7 +156,10 @@ impl CaptureStream for ScreenCaptureKitStream {
                 tx.clone(),
                 self.system_audio_binding,
                 self.sample_rate,
-                self.capture_epoch,
+                self.channels,
+                self.system_audio_epoch.expect(
+                    "outputs.system_audio is true but ScreenCaptureKitStream::new wasn't given a system_audio_epoch",
+                ),
             );
             stream.add_output_handler(handler, SCStreamOutputType::Audio);
             tx.send(CaptureEvent::StreamStarted {
@@ -234,6 +252,11 @@ struct FrameForwarder {
     tx: crossbeam_channel::Sender<CaptureEvent>,
     binding: BindingKind,
     sample_rate: u32,
+    /// Needed to turn `samples.len()` (the total f32 count across *all* channels,
+    /// interleaved or not — see `audio_buffer_list_to_f32`'s doc comment) back into a
+    /// frame count. Without this, `frame_count` silently over-counts by a factor of
+    /// `channels` for any multi-channel stream.
+    channels: u16,
     capture_epoch: u64,
     packet_seq: Arc<AtomicU64>,
     device_position_frames: Arc<AtomicU64>,
@@ -244,12 +267,14 @@ impl FrameForwarder {
         tx: crossbeam_channel::Sender<CaptureEvent>,
         binding: BindingKind,
         sample_rate: u32,
+        channels: u16,
         capture_epoch: u64,
     ) -> Self {
         Self {
             tx,
             binding,
             sample_rate,
+            channels,
             capture_epoch,
             packet_seq: Arc::new(AtomicU64::new(0)),
             device_position_frames: Arc::new(AtomicU64::new(0)),
@@ -271,11 +296,38 @@ impl SCStreamOutputTrait for FrameForwarder {
         .unwrap_or(0);
 
         let samples = audio_buffer_list_to_f32(&buffer_list);
-        let frame_count = if self.sample_rate > 0 {
-            (samples.len() as u32).max(1)
-        } else {
-            samples.len() as u32
-        };
+        // `samples` holds every channel's samples (see `audio_buffer_list_to_f32`'s
+        // doc comment — the total count is `channels * frame_count` whether the
+        // buffer list is interleaved or planar), so it must be divided by the
+        // channel count to recover the actual frame count. Previously this used
+        // `samples.len()` directly, which for any stream with `channels > 1`
+        // over-counted frames by that factor — and since `device_position_frames`
+        // (below) accumulates `frame_count` and is what
+        // `macos_frame_collector::to_captured_frame` divides by `sample_rate` to
+        // derive this track's `source_time_ns` (not `host_time_ns`, which comes from
+        // `capture_time_ns`/the `CMSampleBuffer` presentation timestamp instead),
+        // that inflation made the reported source-time timeline run faster than
+        // real time.
+        //
+        // Residual caveat, not yet resolved: `self.channels` is the value this
+        // stream *configured* via `SCStreamConfiguration::with_channel_count`
+        // (`run()`, above), not a measurement of what this specific output actually
+        // delivers per callback — `with_channel_count` is documented against the
+        // `.audio` (system-audio) output, and whether ScreenCaptureKit's
+        // `.microphone` output always honors the same channel count hasn't been
+        // confirmed against a real build (see this file's and `lib.rs`'s top-level
+        // "not yet verified" notes). If it doesn't, this division would be wrong in
+        // the opposite direction. Confirm against real ScreenCaptureKit output
+        // before trusting this in production.
+        let channels = (self.channels as u32).max(1);
+        // The trailing `.max(1)` (inherited from before this fix, not newly
+        // introduced by it) means an empty buffer still advances
+        // `device_position_frames` by 1 rather than 0. Left as-is rather than
+        // changed to `unwrap_or(0)`/no floor: whether ScreenCaptureKit's callback
+        // can ever legitimately fire with a non-null but zero-sample buffer list
+        // isn't confirmed, and changing this without a real build to check against
+        // risks trading one unverified assumption for another.
+        let frame_count = ((samples.len() as u32) / channels).max(1);
 
         let packet_seq = self.packet_seq.fetch_add(1, Ordering::SeqCst);
         let device_position_frames = self
@@ -316,4 +368,60 @@ fn audio_buffer_list_to_f32(buffer_list: &screencapturekit::AudioBufferList) -> 
         );
     }
     samples
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `StreamErrorDelegate` and `SCError` are both plain Rust types with no
+    // ScreenCaptureKit/Swift bridge involved in their construction (unlike most of
+    // this crate — see `lib.rs`'s top-level doc comment on why the crate as a whole
+    // has never been compiled: the `screencapturekit` crate's own build script
+    // shells out to `swiftc`, which this repo's Linux dev environment doesn't have).
+    // This is deliberately the one piece of `sc_stream.rs` exercised directly,
+    // covering the "(未検証)" gap `docs/adr/0001-*.md` flags: whether
+    // `did_stop_with_error` actually records the message and signals `stream_dead`
+    // the way `run()`'s wait loop (177-192 in this file) assumes it does.
+    #[test]
+    fn did_stop_with_error_records_the_message_and_signals_stream_dead() {
+        let error_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let stream_dead = Arc::new(StopSignal::new());
+        let delegate = StreamErrorDelegate {
+            error: error_slot.clone(),
+            stream_dead: stream_dead.clone(),
+        };
+
+        assert!(!stream_dead.is_signaled());
+
+        delegate.did_stop_with_error(SCError::stream_error("simulated stop"));
+
+        assert!(stream_dead.is_signaled());
+        assert_eq!(
+            error_slot.lock().unwrap().as_deref(),
+            Some(SCError::stream_error("simulated stop").to_string().as_str()),
+        );
+    }
+
+    #[test]
+    fn did_stop_with_error_overwrites_a_previously_recorded_message() {
+        // `run()` only ever reads `error` once, after observing `stream_dead`, so
+        // this isn't exercised in practice today — but `did_stop_with_error` has no
+        // guard against being invoked more than once, so document the actual
+        // "last write wins" behavior rather than leaving it merely assumed.
+        let error_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let stream_dead = Arc::new(StopSignal::new());
+        let delegate = StreamErrorDelegate {
+            error: error_slot.clone(),
+            stream_dead: stream_dead.clone(),
+        };
+
+        delegate.did_stop_with_error(SCError::stream_error("first"));
+        delegate.did_stop_with_error(SCError::stream_error("second"));
+
+        assert_eq!(
+            error_slot.lock().unwrap().as_deref(),
+            Some(SCError::stream_error("second").to_string().as_str()),
+        );
+    }
 }

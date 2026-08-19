@@ -49,7 +49,8 @@ fn main() {
             system_audio: false,
         },
         BindingKind::EndpointLoopback, // unused: system_audio is disabled above
-        0,
+        Some(0),
+        None, // system_audio is disabled above, so no system_audio_epoch is needed
         None,
     );
 
