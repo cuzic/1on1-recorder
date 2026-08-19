@@ -81,9 +81,18 @@ impl DeviceChangeWatcher {
 
 impl Drop for DeviceChangeWatcher {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(());
+        // See `macos_device_watch::DeviceChangeWatcher`'s identical `Drop` — same
+        // fix, same rationale (detach the shutdown-signal-and-join so `drop` itself
+        // never blocks an async runtime worker thread it may be running on). This
+        // module's own doc comment already calls the two watchers "identical
+        // shape"; leaving only one of them fixed would make that claim false. See
+        // docs/adr/0005-macos-duplicate-device-enumeration-listeners.md.
         if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+            let shutdown_tx = self.shutdown_tx.clone();
+            std::thread::spawn(move || {
+                let _ = shutdown_tx.send(());
+                let _ = handle.join();
+            });
         }
     }
 }
