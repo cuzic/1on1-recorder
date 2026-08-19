@@ -5,9 +5,13 @@
 # (`app_service::TrackHealth`, mirrored as `control_protocol::TrackHealthDto`)
 # recovering from a real CoreAudio device-list change, not just a log line.
 #
-# The expected value is matched as a raw JSON fragment (e.g. '"Ok"' or
-# '"Unavailable"') rather than parsed with a JSON tool, matching the plain
-# `grep -q` style the rest of this workflow's E2E steps already use.
+# The expected value is a JSON fragment (e.g. '"Ok"' or '"Unavailable"') compared
+# against `jq -c`'s compact serialization of `.capture_health.<field>` — see
+# docs/adr/0008-poll-capture-health-fragile-grep-matching.md for why this replaced
+# a plain `grep -q "\"${FIELD}\":${EXPECTED}"` substring match: that matched
+# anywhere in the whole JSON blob regardless of nesting, so it would have quietly
+# started matching an unrelated `"${FIELD}"` key the moment one was ever added
+# elsewhere in `StatusDto`. `jq` ships preinstalled on GitHub-hosted macOS runners.
 set -euo pipefail
 
 CTL="${1:?usage: poll-capture-health.sh <ctl-path> <self_health|remote_health> <expected-json-fragment> <timeout-secs>}"
@@ -18,8 +22,25 @@ TIMEOUT_SECS="${4:?missing timeout}"
 deadline=$((SECONDS + TIMEOUT_SECS))
 last_status=""
 while [ "$SECONDS" -lt "$deadline" ]; do
-    last_status="$("$CTL" --json status)"
-    if echo "$last_status" | grep -q "\"${FIELD}\":${EXPECTED}"; then
+    # `set -e` would otherwise abort this whole script silently the moment ctl
+    # exits non-zero (e.g. the `desktop` process it talks to has already crashed
+    # mid-disconnect-test) — that's a materially different failure than "health
+    # never reached the expected value within the timeout" and deserves its own
+    # message rather than being indistinguishable from a hung shell.
+    if ! last_status="$("$CTL" --json status)"; then
+        echo "FAIL: ${CTL} --json status exited non-zero after ${SECONDS}s (is the desktop process still running?)"
+        exit 1
+    fi
+    # Same reasoning as the ctl-failure check above: `set -e` would otherwise abort
+    # the whole script silently the moment `ctl`'s output isn't valid JSON (or
+    # doesn't have the expected shape), which is exactly the "invisible failure"
+    # this script's jq migration was meant to get rid of.
+    if ! actual="$(echo "$last_status" | jq -c --arg field "$FIELD" '.capture_health[$field]')"; then
+        echo "FAIL: could not parse '\"${FIELD}\"' out of ctl's output as JSON after ${SECONDS}s"
+        echo "raw output: ${last_status}"
+        exit 1
+    fi
+    if [ "$actual" = "$EXPECTED" ]; then
         echo "OK: ${FIELD} reached ${EXPECTED} after ${SECONDS}s"
         echo "$last_status"
         exit 0
