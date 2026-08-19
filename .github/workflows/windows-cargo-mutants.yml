@@ -1,0 +1,89 @@
+name: Windows cargo-mutants (coverage investigation)
+
+# crates/capture-windows(WASAPI)と、crates/app-serviceのwindows-supervisor機能配下
+# (windows_session.rs / windows_device_watch.rs / windows_frame_collector.rs /
+# windows_supervisor.rs)はWindows固有API前提で、windows-latestランナーでしか
+# ビルド/テストできない。2026-07-24、GCP上に専用Windows Spot VMを都度手動で
+# 立ててcargo-mutantsを回す方針を試したが、GCEのWindowsゲストエージェントの
+# 不具合(cargo-ci-gcp-spot-instanceスキルのSKILL.md参照)対応に時間を取られた
+# ため撤回し、再現性・共有しやすさを優先してこちらに一本化した。
+#
+# 全ミュータント走査は対象範囲次第で数十分〜数時間かかり得るため、push/PR毎の
+# 自動実行はしない(workflow_dispatchのみ、targetで対象を絞れる)。このrepoは
+# privateなのでwindows-latestは2倍課金(GitHub Actions billingのWindows runner
+# multiplier)である点にも留意。「テスト網羅性の調査」目的であり、missed mutant
+# が出ること自体はこのjobの失敗ではない(continue-on-error: trueにしてあるので
+# missed mutantの多寡でjobが赤くなることはない)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "mutants対象"
+        type: choice
+        options:
+          - both
+          - app-service
+          - capture-windows
+        default: both
+
+jobs:
+  mutants:
+    runs-on: windows-latest
+    # windows-latestの標準ランナーは2vCPU。cargo-mutantsはミュータント毎に
+    # フルインクリメンタルビルド+testを行うため、対象4ファイル+capture-windows
+    # crate全体でも数時間かかる想定。GitHub Actionsのjob上限(360分)に収める。
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: cargo mutants — app-service (windows-supervisor gated modules)
+        # windows-supervisor機能はstt-google(build.rsがprotoc必須)を引き込まない
+        # ので、live-transcription機能と違いprotocのセットアップは不要
+        # (windows-app-build.ymlのCheckステップと同じ選定理由)。
+        if: ${{ inputs.target == 'app-service' || inputs.target == 'both' }}
+        continue-on-error: true
+        run: cargo mutants -p app-service --features windows-supervisor -f windows_session.rs -f windows_device_watch.rs -f windows_frame_collector.rs -f windows_supervisor.rs --target x86_64-pc-windows-msvc --output mutants-app-service
+
+      - name: cargo mutants — capture-windows
+        # 2026-07-24時点でこのcrateには#[test]が一つも無い。ほぼ全mutantが
+        # missed(=テストに一切捕まらない)になるのが期待される結果であり、
+        # それ自体が「テストが無い」というこのjobの調査目的そのもの。
+        if: ${{ inputs.target == 'capture-windows' || inputs.target == 'both' }}
+        continue-on-error: true
+        run: cargo mutants -p capture-windows --target x86_64-pc-windows-msvc --output mutants-capture-windows
+
+      - name: Summarize results
+        if: always()
+        run: |
+          foreach ($dir in @("mutants-app-service", "mutants-capture-windows")) {
+            if (Test-Path $dir) {
+              "### $dir" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              foreach ($f in @("caught.txt", "missed.txt", "unviable.txt", "timeout.txt")) {
+                $path = Join-Path $dir $f
+                $count = if (Test-Path $path) { (Get-Content $path | Where-Object { $_.Trim() -ne "" }).Count } else { 0 }
+                "- ${f}: $count" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              }
+            }
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cargo-mutants-results
+          path: |
+            mutants-app-service/**
+            mutants-capture-windows/**
+          if-no-files-found: warn
