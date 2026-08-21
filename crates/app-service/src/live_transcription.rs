@@ -28,6 +28,12 @@
 use std::sync::{Arc, Mutex};
 
 use credential_store::CredentialStore;
+// `local-broker`はapp-serviceの必須（非optional）依存のため、featureに関わらず
+// 常にコンパイルできる。`#[cfg(not(feature = "live-transcription"))]`側のstub版
+// `run_live_transcription`もこの型を引数に取るため、モジュール直下で読み込む
+// （以前は`stt_wiring`サブモジュール内だけでimportしており、live-transcription
+// feature無効時にstub関数がこの型を解決できずコンパイルエラーになっていた）。
+use local_broker::LocalBroker;
 use recorder_domain::{SessionId, TrackKind};
 use session_store::SessionStore;
 use tokio::sync::mpsc::Receiver;
@@ -119,7 +125,7 @@ mod stt_wiring {
     use crate::resample::resample;
     use crate::silence_gate::{GateAction, GateConfig, SilenceGate};
     use crate::timestamp_mapper::TimestampMapper;
-    use local_broker::LocalBroker;
+    // LocalBrokerはモジュール直下（`super`）でimport済み（`use super::*;`で入る）。
     use session_store::TranscriptSegment;
     use stt_api::{AudioChunk, KeepAliveEffect, SttError, SttEvent, SttProvider, SttSession, SttSessionConfig};
     use stt_assemblyai::AssemblyAIProvider;
